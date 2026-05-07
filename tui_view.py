@@ -47,6 +47,9 @@ def keys(s):
         elif s.startswith("<down-csi>", i):
             out += b"\x1b[1;2B"
             i += 10
+        elif s.startswith("<m-v>", i):
+            out += b"\x1bv"
+            i += 5
         elif s[i] == "^" and i + 1 < len(s):
             out += ctrl(s[i + 1].lower())
             i += 2

@@ -5,10 +5,12 @@
 //
 //   style scope sgr
 //   rule  scope regex
+//   word  scope word...
 //
 // Example:
 //   style comment 90
 //   rule  comment //.*
+//   word  keyword int return
 // ___________________________________________________________________
 
 #ifndef EDIT_GRAMMAR_H
@@ -21,10 +23,12 @@
 #define GRAMMAR_SCOPE_SIZE 32
 #define GRAMMAR_SGR_SIZE 32
 #define GRAMMAR_REGEX_SIZE 256
+#define GRAMMAR_MAX_SPANS 256
 
 typedef struct {
   char scope[GRAMMAR_SCOPE_SIZE];
   char regex[GRAMMAR_REGEX_SIZE];
+  int word;
 } grammar_rule;
 
 typedef struct {
@@ -39,7 +43,16 @@ typedef struct {
   int n_styles;
 } grammar;
 
+typedef struct {
+  size_t start;
+  size_t end;
+  const char * sgr;
+} grammar_span;
+
+void grammar_load_default(grammar * g);
 int grammar_load(grammar * g, const char * path);
+int grammar_highlight(grammar * g, const char * line, size_t len,
+                      grammar_span * spans, int max_spans);
 int grammar_match(grammar * g, const char * line, size_t len,
                   int * start, int * end, const char ** sgr);
 

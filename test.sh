@@ -35,6 +35,24 @@ printf 'style comment 90\nrule comment //.*\n' > "$tmp.grammar"
 EDIT_GRAMMAR="$tmp.grammar" ./edit --print 1:1..1:4 "$tmp" > "$out"
 printf 'one' | cmp -s - "$out"
 
+esc=$(printf '\033')
+printf 'int tint = 42; // return 7\nchar *s = "hi";\n' > "$tmp"
+./edit --render-color 4:80 "$tmp" > "$out"
+printf '%s[35mint%s[0m tint = %s[36m42%s[0m; %s[90m// return 7%s[0m\n%s[35mchar%s[0m *s = %s[32m"hi"%s[0m;\n\n' \
+  "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" |
+  cmp -s - "$out"
+
+printf 'style comment 31\nrule comment //.*\n' > "$tmp.grammar"
+EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$tmp" > "$out"
+printf 'int tint = 42; %s[31m// return 7%s[0m\nchar *s = "hi";\n' \
+  "$esc" "$esc" | cmp -s - "$out"
+
+printf 'style keyword 33\nword keyword int return\n' > "$tmp.grammar"
+printf 'int tint return\n' > "$tmp"
+EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$tmp" > "$out"
+printf '%s[33mint%s[0m tint %s[33mreturn%s[0m\n\n' \
+  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
 printf 'abc\n  def\n\tghi\n' > "$tmp"
 ./edit --render 5:12 "$tmp" > "$out"
 printf '|abc\n..def\n>ghi\n\n=%s\n' "$tmp" | cmp -s - "$out"
@@ -48,6 +66,18 @@ printf 'abc\n.|.def\n>ghi\n\n=%s\n' "$tmp" | cmp -s - "$out"
 printf 'abcdef\nabc\n' > "$tmp"
 ./edit --render-keys 5:12 fffn "$tmp" > "$out"
 printf 'abcdef\nabc|\n\n\n=%s\n' "$tmp" | cmp -s - "$out"
+
+printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > "$tmp"
+./edit --render-keys 5:12 v "$tmp" > "$out"
+printf 'l2\nl3\nl4\n|l5\n=%s\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 5:12 vV "$tmp" > "$out"
+printf '|l1\nl2\nl3\nl4\n=%s\n' "$tmp" | cmp -s - "$out"
+
+python3 ./tui_view.py 5:20 '^v<m-v>' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
 
 enter=$(printf '\r')
 printf 'one\ntwo\nthree\n' > "$tmp"

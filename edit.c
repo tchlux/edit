@@ -15,6 +15,7 @@
 //    edit --render rows:cols file
 //    edit --render-at rows:cols line:col file
 //    edit --render-keys rows:cols keys file
+//    edit --render-color rows:cols file
 //
 // COMPILATION
 //    cc -std=c11 -Wall -Wextra -pedantic -O2 -o edit edit.c grammar.c regex.c
@@ -39,6 +40,7 @@
 void match(const char * regex, const char * string, int * start, int * end);
 
 #define KEY_CTRL(c) ((c) & 0x1f)
+#define KEY_META(c) (2000 + (c))
 #define KEY_BACKSPACE 127
 #define KEY_ENTER 13
 #define KEY_ESC 27
@@ -438,6 +440,15 @@ static buffer * active_buffer(edit_state * e) {
 
 static int dispatch(edit_state * e, int key);
 
+static void load_grammar(edit_state * e) {
+  const char * gp = getenv("EDIT_GRAMMAR");
+  if (gp != NULL) e->has_grammar = grammar_load(&e->grammar, gp) == 0;
+  else {
+    grammar_load_default(&e->grammar);
+    e->has_grammar = true;
+  }
+}
+
 static pane * active_pane(edit_state * e) {
   return &e->panes[e->active_pane];
 }
@@ -490,6 +501,7 @@ static int read_key(void) {
     }
   }
 
+  if (n == 1) return KEY_META((unsigned char) seq[0]);
   if (n < 2) return KEY_ESC;
   char final = seq[n-1];
   if ((seq[0] == '[') || (seq[0] == 'O')) {
@@ -538,23 +550,30 @@ static void render_line(edit_state * e, output * o, size_t * pos) {
   }
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 
-  int hs = -1;
-  int he = -1;
-  const char * sgr = NULL;
-  if (e->has_grammar) grammar_match(&e->grammar, line, n, &hs, &he, &sgr);
+  grammar_span spans[GRAMMAR_MAX_SPANS];
+  int n_spans = e->has_grammar ?
+    grammar_highlight(&e->grammar, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
+  int span = 0;
+  bool color = false;
 
   size_t shown = 0;
   for (size_t i = 0; i < n && shown < limit; i++) {
-    if ((int) i == hs) out_f(o, "\x1b[%sm", sgr);
-    if ((int) i == he) out_s(o, "\x1b[0m");
+    while (span < n_spans && i >= spans[span].end) {
+      out_s(o, "\x1b[0m");
+      color = false;
+      span++;
+    }
+    if (span < n_spans && i == spans[span].start) {
+      out_f(o, "\x1b[%sm", spans[span].sgr);
+      color = true;
+    }
     char c = line[i];
     if (c == '\t') c = ' ';
     if ((unsigned char) c < 32) c = ' ';
     out_add(o, &c, 1);
     shown++;
   }
-  if ((he > hs) && ((size_t) he >= n || shown == limit))
-    out_s(o, "\x1b[0m");
+  if (color) out_s(o, "\x1b[0m");
   (void) start;
 }
 
@@ -664,6 +683,19 @@ static void render_snapshot(edit_state * e) {
   free(o.data);
 }
 
+static void render_color_snapshot(edit_state * e) {
+  ensure_visible(e);
+  output o = {0};
+  size_t pos = active_pane(e)->top;
+  int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
+  for (int row = 0; row < body_rows; row++) {
+    if (pos < buffer_len(active_buffer(e))) render_line(e, &o, &pos);
+    out_s(&o, "\n");
+  }
+  fwrite(o.data, 1, o.len, stdout);
+  free(o.data);
+}
+
 static int cli_render(const char * size, const char * path) {
   edit_state e;
   memset(&e, 0, sizeof(e));
@@ -677,6 +709,24 @@ static int cli_render(const char * size, const char * path) {
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
   render_snapshot(&e);
+  buffer_free(&e.buffers[0]);
+  return 0;
+}
+
+static int cli_render_color(const char * size, const char * path) {
+  edit_state e;
+  memset(&e, 0, sizeof(e));
+  e.n_buffers = 1;
+  e.n_panes = 1;
+  e.panes[0].buffer = 0;
+  e.panes[0].cursor = 0;
+  e.panes[0].preferred_col = SIZE_MAX;
+  if (sscanf(size, "%d:%d", &e.rows, &e.cols) != 2 || e.rows < 2 || e.cols < 1)
+    return fprintf(stderr, "edit: bad render size\n"), 1;
+  load_grammar(&e);
+  if (buffer_load(&e.buffers[0], path) != 0)
+    return fprintf(stderr, "edit: open failed\n"), 1;
+  render_color_snapshot(&e);
   buffer_free(&e.buffers[0]);
   return 0;
 }
@@ -716,6 +766,8 @@ static int key_name(char c) {
   if (c == 'd') return KEY_CTRL('d');
   if (c == 'h') return KEY_CTRL('h');
   if (c == 's') return KEY_CTRL('s');
+  if (c == 'v') return KEY_CTRL('v');
+  if (c == 'V') return KEY_META('v');
   return (unsigned char) c;
 }
 
@@ -774,6 +826,18 @@ static int cmd_down(edit_state * e, int key) {
   size_t next = next_line(b, p->cursor);
   p->cursor = line_column(b, next, p->preferred_col);
   (void) key;
+  return 0;
+}
+
+static int cmd_page_down(edit_state * e, int key) {
+  int n = (e->rows > 1) ? e->rows - 1 : 1;
+  for (int i = 0; i < n; i++) cmd_down(e, key);
+  return 0;
+}
+
+static int cmd_page_up(edit_state * e, int key) {
+  int n = (e->rows > 1) ? e->rows - 1 : 1;
+  for (int i = 0; i < n; i++) cmd_up(e, key);
   return 0;
 }
 
@@ -859,6 +923,8 @@ static binding bindings[] = {
   {{KEY_CTRL('f'), 0}, 1, cmd_right},
   {{KEY_CTRL('p'), 0}, 1, cmd_up},
   {{KEY_CTRL('n'), 0}, 1, cmd_down},
+  {{KEY_CTRL('v'), 0}, 1, cmd_page_down},
+  {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_CTRL('a'), 0}, 1, cmd_line_start},
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
@@ -939,8 +1005,7 @@ static int tui(const char * path) {
   e.panes[0].preferred_col = SIZE_MAX;
   snprintf(e.status, sizeof(e.status), "C-s search, C-x C-s save, C-x C-c quit");
 
-  const char * gp = getenv("EDIT_GRAMMAR");
-  e.has_grammar = (gp != NULL) && (grammar_load(&e.grammar, gp) == 0);
+  load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0) {
     fprintf(stderr, "edit: cannot open %s\n", path);
     return 1;
@@ -1065,13 +1130,16 @@ static void usage(void) {
     "  edit --search line:col regex file\n"
     "  edit --render rows:cols file\n"
     "  edit --render-at rows:cols line:col file\n"
-    "  edit --render-keys rows:cols keys file\n");
+    "  edit --render-keys rows:cols keys file\n"
+    "  edit --render-color rows:cols file\n");
 }
 
 int main(int argc, char ** argv) {
   if (argc == 2) return tui(argv[1]);
   if (argc == 4 && strcmp(argv[1], "--render") == 0)
     return cli_render(argv[2], argv[3]);
+  if (argc == 4 && strcmp(argv[1], "--render-color") == 0)
+    return cli_render_color(argv[2], argv[3]);
   if (argc == 5 && strcmp(argv[1], "--render-at") == 0)
     return cli_render_at(argv[2], argv[3], argv[4]);
   if (argc == 5 && strcmp(argv[1], "--render-keys") == 0)

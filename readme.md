@@ -12,7 +12,8 @@ Interactive use:
 ./edit file.txt
 ```
 
-Keys: `C-s` search, `C-x C-s` save, `C-x C-c` quit.
+Keys: `C-s` search, `C-v` page down, `M-v` page up, `C-x C-s` save,
+`C-x C-c` quit.
 
 Batch use:
 
@@ -25,10 +26,23 @@ Batch use:
 ./edit --render 10:80 file.txt
 ./edit --render-at 10:80 2:1 file.txt
 ./edit --render-keys 10:80 nf file.txt
+./edit --render-color 10:80 file.txt
 ```
 
 TUI debug:
 
 ```
 python3 ./tui_view.py 10:80 '<down><right>' file.txt
+```
+
+Highlighting:
+
+`edit` has default C-like highlighting for comments, strings, numbers, and a
+small keyword set. Set `EDIT_GRAMMAR=path` to fully override it with a line
+based grammar:
+
+```
+style comment 90
+rule comment //.*
+word keyword int return static
 ```

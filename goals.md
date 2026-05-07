@@ -8,11 +8,13 @@ Completed work:
   quit protection, and regression coverage.
 - Regex-backed search: explicit byte cursor semantics, batch `--search`,
   interactive `C-s` forward search, and render/debug coverage.
+- Syntax highlighting: default C-like grammar, custom grammar override, word
+  rules, multi-span line rendering, and raw color render coverage.
+- Page navigation: Emacs-style `C-v` page down and `M-v` page up, with batch
+  and pty regression coverage.
 
 Outstanding work for `edit`:
 
-- Expand syntax highlighting through `grammar.c`, including a small default
-  grammar and color config.
 - Add multiple buffers and Emacs-style buffer switching.
 - Add split panes with shared buffers and independent cursors/viewports.
 - Add undo/redo after the buffer mutation model is stable.
