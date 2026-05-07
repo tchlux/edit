@@ -51,6 +51,9 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
 #define LINE_RENDER_MAX 8192
+#define HISTORY_MAX 1024
+
+enum { HIST_INSERT, HIST_DELETE };
 
 typedef struct {
   char * data;
@@ -74,6 +77,14 @@ typedef struct {
   size_t len;
   size_t cap;
 } output;
+
+typedef struct {
+  int kind;
+  size_t pos;
+  size_t len;
+  char * text;
+  unsigned group;
+} history;
 
 typedef struct edit_state edit_state;
 typedef int (*command_fn)(edit_state * e, int key);
@@ -100,6 +111,10 @@ struct edit_state {
   bool quit;
   bool quit_confirm;
   bool raw;
+  history history[HISTORY_MAX];
+  int n_history;
+  int undo_at;
+  unsigned history_group;
   struct termios saved_termios;
   grammar grammar;
   bool has_grammar;
@@ -438,6 +453,76 @@ static buffer * active_buffer(edit_state * e) {
   return &e->buffers[e->panes[e->active_pane].buffer];
 }
 
+static pane * active_pane(edit_state * e) {
+  return &e->panes[e->active_pane];
+}
+
+static void history_free_one(history * h) {
+  free(h->text);
+  memset(h, 0, sizeof(*h));
+}
+
+static void history_free(edit_state * e) {
+  for (int i = 0; i < e->n_history; i++) history_free_one(&e->history[i]);
+  e->n_history = 0;
+  e->undo_at = 0;
+}
+
+static void history_drop_oldest_group(edit_state * e) {
+  if (e->n_history == 0) return;
+  unsigned group = e->history[0].group;
+  int n = 0;
+  while (n < e->n_history && e->history[n].group == group) n++;
+  for (int i = 0; i < n; i++) history_free_one(&e->history[i]);
+  memmove(e->history, e->history + n, (size_t) (e->n_history - n) * sizeof(history));
+  e->n_history -= n;
+  e->undo_at = (e->undo_at > n) ? e->undo_at - n : 0;
+}
+
+static int history_add(edit_state * e, int kind, size_t pos,
+                       const char * text, size_t len, unsigned group) {
+  while (e->n_history >= HISTORY_MAX) history_drop_oldest_group(e);
+  history * h = &e->history[e->n_history];
+  h->text = malloc(len ? len : 1);
+  if (h->text == NULL) return -1;
+  if (len) memcpy(h->text, text, len);
+  h->kind = kind;
+  h->pos = pos;
+  h->len = len;
+  h->group = group;
+  e->n_history++;
+  return 0;
+}
+
+static int edit_insert(edit_state * e, size_t pos, const char * text,
+                       size_t len, unsigned group, bool reset_undo) {
+  if (len == 0) return 0;
+  if (buffer_insert(active_buffer(e), pos, text, len) != 0) return -1;
+  if (history_add(e, HIST_INSERT, pos, text, len, group) != 0) return -1;
+  if (reset_undo) e->undo_at = e->n_history;
+  return 0;
+}
+
+static int edit_delete(edit_state * e, size_t start, size_t end,
+                       unsigned group, bool reset_undo) {
+  buffer * b = active_buffer(e);
+  size_t len = buffer_len(b);
+  if (start > len) start = len;
+  if (end > len) end = len;
+  if (end <= start) return 0;
+
+  size_t n = end - start;
+  char * text = malloc(n);
+  if (text == NULL) return -1;
+  for (size_t i = 0; i < n; i++) text[i] = buffer_at(b, start + i);
+  buffer_delete(b, start, end);
+  int rc = history_add(e, HIST_DELETE, start, text, n, group);
+  free(text);
+  if (rc != 0) return -1;
+  if (reset_undo) e->undo_at = e->n_history;
+  return 0;
+}
+
 static int dispatch(edit_state * e, int key);
 
 static void load_grammar(edit_state * e) {
@@ -447,10 +532,6 @@ static void load_grammar(edit_state * e) {
     grammar_load_default(&e->grammar);
     e->has_grammar = true;
   }
-}
-
-static pane * active_pane(edit_state * e) {
-  return &e->panes[e->active_pane];
 }
 
 static void get_window_size(edit_state * e) {
@@ -768,6 +849,9 @@ static int key_name(char c) {
   if (c == 's') return KEY_CTRL('s');
   if (c == 'v') return KEY_CTRL('v');
   if (c == 'V') return KEY_META('v');
+  if (c == 'x') return KEY_CTRL('x');
+  if (c == '/') return KEY_CTRL('_');
+  if (c == '_') return KEY_CTRL('_');
   return (unsigned char) c;
 }
 
@@ -786,6 +870,7 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_snapshot(&e);
+  history_free(&e);
   buffer_free(&e.buffers[0]);
   return 0;
 }
@@ -862,16 +947,16 @@ static int cmd_line_end(edit_state * e, int key) {
 static int cmd_delete_next(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor < buffer_len(b)) buffer_delete(b, p->cursor, p->cursor + 1);
+  if (p->cursor < buffer_len(b))
+    edit_delete(e, p->cursor, p->cursor + 1, ++e->history_group, true);
   (void) key;
   return 0;
 }
 
 static int cmd_backspace(edit_state * e, int key) {
-  buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor > 0) {
-    buffer_delete(b, p->cursor - 1, p->cursor);
+    edit_delete(e, p->cursor - 1, p->cursor, ++e->history_group, true);
     p->cursor--;
   }
   (void) key;
@@ -881,9 +966,40 @@ static int cmd_backspace(edit_state * e, int key) {
 static int cmd_insert(edit_state * e, int key) {
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
   pane * p = active_pane(e);
-  buffer_insert(active_buffer(e), p->cursor, &c, 1);
+  edit_insert(e, p->cursor, &c, 1, ++e->history_group, true);
   p->cursor++;
   p->preferred_col = SIZE_MAX;
+  return 0;
+}
+
+static int cmd_undo(edit_state * e, int key) {
+  if (e->undo_at <= 0) {
+    set_status(e, "no undo");
+    (void) key;
+    return 0;
+  }
+
+  int end = e->undo_at;
+  unsigned group = e->history[end - 1].group;
+  int start = end - 1;
+  while (start > 0 && e->history[start - 1].group == group) start--;
+
+  unsigned undo_group = ++e->history_group;
+  pane * p = active_pane(e);
+  for (int i = end - 1; i >= start; i--) {
+    history * h = &e->history[i];
+    if (h->kind == HIST_INSERT) {
+      edit_delete(e, h->pos, h->pos + h->len, undo_group, false);
+      p->cursor = h->pos;
+    } else {
+      edit_insert(e, h->pos, h->text, h->len, undo_group, false);
+      p->cursor = h->pos + h->len;
+    }
+  }
+  p->preferred_col = SIZE_MAX;
+  e->undo_at = start;
+  set_status(e, "undo");
+  (void) key;
   return 0;
 }
 
@@ -932,7 +1048,9 @@ static binding bindings[] = {
   {{KEY_CTRL('h'), 0}, 1, cmd_backspace},
   {{KEY_ENTER, 0}, 1, cmd_insert},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
+  {{KEY_CTRL('_'), 0}, 1, cmd_undo},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
+  {{KEY_CTRL('x'), 'u'}, 2, cmd_undo},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit},
 };
 
@@ -1012,6 +1130,7 @@ static int tui(const char * path) {
   }
   if (raw_on(&e) != 0) {
     fprintf(stderr, "edit: raw mode failed\n");
+    history_free(&e);
     buffer_free(&e.buffers[0]);
     return 1;
   }
@@ -1026,6 +1145,7 @@ static int tui(const char * path) {
   raw_off(&e);
   const char * clear = "\x1b[?25h\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
+  history_free(&e);
   buffer_free(&e.buffers[0]);
   return 0;
 }

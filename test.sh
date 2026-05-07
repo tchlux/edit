@@ -88,6 +88,28 @@ printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X "$tmp" > "$out"
 printf 'X|abc\n\n\n=%s*\n' "$tmp" | cmp -s - "$out"
 
+printf 'abc\n' > "$tmp"
+./edit --render-keys 4:20 X_ "$tmp" > "$out"
+printf '|abc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 X/ "$tmp" > "$out"
+printf '|abc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 Xxu "$tmp" > "$out"
+printf '|abc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 fh_ "$tmp" > "$out"
+printf 'a|bc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 d_ "$tmp" > "$out"
+printf 'a|bc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 A_B__ "$tmp" > "$out"
+printf 'A|abc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 4:20 AB__ "$tmp" > "$out"
+printf '|abc\n\n\n=%s* undo\n' "$tmp" | cmp -s - "$out"
+
 python3 ./tui_view.py 5:50 'X^x^s' "$tmp" > "$out"
 sed -n '5p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *saved*) ;; *) exit 1;; esac
@@ -100,6 +122,10 @@ python3 ./tui_view.py 5:50 'X^x^c' "$tmp" > "$out"
 sed -n '5p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *modified*again*quit*) ;; *) exit 1;; esac
 printf 'abc\n' | cmp -s - "$tmp"
+
+python3 ./tui_view.py 5:50 'X^_^x^c' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *modified*again*quit*) ;; *) exit 1;; esac
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
 printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:\n 06:tmp=$(mktemp)\n 07:out=$(mktemp)\n' > "$tmp.expected"

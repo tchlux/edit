@@ -12,8 +12,8 @@ Interactive use:
 ./edit file.txt
 ```
 
-Keys: `C-s` search, `C-v` page down, `M-v` page up, `C-x C-s` save,
-`C-x C-c` quit.
+Keys: `C-s` search, `C-v` page down, `M-v` page up, `C-/` / `C-_` /
+`C-x u` undo, `C-x C-s` save, `C-x C-c` quit.
 
 Batch use:
 

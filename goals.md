@@ -12,12 +12,13 @@ Completed work:
   rules, multi-span line rendering, and raw color render coverage.
 - Page navigation: Emacs-style `C-v` page down and `M-v` page up, with batch
   and pty regression coverage.
+- Emacs-style undo: append-only edit history, undoable inserts/deletes, no
+  discarded redo branch after typing following undo, and regression coverage.
 
 Outstanding work for `edit`:
 
-- Add multiple buffers and Emacs-style buffer switching.
+- Add recent-file history and fast file reopening.
 - Add split panes with shared buffers and independent cursors/viewports.
-- Add undo/redo after the buffer mutation model is stable.
 - Improve large-file handling beyond a whole-file gap buffer, likely with a
   piece table or paged backing store.
 - Keep language-model usability first-class through reliable batch commands and
