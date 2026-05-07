@@ -11,6 +11,17 @@ printf 'one\ntwo\nthree\n' > "$tmp"
 ./edit --print 2:1..3:1 "$tmp" > "$out"
 printf 'two\n' | cmp -s - "$out"
 
+./edit --search 1:1 one "$tmp" > "$out"
+printf '1:1..1:4\n' | cmp -s - "$out"
+
+./edit --search 1:1 wo "$tmp" > "$out"
+printf '2:2..2:4\n' | cmp -s - "$out"
+
+./edit --search 3:5 e "$tmp" > "$out"
+printf '3:5..3:6\n' | cmp -s - "$out"
+
+if ./edit --search 1:1 zzz "$tmp" > "$out" 2>&1; then exit 1; fi
+
 ./edit --insert 2:1 'X' "$tmp" > "$out"
 printf 'one\nXtwo\nthree\n' | cmp -s - "$tmp"
 
@@ -37,6 +48,11 @@ printf 'abc\n.|.def\n>ghi\n\n=%s\n' "$tmp" | cmp -s - "$out"
 printf 'abcdef\nabc\n' > "$tmp"
 ./edit --render-keys 5:12 fffn "$tmp" > "$out"
 printf 'abcdef\nabc|\n\n\n=%s\n' "$tmp" | cmp -s - "$out"
+
+enter=$(printf '\r')
+printf 'one\ntwo\nthree\n' > "$tmp"
+./edit --render-keys 5:12 "stwo$enter" "$tmp" > "$out"
+printf 'one\n|two\nthree\n\n=%s match two\n' "$tmp" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X "$tmp" > "$out"

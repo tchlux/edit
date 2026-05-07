@@ -11,6 +11,7 @@
 //    edit --insert line:col text file
 //    edit --delete line:col..line:col file
 //    edit --replace line:col..line:col text file
+//    edit --search line:col regex file
 //    edit --render rows:cols file
 //    edit --render-at rows:cols line:col file
 //    edit --render-keys rows:cols keys file
@@ -35,6 +36,8 @@
 #include <termios.h>
 #include <unistd.h>
 
+void match(const char * regex, const char * string, int * start, int * end);
+
 #define KEY_CTRL(c) ((c) & 0x1f)
 #define KEY_BACKSPACE 127
 #define KEY_ENTER 13
@@ -58,6 +61,7 @@ typedef struct {
 
 typedef struct {
   int buffer;
+  // Cursor positions are byte offsets between bytes in the logical buffer.
   size_t cursor;
   size_t top;
   size_t preferred_col;
@@ -87,6 +91,9 @@ struct edit_state {
   int rows;
   int cols;
   int prefix;
+  bool search_prompt;
+  char search[STATUS_SIZE];
+  size_t search_len;
   char status[STATUS_SIZE];
   bool quit;
   bool quit_confirm;
@@ -268,6 +275,25 @@ static void buffer_delete(buffer * b, size_t start, size_t end) {
   b->dirty = true;
 }
 
+static int buffer_search(buffer * b, size_t from, const char * regex,
+                         size_t * start, size_t * end) {
+  size_t len = buffer_len(b);
+  if (from > len) from = len;
+  char * text = malloc(len - from + 1);
+  if (text == NULL) return -1;
+  for (size_t i = from; i < len; i++) text[i - from] = buffer_at(b, i);
+  text[len - from] = '\0';
+
+  int a = -1;
+  int z = -1;
+  match(regex, text, &a, &z);
+  free(text);
+  if (a < 0) return 0;
+  *start = from + (size_t) a;
+  *end = from + (size_t) z;
+  return 1;
+}
+
 static size_t line_start(buffer * b, size_t pos) {
   while ((pos > 0) && (buffer_at(b, pos - 1) != '\n')) pos--;
   return pos;
@@ -310,6 +336,19 @@ static size_t line_col_pos(buffer * b, size_t line, size_t col) {
     pos++;
   }
   return pos;
+}
+
+static void pos_line_col(buffer * b, size_t pos, size_t * line, size_t * col) {
+  *line = 1;
+  *col = 1;
+  for (size_t i = 0; i < pos && i < buffer_len(b); i++) {
+    if (buffer_at(b, i) == '\n') {
+      (*line)++;
+      *col = 1;
+    } else {
+      (*col)++;
+    }
+  }
 }
 
 static int parse_point(const char * s, size_t * pos, buffer * b) {
@@ -667,6 +706,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
 }
 
 static int key_name(char c) {
+  if (c == '\n') return KEY_ENTER;
   if (c == 'b') return KEY_CTRL('b');
   if (c == 'f') return KEY_CTRL('f');
   if (c == 'p') return KEY_CTRL('p');
@@ -675,6 +715,7 @@ static int key_name(char c) {
   if (c == 'e') return KEY_CTRL('e');
   if (c == 'd') return KEY_CTRL('d');
   if (c == 'h') return KEY_CTRL('h');
+  if (c == 's') return KEY_CTRL('s');
   return (unsigned char) c;
 }
 
@@ -788,6 +829,15 @@ static int cmd_save(edit_state * e, int key) {
   return 0;
 }
 
+static int cmd_search(edit_state * e, int key) {
+  e->search_prompt = true;
+  e->search_len = 0;
+  e->search[0] = '\0';
+  set_status(e, "search: ");
+  (void) key;
+  return 0;
+}
+
 static int cmd_quit(edit_state * e, int key) {
   if (active_buffer(e)->dirty && ! e->quit_confirm) {
     e->quit_confirm = true;
@@ -815,13 +865,44 @@ static binding bindings[] = {
   {{KEY_BACKSPACE, 0}, 1, cmd_backspace},
   {{KEY_CTRL('h'), 0}, 1, cmd_backspace},
   {{KEY_ENTER, 0}, 1, cmd_insert},
+  {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit},
 };
 
+static int search_dispatch(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  if (key == KEY_ENTER) {
+    size_t start = 0;
+    size_t end = 0;
+    int rc = e->search_len ?
+      buffer_search(b, p->cursor, e->search, &start, &end) : 0;
+    e->search_prompt = false;
+    if (rc == 1) {
+      p->cursor = start;
+      p->preferred_col = SIZE_MAX;
+      set_status(e, "match %s", e->search);
+    } else {
+      set_status(e, "%s", (rc == 0) ? "no match" : "search failed");
+    }
+    return 0;
+  }
+  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->search_len > 0)
+    e->search[--e->search_len] = '\0';
+  else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
+    e->search[e->search_len++] = (char) key;
+    e->search[e->search_len] = '\0';
+  }
+  set_status(e, "search: %s", e->search);
+  return 0;
+}
+
 static int dispatch(edit_state * e, int key) {
   int keys[2] = {key, 0};
   int n_keys = 1;
+
+  if (e->search_prompt) return search_dispatch(e, key);
 
   if (e->prefix) {
     keys[0] = e->prefix;
@@ -856,7 +937,7 @@ static int tui(const char * path) {
   e.panes[0].buffer = 0;
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
-  snprintf(e.status, sizeof(e.status), "C-x C-s save, C-x C-c quit");
+  snprintf(e.status, sizeof(e.status), "C-s search, C-x C-s save, C-x C-c quit");
 
   const char * gp = getenv("EDIT_GRAMMAR");
   e.has_grammar = (gp != NULL) && (grammar_load(&e.grammar, gp) == 0);
@@ -897,6 +978,35 @@ static int cli_print(const char * range, const char * path) {
     char c = buffer_at(&b, i);
     fwrite(&c, 1, 1, stdout);
   }
+  buffer_free(&b);
+  return 0;
+}
+
+static int cli_search(const char * point, const char * regex, const char * path) {
+  buffer b;
+  if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
+  size_t from;
+  size_t start = 0;
+  size_t end = 0;
+  if (parse_point(point, &from, &b) != 0) {
+    buffer_free(&b);
+    return fprintf(stderr, "edit: bad point\n"), 1;
+  }
+
+  int rc = buffer_search(&b, from, regex, &start, &end);
+  if (rc != 1) {
+    buffer_free(&b);
+    return fprintf(stderr, "edit: %s\n",
+      (rc == 0) ? "no match" : "search failed"), 1;
+  }
+
+  size_t sl;
+  size_t sc;
+  size_t el;
+  size_t ec;
+  pos_line_col(&b, start, &sl, &sc);
+  pos_line_col(&b, end, &el, &ec);
+  printf("%zu:%zu..%zu:%zu\n", sl, sc, el, ec);
   buffer_free(&b);
   return 0;
 }
@@ -952,6 +1062,7 @@ static void usage(void) {
     "  edit --insert line:col text file\n"
     "  edit --delete range file\n"
     "  edit --replace range text file\n"
+    "  edit --search line:col regex file\n"
     "  edit --render rows:cols file\n"
     "  edit --render-at rows:cols line:col file\n"
     "  edit --render-keys rows:cols keys file\n");
@@ -967,6 +1078,8 @@ int main(int argc, char ** argv) {
     return cli_render_keys(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "--print") == 0)
     return cli_print(argv[2], argv[3]);
+  if (argc == 5 && strcmp(argv[1], "--search") == 0)
+    return cli_search(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "--delete") == 0)
     return cli_change(argv[1], argv[2], NULL, argv[3]);
   if (argc == 5 && strcmp(argv[1], "--insert") == 0)

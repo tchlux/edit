@@ -6,12 +6,11 @@ Completed work:
   commands, pty-backed TUI tests, and simple grammar highlighting.
 - Editing safety: rendered status messages, temp-file save flow, dirty-file
   quit protection, and regression coverage.
+- Regex-backed search: explicit byte cursor semantics, batch `--search`,
+  interactive `C-s` forward search, and render/debug coverage.
 
 Outstanding work for `edit`:
 
-- Keep cursor semantics explicit: cursor positions are between bytes, not on
-  character cells.
-- Add search using the local regex engine.
 - Expand syntax highlighting through `grammar.c`, including a small default
   grammar and color config.
 - Add multiple buffers and Emacs-style buffer switching.

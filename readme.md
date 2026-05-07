@@ -12,6 +12,8 @@ Interactive use:
 ./edit file.txt
 ```
 
+Keys: `C-s` search, `C-x C-s` save, `C-x C-c` quit.
+
 Batch use:
 
 ```
@@ -19,6 +21,7 @@ Batch use:
 ./edit --insert 1:1 "text" file.txt
 ./edit --delete 1:1..1:5 file.txt
 ./edit --replace 1:1..1:5 "text" file.txt
+./edit --search 1:1 "regex" file.txt
 ./edit --render 10:80 file.txt
 ./edit --render-at 10:80 2:1 file.txt
 ./edit --render-keys 10:80 nf file.txt
