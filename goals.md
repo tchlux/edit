@@ -1,12 +1,16 @@
 # Goals
 
+Completed work:
+
+- First editor baseline: gap buffer, Emacs-like movement/editing, batch edit
+  commands, pty-backed TUI tests, and simple grammar highlighting.
+- Editing safety: rendered status messages, temp-file save flow, dirty-file
+  quit protection, and regression coverage.
+
 Outstanding work for `edit`:
 
-- Stabilize the terminal UI around the pty test harness before adding features.
 - Keep cursor semantics explicit: cursor positions are between bytes, not on
   character cells.
-- Add full file editing basics: safer save flow, dirty-file quit protection, and
-  simple status messages that are actually rendered.
 - Add search using the local regex engine.
 - Expand syntax highlighting through `grammar.c`, including a small default
   grammar and color config.

@@ -89,6 +89,7 @@ struct edit_state {
   int prefix;
   char status[STATUS_SIZE];
   bool quit;
+  bool quit_confirm;
   bool raw;
   struct termios saved_termios;
   grammar grammar;
@@ -172,19 +173,45 @@ static void buffer_free(buffer * b) {
 }
 
 static int buffer_save(buffer * b) {
-  FILE * f = fopen(b->path, "wb");
-  if (f == NULL) return -1;
+  size_t n = strlen(b->path) + 12;
+  char * tmp = malloc(n);
+  if (tmp == NULL) return -1;
+  snprintf(tmp, n, "%s.tmp.XXXXXX", b->path);
+
+  int fd = mkstemp(tmp);
+  if (fd < 0) {
+    free(tmp);
+    return -1;
+  }
+
+  FILE * f = fdopen(fd, "wb");
+  if (f == NULL) {
+    close(fd);
+    unlink(tmp);
+    free(tmp);
+    return -1;
+  }
   if (fwrite(b->data, 1, b->gap_a, f) != b->gap_a) {
     fclose(f);
+    unlink(tmp);
+    free(tmp);
     return -1;
   }
   size_t tail = b->cap - b->gap_b;
   if (fwrite(b->data + b->gap_b, 1, tail, f) != tail) {
     fclose(f);
+    unlink(tmp);
+    free(tmp);
     return -1;
   }
+  if (fclose(f) != 0 || rename(tmp, b->path) != 0) {
+    unlink(tmp);
+    free(tmp);
+    return -1;
+  }
+  free(tmp);
   b->dirty = false;
-  return fclose(f);
+  return 0;
 }
 
 static int buffer_gap(buffer * b, size_t need) {
@@ -361,6 +388,11 @@ static void set_status(edit_state * e, const char * fmt, ...) {
   va_end(ap);
 }
 
+static void out_clip(output * o, const char * s, size_t * used, size_t limit) {
+  for (size_t i = 0; s[i] != '\0' && *used < limit; i++, (*used)++)
+    out_add(o, &s[i], 1);
+}
+
 static buffer * active_buffer(edit_state * e) {
   return &e->buffers[e->panes[e->active_pane].buffer];
 }
@@ -505,9 +537,17 @@ static void render(edit_state * e) {
   }
 
   out_s(&o, "\x1b[7m");
-  out_f(&o, " %s%s ", b->path, b->dirty ? " *" : "");
-  size_t used = strlen(b->path) + (b->dirty ? 3 : 1);
   size_t status_cols = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
+  size_t used = 0;
+  out_clip(&o, " ", &used, status_cols);
+  if (e->status[0] != '\0') {
+    out_clip(&o, e->status, &used, status_cols);
+    out_clip(&o, "  ", &used, status_cols);
+    if (b->dirty) out_clip(&o, "* ", &used, status_cols);
+  }
+  out_clip(&o, b->path, &used, status_cols);
+  if (b->dirty && e->status[0] == '\0') out_clip(&o, " *", &used, status_cols);
+  out_clip(&o, " ", &used, status_cols);
   while (used++ < status_cols) out_s(&o, " ");
   out_s(&o, "\x1b[0m");
 
@@ -576,6 +616,10 @@ static void render_snapshot(edit_state * e) {
   out_s(&o, "=");
   out_s(&o, b->path);
   if (b->dirty) out_s(&o, "*");
+  if (e->status[0] != '\0') {
+    out_s(&o, " ");
+    out_s(&o, e->status);
+  }
   out_s(&o, "\n");
   fwrite(o.data, 1, o.len, stdout);
   free(o.data);
@@ -745,6 +789,12 @@ static int cmd_save(edit_state * e, int key) {
 }
 
 static int cmd_quit(edit_state * e, int key) {
+  if (active_buffer(e)->dirty && ! e->quit_confirm) {
+    e->quit_confirm = true;
+    set_status(e, "modified; C-x C-c again to quit");
+    (void) key;
+    return 0;
+  }
   e->quit = true;
   (void) key;
   return 0;
@@ -786,10 +836,15 @@ static int dispatch(edit_state * e, int key) {
 
   for (size_t i = 0; i < sizeof(bindings) / sizeof(bindings[0]); i++)
     if (bindings[i].n_keys == n_keys && bindings[i].keys[0] == keys[0] &&
-        bindings[i].keys[1] == keys[1])
+        bindings[i].keys[1] == keys[1]) {
+      if (bindings[i].fn != cmd_quit) e->quit_confirm = false;
       return bindings[i].fn(e, key);
+    }
 
-  if ((n_keys == 1) && (key >= 32) && (key < 127)) return cmd_insert(e, key);
+  if ((n_keys == 1) && (key >= 32) && (key < 127)) {
+    e->quit_confirm = false;
+    return cmd_insert(e, key);
+  }
   return 0;
 }
 

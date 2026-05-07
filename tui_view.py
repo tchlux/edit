@@ -71,9 +71,10 @@ def read_tui(path, rows, cols, key_text):
                 out += os.read(fd, 4096)
             except OSError:
                 break
-    os.write(fd, keys(key_text) + ctrl("x") + ctrl("c"))
+    os.write(fd, keys(key_text))
 
-    end = time.time() + 3
+    done = (0, 0)
+    end = time.time() + 0.25
     while time.time() < end:
         r, _, _ = select.select([fd], [], [], 0.05)
         if fd in r:
@@ -87,7 +88,33 @@ def read_tui(path, rows, cols, key_text):
                 break
         except ChildProcessError:
             break
-    return out
+
+    snapshot = out
+    if not done[0]:
+        os.write(fd, ctrl("x") + ctrl("c"))
+        for _ in range(2):
+            end = time.time() + 0.5
+            while time.time() < end:
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if fd in r:
+                    try:
+                        os.read(fd, 4096)
+                    except OSError:
+                        break
+                try:
+                    done = os.waitpid(pid, os.WNOHANG)
+                    if done[0]:
+                        break
+                except ChildProcessError:
+                    break
+            if done[0]:
+                break
+            os.write(fd, ctrl("x") + ctrl("c"))
+        if not done[0]:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            raise RuntimeError("editor did not exit")
+    return snapshot
 
 
 def decode(out, rows, cols):
