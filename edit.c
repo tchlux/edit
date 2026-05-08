@@ -54,6 +54,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define HISTORY_MAX 1024
 
 enum { HIST_INSERT, HIST_DELETE };
+enum { LAYOUT_ROWS, LAYOUT_COLS };
 
 typedef struct {
   char * data;
@@ -70,6 +71,7 @@ typedef struct {
   size_t cursor;
   size_t top;
   size_t preferred_col;
+  int recenter;
 } pane;
 
 typedef struct {
@@ -101,6 +103,7 @@ struct edit_state {
   int n_buffers;
   int n_panes;
   int active_pane;
+  int layout;
   int rows;
   int cols;
   int prefix;
@@ -457,6 +460,10 @@ static pane * active_pane(edit_state * e) {
   return &e->panes[e->active_pane];
 }
 
+static buffer * pane_buffer(edit_state * e, pane * p) {
+  return &e->buffers[p->buffer];
+}
+
 static void history_free_one(history * h) {
   free(h->text);
   memset(h, 0, sizeof(*h));
@@ -498,6 +505,11 @@ static int edit_insert(edit_state * e, size_t pos, const char * text,
                        size_t len, unsigned group, bool reset_undo) {
   if (len == 0) return 0;
   if (buffer_insert(active_buffer(e), pos, text, len) != 0) return -1;
+  for (int i = 0; i < e->n_panes; i++) {
+    if (i == e->active_pane) continue;
+    if (e->panes[i].cursor >= pos) e->panes[i].cursor += len;
+    if (e->panes[i].top > pos) e->panes[i].top += len;
+  }
   if (history_add(e, HIST_INSERT, pos, text, len, group) != 0) return -1;
   if (reset_undo) e->undo_at = e->n_history;
   return 0;
@@ -516,6 +528,12 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (text == NULL) return -1;
   for (size_t i = 0; i < n; i++) text[i] = buffer_at(b, start + i);
   buffer_delete(b, start, end);
+  for (int i = 0; i < e->n_panes; i++) {
+    pane * p = &e->panes[i];
+    if (i == e->active_pane) continue;
+    if (p->cursor > start) p->cursor = (p->cursor >= end) ? p->cursor - n : start;
+    if (p->top > start) p->top = (p->top >= end) ? p->top - n : start;
+  }
   int rc = history_add(e, HIST_DELETE, start, text, n, group);
   free(text);
   if (rc != 0) return -1;
@@ -599,11 +617,29 @@ static void raw_off(edit_state * e) {
   e->raw = false;
 }
 
-static void ensure_visible(edit_state * e) {
-  buffer * b = active_buffer(e);
-  pane * p = active_pane(e);
+static int pane_body_rows(edit_state * e, int i) {
+  if (e->layout == LAYOUT_COLS) return (e->rows > 1) ? e->rows - 1 : 1;
+  int total = e->rows - e->n_panes;
+  if (total < e->n_panes) return 1;
+  return total / e->n_panes + (i < total % e->n_panes);
+}
+
+static int pane_cols(edit_state * e, int i) {
+  if (e->layout == LAYOUT_ROWS) return e->cols;
+  int width = e->cols / e->n_panes;
+  return width + (i < e->cols % e->n_panes);
+}
+
+static int pane_col(edit_state * e, int i) {
+  if (e->layout == LAYOUT_ROWS) return 0;
+  int x = 0;
+  for (int n = 0; n < i; n++) x += pane_cols(e, n);
+  return x;
+}
+
+static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
+  buffer * b = pane_buffer(e, p);
   size_t cursor = p->cursor;
-  int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
 
   if (cursor < p->top) p->top = line_start(b, cursor);
   for (;;) {
@@ -618,12 +654,15 @@ static void ensure_visible(edit_state * e) {
   }
 }
 
-static void render_line(edit_state * e, output * o, size_t * pos) {
-  buffer * b = active_buffer(e);
+static void ensure_visible(edit_state * e) {
+  ensure_pane_visible(e, active_pane(e), pane_body_rows(e, e->active_pane));
+}
+
+static void render_buffer_line(edit_state * e, output * o, buffer * b,
+                               size_t * pos, size_t limit) {
   char line[LINE_RENDER_MAX];
   size_t n = 0;
   size_t start = *pos;
-  size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
 
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) {
     if (n + 1 < sizeof(line)) line[n++] = buffer_at(b, *pos);
@@ -658,58 +697,124 @@ static void render_line(edit_state * e, output * o, size_t * pos) {
   (void) start;
 }
 
-static void render(edit_state * e) {
-  get_window_size(e);
-  ensure_visible(e);
+static void render_line(edit_state * e, output * o, size_t * pos) {
+  size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
+  render_buffer_line(e, o, active_buffer(e), pos, limit);
+}
 
-  buffer * b = active_buffer(e);
-  pane * p = active_pane(e);
-  output o = {0};
-  out_s(&o, "\x1b[?25l\x1b[H");
-
-  size_t pos = p->top;
-  int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
-  for (int row = 0; row < body_rows; row++) {
-    out_s(&o, "\x1b[K");
-    if (pos < buffer_len(b)) render_line(e, &o, &pos);
-    if (row + 1 < e->rows) out_s(&o, "\r\n");
-  }
-
-  out_s(&o, "\x1b[7m");
-  size_t status_cols = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
-  size_t used = 0;
-  out_clip(&o, " ", &used, status_cols);
-  if (e->status[0] != '\0') {
-    out_clip(&o, e->status, &used, status_cols);
-    out_clip(&o, "  ", &used, status_cols);
-    if (b->dirty) out_clip(&o, "* ", &used, status_cols);
-  }
-  out_clip(&o, b->path, &used, status_cols);
-  if (b->dirty && e->status[0] == '\0') out_clip(&o, " *", &used, status_cols);
-  out_clip(&o, " ", &used, status_cols);
-  while (used++ < status_cols) out_s(&o, " ");
-  out_s(&o, "\x1b[0m");
-
+static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
+  buffer * b = pane_buffer(e, p);
   size_t row_pos = p->top;
   int cy = 0;
   while (row_pos < p->cursor && cy < body_rows) {
     if (buffer_at(b, row_pos) == '\n') cy++;
     row_pos++;
   }
-  if (cy >= body_rows) cy = body_rows - 1;
-  size_t ls = line_start(b, p->cursor);
-  size_t cx = p->cursor - ls;
-  size_t limit = (e->cols > 1) ? (size_t) e->cols - 2 : 0;
-  if (cx > limit) cx = limit;
-  out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cy + 1, cx + 1);
+  return (cy >= body_rows) ? body_rows - 1 : cy;
+}
+
+static size_t pane_cursor_col(edit_state * e, pane * p) {
+  buffer * b = pane_buffer(e, p);
+  size_t cx = p->cursor - line_start(b, p->cursor);
+  int cols = pane_cols(e, (int) (p - e->panes));
+  size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
+  return (cx > limit) ? limit : cx;
+}
+
+static void render_modeline(edit_state * e, output * o, buffer * b,
+                            bool active, int cols) {
+  size_t status_cols = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t used = 0;
+  out_clip(o, (active && e->n_panes > 1) ? ">" : " ", &used, status_cols);
+  if (active && e->status[0] != '\0') {
+    out_clip(o, e->status, &used, status_cols);
+    out_clip(o, "  ", &used, status_cols);
+    if (b->dirty) out_clip(o, "* ", &used, status_cols);
+  }
+  out_clip(o, b->path, &used, status_cols);
+  if (b->dirty && (! active || e->status[0] == '\0')) out_clip(o, " *", &used, status_cols);
+  out_clip(o, " ", &used, status_cols);
+  while (used++ < status_cols) out_s(o, " ");
+}
+
+static void render(edit_state * e) {
+  get_window_size(e);
+  output o = {0};
+  out_s(&o, "\x1b[?25l\x1b[H");
+
+  if (e->layout == LAYOUT_COLS) {
+    size_t pos[8];
+    int cursor_row = 0;
+    size_t cursor_col = 0;
+    int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
+
+    for (int i = 0; i < e->n_panes; i++) {
+      pane * p = &e->panes[i];
+      ensure_pane_visible(e, p, body_rows);
+      pos[i] = p->top;
+      if (i == e->active_pane) {
+        cursor_row = pane_cursor_row(e, p, body_rows);
+        cursor_col = (size_t) pane_col(e, i) + pane_cursor_col(e, p);
+      }
+    }
+    for (int row = 0; row < body_rows; row++) {
+      out_f(&o, "\x1b[%d;1H\x1b[K", row + 1);
+      for (int i = 0; i < e->n_panes; i++) {
+        buffer * b = pane_buffer(e, &e->panes[i]);
+        out_f(&o, "\x1b[%d;%dH", row + 1, pane_col(e, i) + 1);
+        int cols = pane_cols(e, i);
+        if (pos[i] < buffer_len(b))
+          render_buffer_line(e, &o, b, &pos[i], (cols > 1) ? (size_t) cols - 1 : 1);
+      }
+    }
+    out_f(&o, "\x1b[%d;1H", e->rows);
+    for (int i = 0; i < e->n_panes; i++) {
+      out_f(&o, "\x1b[%d;%dH\x1b[7m", e->rows, pane_col(e, i) + 1);
+      render_modeline(e, &o, pane_buffer(e, &e->panes[i]),
+                       i == e->active_pane, pane_cols(e, i));
+      out_s(&o, "\x1b[0m");
+    }
+    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
+    write(STDOUT_FILENO, o.data, o.len);
+    free(o.data);
+    return;
+  }
+
+  int cursor_row = 0;
+  size_t cursor_col = 0;
+  int screen_row = 0;
+  for (int i = 0; i < e->n_panes && screen_row < e->rows; i++) {
+    pane * p = &e->panes[i];
+    buffer * b = pane_buffer(e, p);
+    int body_rows = pane_body_rows(e, i);
+    ensure_pane_visible(e, p, body_rows);
+    if (i == e->active_pane) {
+      cursor_row = screen_row + pane_cursor_row(e, p, body_rows);
+      cursor_col = pane_cursor_col(e, p);
+    }
+
+    size_t pos = p->top;
+    for (int row = 0; row < body_rows && screen_row < e->rows; row++, screen_row++) {
+      out_s(&o, "\x1b[K");
+      if (pos < buffer_len(b))
+        render_buffer_line(e, &o, b, &pos, (e->cols > 1) ? (size_t) e->cols - 1 : 1);
+      if (screen_row + 1 < e->rows) out_s(&o, "\r\n");
+    }
+    if (screen_row < e->rows) {
+      out_s(&o, "\x1b[7m");
+      render_modeline(e, &o, b, i == e->active_pane, e->cols);
+      out_s(&o, "\x1b[0m");
+      if (++screen_row < e->rows) out_s(&o, "\r\n");
+    }
+  }
+  out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
   write(STDOUT_FILENO, o.data, o.len);
   free(o.data);
 }
 
-static void snapshot_line(edit_state * e, output * o, size_t * pos,
+static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
                           int cursor_row, size_t cursor_col, int row) {
-  buffer * b = active_buffer(e);
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
   size_t col = 0;
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') &&
@@ -728,38 +833,110 @@ static void snapshot_line(edit_state * e, output * o, size_t * pos,
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
 
-static void render_snapshot(edit_state * e) {
-  ensure_visible(e);
-  buffer * b = active_buffer(e);
-  pane * p = active_pane(e);
-  output o = {0};
-  int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
-
-  size_t row_pos = p->top;
-  int cy = 0;
-  while (row_pos < p->cursor && cy < body_rows) {
-    if (buffer_at(b, row_pos) == '\n') cy++;
-    row_pos++;
+static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
+                          int cursor_row, size_t cursor_col, int row, int cols) {
+  (void) e;
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t col = 0;
+  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && col < limit) {
+    if ((row == cursor_row) && (col == cursor_col)) {
+      out_s(o, "|");
+      col++;
+    }
+    char c = buffer_at(b, *pos);
+    if (c == ' ') c = '.';
+    if (c == '\t') c = '>';
+    if ((unsigned char) c < 32) c = '?';
+    out_add(o, &c, 1);
+    (*pos)++;
+    col++;
   }
-  if (cy >= body_rows) cy = body_rows - 1;
-  size_t cx = p->cursor - line_start(b, p->cursor);
-  size_t limit = (e->cols > 1) ? (size_t) e->cols - 2 : 0;
-  if (cx > limit) cx = limit;
+  if ((row == cursor_row) && (col == cursor_col) && col < limit) {
+    out_s(o, "|");
+    col++;
+  }
+  while (col++ < limit) out_s(o, " ");
+  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
+  if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
+}
 
-  size_t pos = p->top;
-  for (int row = 0; row < body_rows; row++) {
-    if (pos < buffer_len(b)) snapshot_line(e, &o, &pos, cy, cx, row);
-    else if (row == cy && cx == 0) out_s(&o, "|");
+static void snapshot_modeline(output * o, buffer * b, bool active, int cols) {
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t used = 0;
+  out_s(o, active ? ">" : "=");
+  used++;
+  out_clip(o, b->path, &used, limit);
+  while (used++ < limit) out_s(o, " ");
+}
+
+static void render_snapshot(edit_state * e) {
+  output o = {0};
+  if (e->layout == LAYOUT_COLS) {
+    size_t pos[8];
+    int cy[8];
+    size_t cx[8];
+    int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
+
+    for (int i = 0; i < e->n_panes; i++) {
+      pane * p = &e->panes[i];
+      ensure_pane_visible(e, p, body_rows);
+      pos[i] = p->top;
+      cy[i] = pane_cursor_row(e, p, body_rows);
+      cx[i] = pane_cursor_col(e, p);
+    }
+    for (int row = 0; row < body_rows; row++) {
+      for (int i = 0; i < e->n_panes; i++)
+        snapshot_cell(e, &o, pane_buffer(e, &e->panes[i]), &pos[i],
+                      cy[i], cx[i], row, pane_cols(e, i));
+      out_s(&o, "\n");
+    }
+    for (int i = 0; i < e->n_panes; i++)
+      snapshot_modeline(&o, pane_buffer(e, &e->panes[i]),
+                         i == e->active_pane, pane_cols(e, i));
+    if (e->status[0] != '\0') {
+      out_s(&o, " ");
+      out_s(&o, e->status);
+    }
+    out_s(&o, "\n");
+    fwrite(o.data, 1, o.len, stdout);
+    free(o.data);
+    return;
+  }
+  for (int i = 0; i < e->n_panes; i++) {
+    pane * p = &e->panes[i];
+    buffer * b = pane_buffer(e, p);
+    int body_rows = pane_body_rows(e, i);
+    ensure_pane_visible(e, p, body_rows);
+    int cy = pane_cursor_row(e, p, body_rows);
+    size_t cx = pane_cursor_col(e, p);
+    size_t pos = p->top;
+
+    for (int row = 0; row < body_rows; row++) {
+      if (pos < buffer_len(b)) snapshot_line(e, &o, b, &pos, cy, cx, row);
+      else if (row == cy && cx == 0) out_s(&o, "|");
+      out_s(&o, "\n");
+    }
+    if (e->n_panes > 1) {
+      out_s(&o, (i == e->active_pane) ? ">" : "=");
+      out_s(&o, b->path);
+      if (b->dirty) out_s(&o, "*");
+      if (i == e->active_pane && e->status[0] != '\0') {
+        out_s(&o, " ");
+        out_s(&o, e->status);
+      }
+      out_s(&o, "\n");
+    }
+  }
+  if (e->n_panes == 1) {
+    out_s(&o, "=");
+    out_s(&o, active_buffer(e)->path);
+    if (active_buffer(e)->dirty) out_s(&o, "*");
+    if (e->status[0] != '\0') {
+      out_s(&o, " ");
+      out_s(&o, e->status);
+    }
     out_s(&o, "\n");
   }
-  out_s(&o, "=");
-  out_s(&o, b->path);
-  if (b->dirty) out_s(&o, "*");
-  if (e->status[0] != '\0') {
-    out_s(&o, " ");
-    out_s(&o, e->status);
-  }
-  out_s(&o, "\n");
   fwrite(o.data, 1, o.len, stdout);
   free(o.data);
 }
@@ -846,6 +1023,7 @@ static int key_name(char c) {
   if (c == 'e') return KEY_CTRL('e');
   if (c == 'd') return KEY_CTRL('d');
   if (c == 'h') return KEY_CTRL('h');
+  if (c == 'l') return KEY_CTRL('l');
   if (c == 's') return KEY_CTRL('s');
   if (c == 'v') return KEY_CTRL('v');
   if (c == 'V') return KEY_META('v');
@@ -915,14 +1093,27 @@ static int cmd_down(edit_state * e, int key) {
 }
 
 static int cmd_page_down(edit_state * e, int key) {
-  int n = (e->rows > 1) ? e->rows - 1 : 1;
+  int n = pane_body_rows(e, e->active_pane);
   for (int i = 0; i < n; i++) cmd_down(e, key);
   return 0;
 }
 
 static int cmd_page_up(edit_state * e, int key) {
-  int n = (e->rows > 1) ? e->rows - 1 : 1;
+  int n = pane_body_rows(e, e->active_pane);
   for (int i = 0; i < n; i++) cmd_up(e, key);
+  return 0;
+}
+
+static int cmd_recenter(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  int body_rows = pane_body_rows(e, e->active_pane);
+  int mode = p->recenter++ % 3;
+  int above = (mode == 0) ? body_rows / 2 : (mode == 1) ? 0 : body_rows - 1;
+
+  p->top = line_start(b, p->cursor);
+  for (int i = 0; i < above && p->top > 0; i++) p->top = prev_line(b, p->top);
+  (void) key;
   return 0;
 }
 
@@ -1018,6 +1209,67 @@ static int cmd_search(edit_state * e, int key) {
   return 0;
 }
 
+static int split_pane(edit_state * e, int layout) {
+  if (e->n_panes >= 8 ||
+      (layout == LAYOUT_ROWS && e->rows && e->rows < (e->n_panes + 1) * 2) ||
+      (layout == LAYOUT_COLS && e->cols && e->cols < (e->n_panes + 1) * 4)) {
+    set_status(e, "cannot split");
+    return 0;
+  }
+  int at = e->active_pane + 1;
+  memmove(e->panes + at + 1, e->panes + at,
+          (size_t) (e->n_panes - at) * sizeof(pane));
+  e->panes[at] = e->panes[e->active_pane];
+  e->n_panes++;
+  e->layout = layout;
+  set_status(e, "split");
+  return 0;
+}
+
+static int cmd_split(edit_state * e, int key) {
+  split_pane(e, LAYOUT_ROWS);
+  (void) key;
+  return 0;
+}
+
+static int cmd_split_cols(edit_state * e, int key) {
+  split_pane(e, LAYOUT_COLS);
+  (void) key;
+  return 0;
+}
+
+static int cmd_other_pane(edit_state * e, int key) {
+  if (e->n_panes > 1) e->active_pane = (e->active_pane + 1) % e->n_panes;
+  set_status(e, (e->n_panes > 1) ? "other pane" : "one pane");
+  (void) key;
+  return 0;
+}
+
+static int cmd_close_pane(edit_state * e, int key) {
+  if (e->n_panes <= 1) {
+    set_status(e, "one pane");
+    (void) key;
+    return 0;
+  }
+  memmove(e->panes + e->active_pane, e->panes + e->active_pane + 1,
+          (size_t) (e->n_panes - e->active_pane - 1) * sizeof(pane));
+  e->n_panes--;
+  if (e->active_pane >= e->n_panes) e->active_pane = e->n_panes - 1;
+  set_status(e, "close pane");
+  (void) key;
+  return 0;
+}
+
+static int cmd_one_pane(edit_state * e, int key) {
+  e->panes[0] = *active_pane(e);
+  e->n_panes = 1;
+  e->active_pane = 0;
+  e->layout = LAYOUT_ROWS;
+  set_status(e, "one pane");
+  (void) key;
+  return 0;
+}
+
 static int cmd_quit(edit_state * e, int key) {
   if (active_buffer(e)->dirty && ! e->quit_confirm) {
     e->quit_confirm = true;
@@ -1039,6 +1291,7 @@ static binding bindings[] = {
   {{KEY_CTRL('f'), 0}, 1, cmd_right},
   {{KEY_CTRL('p'), 0}, 1, cmd_up},
   {{KEY_CTRL('n'), 0}, 1, cmd_down},
+  {{KEY_CTRL('l'), 0}, 1, cmd_recenter},
   {{KEY_CTRL('v'), 0}, 1, cmd_page_down},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_CTRL('a'), 0}, 1, cmd_line_start},
@@ -1049,6 +1302,11 @@ static binding bindings[] = {
   {{KEY_ENTER, 0}, 1, cmd_insert},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
+  {{KEY_CTRL('x'), '0'}, 2, cmd_close_pane},
+  {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
+  {{KEY_CTRL('x'), '2'}, 2, cmd_split},
+  {{KEY_CTRL('x'), '3'}, 2, cmd_split_cols},
+  {{KEY_CTRL('x'), 'o'}, 2, cmd_other_pane},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
   {{KEY_CTRL('x'), 'u'}, 2, cmd_undo},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit},
@@ -1103,11 +1361,13 @@ static int dispatch(edit_state * e, int key) {
     if (bindings[i].n_keys == n_keys && bindings[i].keys[0] == keys[0] &&
         bindings[i].keys[1] == keys[1]) {
       if (bindings[i].fn != cmd_quit) e->quit_confirm = false;
+      if (bindings[i].fn != cmd_recenter) active_pane(e)->recenter = 0;
       return bindings[i].fn(e, key);
     }
 
   if ((n_keys == 1) && (key >= 32) && (key < 127)) {
     e->quit_confirm = false;
+    active_pane(e)->recenter = 0;
     return cmd_insert(e, key);
   }
   return 0;

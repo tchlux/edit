@@ -14,11 +14,13 @@ Completed work:
   and pty regression coverage.
 - Emacs-style undo: append-only edit history, undoable inserts/deletes, no
   discarded redo branch after typing following undo, and regression coverage.
+- Split panes: Emacs-style stacked/side-by-side panes sharing one buffer,
+  independent cursors/viewports, pane switching/closing, and regression
+  coverage.
 
 Outstanding work for `edit`:
 
 - Add recent-file history and fast file reopening.
-- Add split panes with shared buffers and independent cursors/viewports.
 - Improve large-file handling beyond a whole-file gap buffer, likely with a
   piece table or paged backing store.
 - Keep language-model usability first-class through reliable batch commands and

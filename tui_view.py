@@ -50,6 +50,9 @@ def keys(s):
         elif s.startswith("<m-v>", i):
             out += b"\x1bv"
             i += 5
+        elif s.startswith("<c-x>", i):
+            out += ctrl("x")
+            i += 5
         elif s[i] == "^" and i + 1 < len(s):
             out += ctrl(s[i + 1].lower())
             i += 2

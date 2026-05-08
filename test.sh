@@ -74,6 +74,51 @@ printf 'l2\nl3\nl4\n|l5\n=%s\n' "$tmp" | cmp -s - "$out"
 ./edit --render-keys 5:12 vV "$tmp" > "$out"
 printf '|l1\nl2\nl3\nl4\n=%s\n' "$tmp" | cmp -s - "$out"
 
+./edit --render-keys 5:20 nnnnnl "$tmp" > "$out"
+printf 'l4\nl5\n|l6\nl7\n=%s\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 5:20 nnnnnll "$tmp" > "$out"
+printf '|l6\nl7\nl8\n\n=%s\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 5:20 nnnnnlll "$tmp" > "$out"
+printf 'l3\nl4\nl5\n|l6\n=%s\n' "$tmp" | cmp -s - "$out"
+
+printf 'one\ntwo\nthree\nfour\n' > "$tmp"
+./edit --render-keys 6:20 x2 "$tmp" > "$out"
+printf '|one\ntwo\n>%s split\n|one\ntwo\n=%s\n' "$tmp" "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 6:20 x2nxof "$tmp" > "$out"
+printf 'one\n|two\n=%s\no|ne\ntwo\n>%s other pane\n' "$tmp" "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 6:20 x2Xxo "$tmp" > "$out"
+printf 'X|one\ntwo\n=%s*\nX|one\ntwo\n>%s* other pane\n' "$tmp" "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 6:20 x2X_xo "$tmp" > "$out"
+printf '|one\ntwo\n=%s*\n|one\ntwo\n>%s* other pane\n' "$tmp" "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 6:20 x2x0 "$tmp" > "$out"
+printf '|one\ntwo\nthree\nfour\n\n=%s close pane\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 6:20 x2x1 "$tmp" > "$out"
+printf '|one\ntwo\nthree\nfour\n\n=%s one pane\n' "$tmp" | cmp -s - "$out"
+
+./edit --render-keys 5:24 x3 "$tmp" > "$out"
+head=$(printf '%s' "$tmp" | cut -c 1-10)
+printf '|one       |one       \ntwo        two        \nthree      three      \nfour       four       \n>%s=%s split\n' "$head" "$head" | cmp -s - "$out"
+
+./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
+printf 'one        o|ne       \n|two       two        \nthree      three      \nfour       four       \n=%s>%s other pane\n' "$head" "$head" | cmp -s - "$out"
+
+python3 ./tui_view.py 6:30 '<c-x>2<c-x>o' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:4:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 5:30 '<c-x>3<c-x>o' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:16\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
 python3 ./tui_view.py 5:20 '^v<m-v>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:1\n' > "$tmp.expected"
