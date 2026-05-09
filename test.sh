@@ -6,7 +6,10 @@ sh ./build.sh
 tmp=$(mktemp)
 base=${tmp##*/}
 out=$(mktemp)
-trap 'rm -f "$tmp" "$out" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"' EXIT
+recent=$(mktemp)
+dir=$(mktemp -d)
+export EDIT_RECENT="$recent"
+trap 'rm -rf "$dir"; rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"' EXIT
 
 printf 'one\ntwo\nthree\n' > "$tmp"
 ./edit --print 2:1..3:1 "$tmp" > "$out"
@@ -274,6 +277,51 @@ printf 'abc\n' | cmp -s - "$tmp"
 python3 ./tui_view.py 5:50 'X^_^x^c' "$tmp" > "$out"
 sed -n '4p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *modified*again*) ;; *) exit 1;; esac
+
+printf 'alpha\n' > "$dir/a"
+printf 'beta\n' > "$dir/b"
+printf 'gamma\n' > "$dir/gamma"
+mkdir "$dir/sub"
+printf 'child\n' > "$dir/sub/child"
+printf '%s\n' "$dir/b" > "$recent"
+python3 ./tui_view.py 5:50 '^x^f
+' "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
+grep -q "^$dir/a$" "$recent"
+grep -q "^$dir/b$" "$recent"
+
+printf '' > "$recent"
+python3 ./tui_view.py 5:50 "^x^f$dir/b
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 5:50 "^x^f$dir/ga<tab>
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *gamma*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 5:50 "^x^f$dir/su<tab>child
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *child*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 5:70 "^x^f$dir/<tab>" "$dir/a" > "$out"
+grep -q 'gamma' "$out"
+grep -q 'sub/' "$out"
+
+printf '%s\n' "$dir/b" > "$recent"
+python3 ./tui_view.py 5:50 'X^x^f' "$dir/a" > "$out"
+sed -n '4p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *modified*save*first*) ;; *) exit 1;; esac
+
+home="$dir/home"
+mkdir "$home"
+env -u EDIT_RECENT HOME="$home" python3 ./tui_view.py 5:50 '^x^f
+' "$dir/a" > "$out"
+test -s "$home/.edit/recent"
+grep -q "^$dir/a$" "$home/.edit/recent"
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
 printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:\n 06:tmp=$(mktemp)\n 07:base=${tmp##*/}\n' > "$tmp.expected"

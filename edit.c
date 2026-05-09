@@ -24,6 +24,7 @@
 #include "grammar.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -33,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -55,7 +57,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define LINE_RENDER_MAX 8192
 #define HISTORY_MAX 1024
 #define DEBUG_PATH_SIZE 512
-#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-s save  C-x C-c quit  Esc r debug"
+#define RECENT_MAX 16
+#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x C-s save  C-x C-c quit  Esc r debug"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
@@ -125,7 +128,12 @@ struct edit_state {
   bool search_reuse;
   char search[STATUS_SIZE];
   size_t search_len;
+  bool find_prompt;
+  bool find_reuse;
+  char find_path[DEBUG_PATH_SIZE];
+  size_t find_len;
   char status[STATUS_SIZE];
+  char footer[STATUS_SIZE];
   bool quit;
   bool quit_confirm;
   bool raw;
@@ -489,6 +497,13 @@ static void set_status(edit_state * e, const char * fmt, ...) {
   va_end(ap);
 }
 
+static void set_footer(edit_state * e, const char * fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(e->footer, sizeof(e->footer), fmt, ap);
+  va_end(ap);
+}
+
 static long long now_ms(void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -606,6 +621,148 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   free(text);
   if (rc != 0) return -1;
   if (reset_undo) e->undo_at = e->n_history;
+  return 0;
+}
+
+static int path_absolute(const char * path, char * out, size_t n) {
+  if (path[0] == '/') return snprintf(out, n, "%s", path) < (int) n ? 0 : -1;
+  char cwd[DEBUG_PATH_SIZE];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) return -1;
+  return snprintf(out, n, "%s/%s", cwd, path) < (int) n ? 0 : -1;
+}
+
+static void chomp(char * s) {
+  s[strcspn(s, "\r\n")] = '\0';
+}
+
+static int recent_path(char * out, size_t n, bool create) {
+  const char * override = getenv("EDIT_RECENT");
+  if (override != NULL && override[0] != '\0')
+    return snprintf(out, n, "%s", override) < (int) n ? 0 : -1;
+
+  const char * home = getenv("HOME");
+  if (home == NULL || home[0] == '\0') return -1;
+  if (snprintf(out, n, "%s/.edit", home) >= (int) n) return -1;
+  if (create) mkdir(out, 0755);
+  return snprintf(out, n, "%s/.edit/recent", home) < (int) n ? 0 : -1;
+}
+
+static int recent_other(const char * current, char * out, size_t n) {
+  char path[DEBUG_PATH_SIZE];
+  char line[DEBUG_PATH_SIZE];
+  if (recent_path(path, sizeof(path), false) != 0) return -1;
+  FILE * f = fopen(path, "r");
+  if (f == NULL) return -1;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    chomp(line);
+    if (line[0] != '\0' && strcmp(line, current) != 0) {
+      int rc = snprintf(out, n, "%s", line) < (int) n ? 0 : -1;
+      fclose(f);
+      return rc;
+    }
+  }
+  fclose(f);
+  return -1;
+}
+
+static int recent_save(const char * path) {
+  char recent[DEBUG_PATH_SIZE];
+  char lines[RECENT_MAX][DEBUG_PATH_SIZE];
+  int n = 1;
+  snprintf(lines[0], sizeof(lines[0]), "%s", path);
+  if (recent_path(recent, sizeof(recent), true) != 0) return -1;
+
+  FILE * f = fopen(recent, "r");
+  if (f != NULL) {
+    char line[DEBUG_PATH_SIZE];
+    while (n < RECENT_MAX && fgets(line, sizeof(line), f) != NULL) {
+      chomp(line);
+      if (line[0] != '\0' && strcmp(line, path) != 0)
+        snprintf(lines[n++], sizeof(lines[0]), "%s", line);
+    }
+    fclose(f);
+  }
+
+  f = fopen(recent, "w");
+  if (f == NULL) return -1;
+  for (int i = 0; i < n; i++) fprintf(f, "%s\n", lines[i]);
+  return fclose(f);
+}
+
+static bool starts_with(const char * s, const char * prefix) {
+  return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static void common_prefix(char * s, const char * t) {
+  size_t i = 0;
+  while (s[i] != '\0' && t[i] != '\0' && s[i] == t[i]) i++;
+  s[i] = '\0';
+}
+
+static void path_parts(const char * path, char * dir, char * prefix, char * base) {
+  const char * slash = strrchr(path, '/');
+  if (slash == NULL) {
+    snprintf(dir, DEBUG_PATH_SIZE, ".");
+    prefix[0] = '\0';
+    snprintf(base, DEBUG_PATH_SIZE, "%s", path);
+    return;
+  }
+
+  size_t n = (size_t) (slash - path) + 1;
+  snprintf(prefix, DEBUG_PATH_SIZE, "%.*s", (int) n, path);
+  snprintf(base, DEBUG_PATH_SIZE, "%s", slash + 1);
+  if (n == 1) snprintf(dir, DEBUG_PATH_SIZE, "/");
+  else snprintf(dir, DEBUG_PATH_SIZE, "%.*s", (int) (n - 1), path);
+}
+
+static bool directory_path(const char * path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void find_set(edit_state * e, const char * path) {
+  snprintf(e->find_path, sizeof(e->find_path), "%s", path);
+  e->find_len = strlen(e->find_path);
+  e->find_reuse = false;
+}
+
+static int find_complete(edit_state * e) {
+  char dir[DEBUG_PATH_SIZE];
+  char prefix[DEBUG_PATH_SIZE];
+  char base[DEBUG_PATH_SIZE];
+  char match[DEBUG_PATH_SIZE] = "";
+  char list[STATUS_SIZE] = "";
+  int n = 0;
+
+  path_parts(e->find_path, dir, prefix, base);
+  DIR * d = opendir(dir);
+  if (d == NULL) return set_status(e, "no such directory"), 0;
+
+  for (struct dirent * ent = readdir(d); ent != NULL; ent = readdir(d)) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+    if (! starts_with(ent->d_name, base)) continue;
+    if (n == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
+    else common_prefix(match, ent->d_name);
+    if (base[0] == '\0') {
+      char path[DEBUG_PATH_SIZE];
+      size_t used = strlen(list);
+      snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
+      snprintf(list + used, sizeof(list) - used, "%s%s%s",
+               used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
+    }
+    n++;
+  }
+  closedir(d);
+
+  if (n == 0) return set_footer(e, "no match"), 0;
+  if (base[0] == '\0') return set_footer(e, "%s", list[0] ? list : "empty directory"), 0;
+
+  char path[DEBUG_PATH_SIZE];
+  snprintf(path, sizeof(path), "%s%s", prefix, match);
+  if (n == 1 && directory_path(path) && strlen(path) + 1 < sizeof(path))
+    strcat(path, "/");
+  find_set(e, path);
+  set_status(e, "find file: %s", e->find_path);
   return 0;
 }
 
@@ -849,10 +1006,10 @@ static void modeline_pos(output * o, buffer * b, pane * p,
   out_clip(o, s, used, limit);
 }
 
-static void render_keymap(output * o, int cols) {
+static void render_footer(edit_state * e, output * o, int cols) {
   size_t used = 0;
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
-  out_clip(o, KEYMAP_HINT, &used, limit);
+  out_clip(o, e->footer[0] ? e->footer : KEYMAP_HINT, &used, limit);
   while (used++ < limit) out_s(o, " ");
 }
 
@@ -914,7 +1071,7 @@ static void render(edit_state * e) {
       out_s(&o, "\x1b[0m");
     }
     out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
-    render_keymap(&o, e->cols);
+    render_footer(e, &o, e->cols);
     out_s(&o, "\x1b[0m");
     out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
     debug_log_render(e, &o);
@@ -952,7 +1109,7 @@ static void render(edit_state * e) {
   }
   if (screen_row < e->rows) {
     out_s(&o, "\x1b[90m");
-    render_keymap(&o, e->cols);
+    render_footer(e, &o, e->cols);
     out_s(&o, "\x1b[0m");
   }
   out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
@@ -1024,7 +1181,7 @@ static void snapshot_modeline(edit_state * e, output * o, pane * p,
 static void snapshot_keymap(edit_state * e, output * o) {
   size_t used = 0;
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
-  out_clip(o, KEYMAP_HINT, &used, limit);
+  out_clip(o, e->footer[0] ? e->footer : KEYMAP_HINT, &used, limit);
   out_s(o, "\n");
 }
 
@@ -1525,6 +1682,62 @@ static int cmd_save(edit_state * e, int key) {
   return 0;
 }
 
+static void reset_panes(edit_state * e) {
+  for (int i = 0; i < e->n_panes; i++) {
+    e->panes[i].buffer = 0;
+    e->panes[i].cursor = 0;
+    e->panes[i].top = 0;
+    e->panes[i].preferred_col = SIZE_MAX;
+    e->panes[i].recenter = 0;
+  }
+  e->active_pane = 0;
+}
+
+static int open_find_path(edit_state * e) {
+  if (e->find_len == 0) {
+    e->find_prompt = false;
+    return set_status(e, "no file"), 0;
+  }
+  if (active_buffer(e)->dirty) return set_status(e, "modified; save first"), 0;
+
+  char path[DEBUG_PATH_SIZE];
+  if (path_absolute(e->find_path, path, sizeof(path)) != 0) {
+    e->find_prompt = false;
+    return set_status(e, "bad path"), 0;
+  }
+
+  buffer next;
+  if (buffer_load(&next, path) != 0) {
+    e->find_prompt = false;
+    return set_status(e, "open failed"), 0;
+  }
+  buffer_free(active_buffer(e));
+  e->buffers[0] = next;
+  e->n_buffers = 1;
+  reset_panes(e);
+  history_free(e);
+  recent_save(path);
+  e->find_prompt = false;
+  e->find_reuse = false;
+  set_status(e, "opened %s", file_name(path));
+  return 0;
+}
+
+static int cmd_find_file(edit_state * e, int key) {
+  char current[DEBUG_PATH_SIZE];
+  (void) key;
+  if (active_buffer(e)->dirty) return set_status(e, "modified; save first"), 0;
+  if (path_absolute(active_buffer(e)->path, current, sizeof(current)) != 0)
+    snprintf(current, sizeof(current), "%s", active_buffer(e)->path);
+  if (recent_other(current, e->find_path, sizeof(e->find_path)) != 0)
+    e->find_path[0] = '\0';
+  e->find_len = strlen(e->find_path);
+  e->find_prompt = true;
+  e->find_reuse = e->find_len > 0;
+  set_status(e, "find file: %s", e->find_path);
+  return 0;
+}
+
 static int search_move(edit_state * e, bool reverse, bool skip_current) {
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
@@ -1573,6 +1786,8 @@ static int cmd_cancel(edit_state * e, int key) {
   e->prefix = 0;
   e->search_prompt = false;
   e->search_reuse = false;
+  e->find_prompt = false;
+  e->find_reuse = false;
   e->quit_confirm = false;
   set_status(e, "cancel");
   (void) key;
@@ -1682,11 +1897,32 @@ static binding bindings[] = {
   {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
   {{KEY_CTRL('x'), '2'}, 2, cmd_split},
   {{KEY_CTRL('x'), '3'}, 2, cmd_split_cols},
+  {{KEY_CTRL('x'), KEY_CTRL('f')}, 2, cmd_find_file},
   {{KEY_CTRL('x'), 'o'}, 2, cmd_other_pane},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
   {{KEY_CTRL('x'), 'u'}, 2, cmd_undo},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit},
 };
+
+static int find_dispatch(edit_state * e, int key) {
+  e->footer[0] = '\0';
+  if (key == KEY_ENTER) return open_find_path(e);
+  if (key == KEY_CTRL('i')) return find_complete(e);
+  if (e->find_reuse && key >= 32 && key < 127) {
+    e->find_len = 0;
+    e->find_path[0] = '\0';
+    e->find_reuse = false;
+  }
+  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->find_len > 0) {
+    e->find_path[--e->find_len] = '\0';
+    e->find_reuse = false;
+  } else if (key >= 32 && key < 127 && e->find_len + 1 < sizeof(e->find_path)) {
+    e->find_path[e->find_len++] = (char) key;
+    e->find_path[e->find_len] = '\0';
+  }
+  set_status(e, "find file: %s", e->find_path);
+  return 0;
+}
 
 static int search_dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
@@ -1725,6 +1961,7 @@ static int dispatch(edit_state * e, int key) {
   int n_keys = 1;
 
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (e->find_prompt) return find_dispatch(e, key);
   if (e->search_prompt) return search_dispatch(e, key);
 
   if (e->prefix) {
@@ -1756,6 +1993,7 @@ static int dispatch(edit_state * e, int key) {
 
 static int tui(const char * path) {
   edit_state e;
+  char open_path[DEBUG_PATH_SIZE];
   memset(&e, 0, sizeof(e));
   e.n_buffers = 1;
   e.n_panes = 1;
@@ -1763,12 +2001,15 @@ static int tui(const char * path) {
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
   snprintf(e.status, sizeof(e.status), "C-s/C-r search, C-g cancel, Esc r debug");
+  if (path_absolute(path, open_path, sizeof(open_path)) != 0)
+    snprintf(open_path, sizeof(open_path), "%s", path);
 
   load_grammar(&e);
-  if (buffer_load(&e.buffers[0], path) != 0) {
+  if (buffer_load(&e.buffers[0], open_path) != 0) {
     fprintf(stderr, "edit: cannot open %s\n", path);
     return 1;
   }
+  recent_save(open_path);
   if (raw_on(&e) != 0) {
     fprintf(stderr, "edit: raw mode failed\n");
     history_free(&e);

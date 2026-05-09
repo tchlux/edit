@@ -20,9 +20,12 @@ repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `Esc f`/`Esc b` word movement,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
-`C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-s` save,
-`C-x C-c` quit. `Esc r` records a debug log until the next plain `Esc`, then
-prompts for a note.
+`C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
+`C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
+plain `Esc`, then prompts for a note.
+
+`C-x C-f` stores recent files in `$HOME/.edit/recent`; set `EDIT_RECENT` to
+override that path.
 
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
 Use the literal `Esc` prefix for reliable command input.

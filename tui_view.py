@@ -65,6 +65,9 @@ def keys(s):
         elif s.startswith("<m-r>", i):
             out += b"\x1br"
             i += 5
+        elif s.startswith("<tab>", i):
+            out += b"\t"
+            i += 5
         elif s.startswith("<esc>", i):
             out += b"\x1b\x00"
             i += 5
@@ -152,7 +155,7 @@ def read_tui(path, rows, cols, key_text):
 
     snapshot = out
     if not done[0]:
-        os.write(fd, ctrl("x") + ctrl("c"))
+        os.write(fd, ctrl("g") + ctrl("x") + ctrl("c"))
         for _ in range(2):
             end = time.time() + 0.5
             while time.time() < end:

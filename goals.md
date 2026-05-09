@@ -24,10 +24,12 @@ Completed work:
 - Debug tooling: `Esc r` TUI recording with terminal size, raw key bytes,
   decoded keys, state snapshots, ANSI render bytes, and final user note; plus a
   standalone `keydump.sh` terminal byte inspector for macOS Option diagnosis.
+- Recent files: `C-x C-f` find-file prompt, fast reopen of the most recent
+  different file, and global `$HOME/.edit/recent` history with `EDIT_RECENT`
+  override for tests/debugging.
 
 Outstanding work for `edit`:
 
-- Add recent-file history and fast file reopening.
 - Improve large-file handling beyond a whole-file gap buffer, likely with a
   piece table or paged backing store.
 - Keep language-model usability first-class through reliable batch commands and
