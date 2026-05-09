@@ -55,7 +55,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define LINE_RENDER_MAX 8192
 #define HISTORY_MAX 1024
 #define DEBUG_PATH_SIZE 512
-#define KEYMAP_HINT "C-s search  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-s save  C-x C-c quit  Esc r debug"
+#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-s save  C-x C-c quit  Esc r debug"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
@@ -121,6 +121,8 @@ struct edit_state {
   int cols;
   int prefix;
   bool search_prompt;
+  bool search_reverse;
+  bool search_reuse;
   char search[STATUS_SIZE];
   size_t search_len;
   char status[STATUS_SIZE];
@@ -333,6 +335,25 @@ static int buffer_search(buffer * b, size_t from, const char * regex,
   *start = from + (size_t) a;
   *end = from + (size_t) z;
   return 1;
+}
+
+static int buffer_search_back(buffer * b, size_t from, const char * regex,
+                              size_t * start, size_t * end) {
+  size_t len = buffer_len(b);
+  size_t pos = 0;
+  int found = 0;
+  if (from > len) from = len;
+  while (pos <= from) {
+    size_t a = 0;
+    size_t z = 0;
+    int rc = buffer_search(b, pos, regex, &a, &z);
+    if (rc != 1 || a > from) break;
+    *start = a;
+    *end = z;
+    found = 1;
+    pos = (z > pos) ? z : a + 1;
+  }
+  return found;
 }
 
 static size_t line_start(buffer * b, size_t pos) {
@@ -1281,6 +1302,8 @@ static int key_name(char c) {
   if (c == 'd') return KEY_CTRL('d');
   if (c == 'h') return KEY_CTRL('h');
   if (c == 'l') return KEY_CTRL('l');
+  if (c == 'g') return KEY_CTRL('g');
+  if (c == 'r') return KEY_CTRL('r');
   if (c == 's') return KEY_CTRL('s');
   if (c == 'v') return KEY_CTRL('v');
   if (c == 'B') return KEY_META('b');
@@ -1502,11 +1525,56 @@ static int cmd_save(edit_state * e, int key) {
   return 0;
 }
 
-static int cmd_search(edit_state * e, int key) {
+static int search_move(edit_state * e, bool reverse, bool skip_current) {
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  size_t start = 0;
+  size_t end = 0;
+  size_t from = p->cursor;
+  int rc;
+
+  if (e->search_len == 0) return set_status(e, "no search"), 0;
+  if (reverse) {
+    if (skip_current && from > 0) from--;
+    rc = buffer_search_back(b, from, e->search, &start, &end);
+  } else {
+    if (skip_current && from < buffer_len(b)) from++;
+    rc = buffer_search(b, from, e->search, &start, &end);
+  }
+  if (rc == 1) {
+    p->cursor = start;
+    p->preferred_col = SIZE_MAX;
+    set_status(e, "match %s", e->search);
+  } else {
+    set_status(e, "%s", (rc == 0) ? "no match" : "search failed");
+  }
+  return 0;
+}
+
+static int cmd_search_dir(edit_state * e, bool reverse) {
   e->search_prompt = true;
-  e->search_len = 0;
-  e->search[0] = '\0';
-  set_status(e, "search: ");
+  e->search_reverse = reverse;
+  e->search_reuse = e->search_len > 0;
+  set_status(e, "%ssearch: %s", reverse ? "r" : "", e->search);
+  return 0;
+}
+
+static int cmd_search(edit_state * e, int key) {
+  (void) key;
+  return cmd_search_dir(e, false);
+}
+
+static int cmd_reverse_search(edit_state * e, int key) {
+  (void) key;
+  return cmd_search_dir(e, true);
+}
+
+static int cmd_cancel(edit_state * e, int key) {
+  e->prefix = 0;
+  e->search_prompt = false;
+  e->search_reuse = false;
+  e->quit_confirm = false;
+  set_status(e, "cancel");
   (void) key;
   return 0;
 }
@@ -1606,6 +1674,8 @@ static binding bindings[] = {
   {{KEY_BACKSPACE, 0}, 1, cmd_backspace},
   {{KEY_CTRL('h'), 0}, 1, cmd_backspace},
   {{KEY_ENTER, 0}, 1, cmd_insert},
+  {{KEY_CTRL('g'), 0}, 1, cmd_cancel},
+  {{KEY_CTRL('r'), 0}, 1, cmd_reverse_search},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
   {{KEY_CTRL('x'), '0'}, 2, cmd_close_pane},
@@ -1619,30 +1689,34 @@ static binding bindings[] = {
 };
 
 static int search_dispatch(edit_state * e, int key) {
-  pane * p = active_pane(e);
-  buffer * b = active_buffer(e);
-  if (key == KEY_ENTER) {
-    size_t start = 0;
-    size_t end = 0;
-    int rc = e->search_len ?
-      buffer_search(b, p->cursor, e->search, &start, &end) : 0;
-    e->search_prompt = false;
-    if (rc == 1) {
-      p->cursor = start;
-      p->preferred_col = SIZE_MAX;
-      set_status(e, "match %s", e->search);
-    } else {
-      set_status(e, "%s", (rc == 0) ? "no match" : "search failed");
-    }
+  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (key == KEY_CTRL('s') || key == KEY_CTRL('r')) {
+    bool reverse = key == KEY_CTRL('r');
+    bool skip = e->search_reuse;
+    e->search_reverse = reverse;
+    search_move(e, reverse, skip);
+    e->search_reuse = true;
     return 0;
   }
-  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->search_len > 0)
+  if (key == KEY_ENTER) {
+    search_move(e, e->search_reverse, false);
+    e->search_prompt = false;
+    e->search_reuse = false;
+    return 0;
+  }
+  if (e->search_reuse && key >= 32 && key < 127) {
+    e->search_len = 0;
+    e->search[0] = '\0';
+    e->search_reuse = false;
+  }
+  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->search_len > 0) {
     e->search[--e->search_len] = '\0';
-  else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
+    e->search_reuse = false;
+  } else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
     e->search[e->search_len++] = (char) key;
     e->search[e->search_len] = '\0';
   }
-  set_status(e, "search: %s", e->search);
+  set_status(e, "%ssearch: %s", e->search_reverse ? "r" : "", e->search);
   return 0;
 }
 
@@ -1650,6 +1724,7 @@ static int dispatch(edit_state * e, int key) {
   int keys[2] = {key, 0};
   int n_keys = 1;
 
+  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
   if (e->search_prompt) return search_dispatch(e, key);
 
   if (e->prefix) {
@@ -1687,7 +1762,7 @@ static int tui(const char * path) {
   e.panes[0].buffer = 0;
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
-  snprintf(e.status, sizeof(e.status), "C-s search, Esc r debug, C-x C-s save, C-x C-c quit");
+  snprintf(e.status, sizeof(e.status), "C-s/C-r search, C-g cancel, Esc r debug");
 
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0) {
@@ -1712,7 +1787,8 @@ static int tui(const char * path) {
       debug_log_state(&e, "before");
     }
 
-    if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC) {
+    if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC &&
+        key != KEY_CTRL('g')) {
       e.prefix = 0;
       if (key >= 0 && key < 128) {
         key = KEY_META(key);

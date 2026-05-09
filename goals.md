@@ -7,7 +7,8 @@ Completed work:
 - Editing safety: rendered status messages, temp-file save flow, dirty-file
   quit protection, and regression coverage.
 - Regex-backed search: explicit byte cursor semantics, batch `--search`,
-  interactive `C-s` forward search, and render/debug coverage.
+  interactive `C-s` forward search, `C-r` reverse search, repeated next/previous
+  match navigation, `C-g` cancel, and render/debug coverage.
 - Syntax highlighting: default C-like grammar, custom grammar override, word
   rules, multi-span line rendering, and raw color render coverage.
 - Page navigation: Emacs-style `C-v` page down and `M-v` page up, with batch
@@ -17,6 +18,12 @@ Completed work:
 - Split panes: Emacs-style stacked/side-by-side panes sharing one buffer,
   independent cursors/viewports, pane switching/closing, and regression
   coverage.
+- Modeline and movement polish: filename plus cursor `line:column`, separate
+  keymap reminder row, `M-n`/`M-p` 10-line movement, and regex-backed
+  `M-f`/`M-b` word movement.
+- Debug tooling: `Esc r` TUI recording with terminal size, raw key bytes,
+  decoded keys, state snapshots, ANSI render bytes, and final user note; plus a
+  standalone `keydump.sh` terminal byte inspector for macOS Option diagnosis.
 
 Outstanding work for `edit`:
 
@@ -31,7 +38,6 @@ Preferred customization goals:
 - Indentation: use spaces instead of tabs; display literal tabs at width 3.
 - Line display: truncate long lines by default; `C-c C-w` toggles visual line
   wrapping.
-- Status display: show the current cursor column.
 - Theme: dark palette with foreground `#E0E0E0` and background `#202020`.
 - Cursor: solid and non-blinking.
 - JavaScript: indent width 2.
@@ -51,8 +57,6 @@ Preferred customization goals:
 - Environment: support explicit `PATH` and `PYTHONPATH` settings. Initial
   values from `.emacs` are `PATH=/Users/thomaslux/Sync/bin:/Users/thomaslux/.local/bin:/opt/homebrew/bin:/opt/homebrew/opt/binutils/bin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/Library/Apple/usr/bin:/usr/local/sbin`
   and `PYTHONPATH=/Users/thomaslux/Sync/bin/python:/Users/thomaslux/Library/Python/3.12/lib/python/site-packages`.
-- `M-n`: move down 10 lines.
-- `M-p`: move up 10 lines.
 - Mouse wheel up/down: move the cursor line-by-line.
 - Mouse wheel left/right: move the cursor by characters.
 - Scrolling: gradually recenter once the cursor crosses half the window.
@@ -66,7 +70,8 @@ Preferred customization goals:
 - Spelling: use right-click (`mouse-3`) for corrections.
 - Spelling: use local aspell binaries at
   `~/Sync/bin/aspell/aspell-<system-name>`.
-- macOS modifiers: map Option to Meta and Command to Super.
+- macOS modifiers: map Command to Super and improve terminal-level Meta
+  behavior where the terminal actually sends Meta bytes.
 - `C-c C-c`: stream AI completion into the buffer at the cursor.
 - AI completion: cancel on any user action.
 - AI completion: build prompts from nearby file context and the current file

@@ -12,7 +12,12 @@ Interactive use:
 ./edit file.txt
 ```
 
-Keys: `C-l` recenter, `C-s` search, `Esc f`/`Esc b` word movement,
+The modeline shows the file name and current `line:column`; the row below it
+shows built-in key reminders.
+
+Keys: `C-l` recenter, `C-s` search forward, `C-r` search backward,
+repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
+`Esc f`/`Esc b` word movement,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-s` save,
@@ -40,7 +45,12 @@ TUI debug:
 
 ```
 python3 ./tui_view.py 10:80 '<down><right>' file.txt
+./keydump.sh
 ```
+
+`Esc r` starts a detailed UI recording and saves a local debug log after the
+next plain `Esc` and note prompt. `./keydump.sh` prints raw key bytes from the
+terminal for modifier/debugging work.
 
 Highlighting:
 
