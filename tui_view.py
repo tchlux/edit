@@ -50,12 +50,63 @@ def keys(s):
         elif s.startswith("<m-v>", i):
             out += b"\x1bv"
             i += 5
+        elif s.startswith("<m-n>", i):
+            out += b"\x1bn"
+            i += 5
+        elif s.startswith("<m-p>", i):
+            out += b"\x1bp"
+            i += 5
+        elif s.startswith("<m-f>", i):
+            out += b"\x1bf"
+            i += 5
+        elif s.startswith("<m-b>", i):
+            out += b"\x1bb"
+            i += 5
+        elif s.startswith("<m-r>", i):
+            out += b"\x1br"
+            i += 5
+        elif s.startswith("<esc>", i):
+            out += b"\x1b\x00"
+            i += 5
+        elif s.startswith("<opt-n>", i):
+            out += bytes([0xCB, 0x9C])
+            i += 7
+        elif s.startswith("<opt-p>", i):
+            out += bytes([0xCF, 0x80])
+            i += 7
+        elif s.startswith("<opt-f>", i):
+            out += bytes([0xC6, 0x92])
+            i += 7
+        elif s.startswith("<opt-b>", i):
+            out += bytes([0xE2, 0x88, 0xAB])
+            i += 7
+        elif s.startswith("<opt-r>", i):
+            out += bytes([0xC2, 0xAE])
+            i += 7
+        elif s.startswith("<mac-n>", i):
+            out += bytes([0xCB, 0x9C])
+            i += 7
+        elif s.startswith("<mac-p>", i):
+            out += bytes([0xCF, 0x80])
+            i += 7
+        elif s.startswith("<mac-f>", i):
+            out += bytes([0xC6, 0x92])
+            i += 7
+        elif s.startswith("<mac-b>", i):
+            out += bytes([0xE2, 0x88, 0xAB])
+            i += 7
+        elif s.startswith("<mac-r>", i):
+            out += bytes([0xC2, 0xAE])
+            i += 7
         elif s.startswith("<c-x>", i):
             out += ctrl("x")
             i += 5
         elif s[i] == "^" and i + 1 < len(s):
             out += ctrl(s[i + 1].lower())
             i += 2
+        elif s[i] == "\n":
+            out += b"\r"
+            i += 1
         else:
             out += s[i].encode()
             i += 1
@@ -77,7 +128,11 @@ def read_tui(path, rows, cols, key_text):
                 out += os.read(fd, 4096)
             except OSError:
                 break
-    os.write(fd, keys(key_text))
+    for c in keys(key_text):
+        if c == 0:
+            time.sleep(0.05)
+        else:
+            os.write(fd, bytes([c]))
 
     done = (0, 0)
     end = time.time() + 0.25

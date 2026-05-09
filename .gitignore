@@ -1,3 +1,5 @@
 .source-control
 edit
+keydump
 *.o
+logs/debug-*.log

@@ -34,7 +34,9 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 void match(const char * regex, const char * string, int * start, int * end);
@@ -52,6 +54,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define STATUS_SIZE 160
 #define LINE_RENDER_MAX 8192
 #define HISTORY_MAX 1024
+#define DEBUG_PATH_SIZE 512
+#define KEYMAP_HINT "C-s search  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-s save  C-x C-c quit  Esc r debug"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
@@ -97,6 +101,15 @@ typedef struct {
   command_fn fn;
 } binding;
 
+typedef struct {
+  int key;
+  unsigned char raw[32];
+  int n_raw;
+  long long start_ms;
+  long long end_ms;
+  char kind[24];
+} key_event;
+
 struct edit_state {
   buffer buffers[8];
   pane panes[8];
@@ -114,11 +127,19 @@ struct edit_state {
   bool quit;
   bool quit_confirm;
   bool raw;
+  bool debug_recording;
+  bool debug_note_prompt;
+  FILE * debug_log;
+  char debug_path[DEBUG_PATH_SIZE];
+  char debug_note[STATUS_SIZE];
+  size_t debug_note_len;
+  unsigned debug_event;
   history history[HISTORY_MAX];
   int n_history;
   int undo_at;
   unsigned history_group;
   struct termios saved_termios;
+  struct termios raw_termios;
   grammar grammar;
   bool has_grammar;
 };
@@ -447,6 +468,32 @@ static void set_status(edit_state * e, const char * fmt, ...) {
   va_end(ap);
 }
 
+static long long now_ms(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (long long) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static void out_hex(output * o, const unsigned char * s, size_t n) {
+  for (size_t i = 0; i < n; i++) out_f(o, "%02x%s", s[i], (i + 1 == n) ? "" : " ");
+}
+
+static void key_text(int key, char * out, size_t n) {
+  if (key == KEY_ESC) snprintf(out, n, "ESC");
+  else if (key == KEY_ENTER) snprintf(out, n, "ENTER");
+  else if (key == KEY_BACKSPACE) snprintf(out, n, "BACKSPACE");
+  else if (key == KEY_UP) snprintf(out, n, "UP");
+  else if (key == KEY_DOWN) snprintf(out, n, "DOWN");
+  else if (key == KEY_LEFT) snprintf(out, n, "LEFT");
+  else if (key == KEY_RIGHT) snprintf(out, n, "RIGHT");
+  else if (key >= KEY_META(0) && key < KEY_META(128)) {
+    int c = key - KEY_META(0);
+    snprintf(out, n, (c >= 32 && c < 127) ? "M-%c" : "M-%d", c);
+  } else if (key > 0 && key < 32) snprintf(out, n, "C-%c", key + 96);
+  else if (key >= 32 && key < 127) snprintf(out, n, "%c", key);
+  else snprintf(out, n, "%d", key);
+}
+
 static void out_clip(output * o, const char * s, size_t * used, size_t limit) {
   for (size_t i = 0; s[i] != '\0' && *used < limit; i++, (*used)++)
     out_add(o, &s[i], 1);
@@ -573,14 +620,47 @@ static int raw_on(edit_state * e) {
   raw.c_cc[VMIN] = 1;
   raw.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return -1;
+  e->raw_termios = raw;
   e->raw = true;
   return 0;
 }
 
-static int read_key(void) {
+static key_event read_key_event(void) {
+  key_event ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.key = -1;
+  ev.start_ms = now_ms();
+
   char c;
-  if (read(STDIN_FILENO, &c, 1) != 1) return -1;
-  if ((unsigned char) c != KEY_ESC) return (unsigned char) c;
+  if (read(STDIN_FILENO, &c, 1) != 1) return ev;
+  unsigned char uc = (unsigned char) c;
+  ev.raw[ev.n_raw++] = uc;
+  if (uc != KEY_ESC) {
+    int need = (uc >= 0xf0) ? 4 : (uc >= 0xe0) ? 3 : (uc >= 0xc0) ? 2 : 1;
+    while (ev.n_raw < need && ev.n_raw < (int) sizeof(ev.raw)) {
+      fd_set set;
+      struct timeval tv = {0, 20000};
+      FD_ZERO(&set);
+      FD_SET(STDIN_FILENO, &set);
+      if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) break;
+      if (read(STDIN_FILENO, &c, 1) != 1) break;
+      ev.raw[ev.n_raw++] = (unsigned char) c;
+    }
+    if (ev.n_raw == 2 && ev.raw[0] == 0xc6 && ev.raw[1] == 0x92) ev.key = KEY_META('f');
+    else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0xab) ev.key = KEY_META('b');
+    else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xae) ev.key = KEY_META('r');
+    else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x9c) ev.key = KEY_META('n');
+    else if (ev.n_raw == 2 && ev.raw[0] == 0xcf && ev.raw[1] == 0x80) ev.key = KEY_META('p');
+    if (ev.key >= KEY_META(0)) {
+      snprintf(ev.kind, sizeof(ev.kind), "mac-option");
+      ev.end_ms = now_ms();
+      return ev;
+    }
+    ev.key = (uc & 0x80) ? KEY_META(uc & 0x7f) : uc;
+    snprintf(ev.kind, sizeof(ev.kind), "%s", (uc & 0x80) ? "high-meta" : "plain");
+    ev.end_ms = now_ms();
+    return ev;
+  }
 
   char seq[32];
   int n = 0;
@@ -591,6 +671,7 @@ static int read_key(void) {
     FD_SET(STDIN_FILENO, &set);
     if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) break;
     if (read(STDIN_FILENO, &seq[n], 1) != 1) break;
+    if (ev.n_raw < (int) sizeof(ev.raw)) ev.raw[ev.n_raw++] = (unsigned char) seq[n];
     n++;
     if ((n == 1) && ((seq[0] != '[') && (seq[0] != 'O'))) break;
     if ((seq[0] == 'O') && (n == 2)) break;
@@ -600,16 +681,30 @@ static int read_key(void) {
     }
   }
 
-  if (n == 1) return KEY_META((unsigned char) seq[0]);
-  if (n < 2) return KEY_ESC;
+  ev.end_ms = now_ms();
+  if (n == 1) {
+    ev.key = KEY_META((unsigned char) seq[0]);
+    snprintf(ev.kind, sizeof(ev.kind), "esc-meta");
+    return ev;
+  }
+  if (n < 2) {
+    ev.key = KEY_ESC;
+    snprintf(ev.kind, sizeof(ev.kind), "plain-esc");
+    return ev;
+  }
   char final = seq[n-1];
   if ((seq[0] == '[') || (seq[0] == 'O')) {
-    if (final == 'A') return KEY_UP;
-    if (final == 'B') return KEY_DOWN;
-    if (final == 'C') return KEY_RIGHT;
-    if (final == 'D') return KEY_LEFT;
+    snprintf(ev.kind, sizeof(ev.kind), "%s", seq[0] == '[' ? "csi" : "ss3");
+    if (final == 'A') ev.key = KEY_UP;
+    else if (final == 'B') ev.key = KEY_DOWN;
+    else if (final == 'C') ev.key = KEY_RIGHT;
+    else if (final == 'D') ev.key = KEY_LEFT;
+    else ev.key = KEY_ESC;
+    return ev;
   }
-  return KEY_ESC;
+  ev.key = KEY_ESC;
+  snprintf(ev.kind, sizeof(ev.kind), "unknown-esc");
+  return ev;
 }
 
 static void raw_off(edit_state * e) {
@@ -618,8 +713,8 @@ static void raw_off(edit_state * e) {
 }
 
 static int pane_body_rows(edit_state * e, int i) {
-  if (e->layout == LAYOUT_COLS) return (e->rows > 1) ? e->rows - 1 : 1;
-  int total = e->rows - e->n_panes;
+  if (e->layout == LAYOUT_COLS) return (e->rows > 2) ? e->rows - 2 : 1;
+  int total = e->rows - e->n_panes - 1;
   if (total < e->n_panes) return 1;
   return total / e->n_panes + (i < total % e->n_panes);
 }
@@ -657,6 +752,8 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
 static void ensure_visible(edit_state * e) {
   ensure_pane_visible(e, active_pane(e), pane_body_rows(e, e->active_pane));
 }
+
+static void debug_log_render(edit_state * e, output * o);
 
 static void render_buffer_line(edit_state * e, output * o, buffer * b,
                                size_t * pos, size_t limit) {
@@ -721,19 +818,41 @@ static size_t pane_cursor_col(edit_state * e, pane * p) {
   return (cx > limit) ? limit : cx;
 }
 
-static void render_modeline(edit_state * e, output * o, buffer * b,
+static void modeline_pos(output * o, buffer * b, pane * p,
+                          size_t * used, size_t limit) {
+  size_t line;
+  size_t col;
+  char s[48];
+  pos_line_col(b, p->cursor, &line, &col);
+  snprintf(s, sizeof(s), " %zu:%zu", line, col);
+  out_clip(o, s, used, limit);
+}
+
+static void render_keymap(output * o, int cols) {
+  size_t used = 0;
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+  out_clip(o, KEYMAP_HINT, &used, limit);
+  while (used++ < limit) out_s(o, " ");
+}
+
+static const char * file_name(const char * path) {
+  const char * slash = strrchr(path, '/');
+  return slash ? slash + 1 : path;
+}
+
+static void render_modeline(edit_state * e, output * o, pane * p,
                             bool active, int cols) {
+  buffer * b = pane_buffer(e, p);
   size_t status_cols = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t used = 0;
-  out_clip(o, (active && e->n_panes > 1) ? ">" : " ", &used, status_cols);
+  out_clip(o, file_name(b->path), &used, status_cols);
+  modeline_pos(o, b, p, &used, status_cols);
+  if (b->dirty) out_clip(o, " *", &used, status_cols);
+  if (active && e->n_panes > 1) out_clip(o, " >", &used, status_cols);
   if (active && e->status[0] != '\0') {
-    out_clip(o, e->status, &used, status_cols);
     out_clip(o, "  ", &used, status_cols);
-    if (b->dirty) out_clip(o, "* ", &used, status_cols);
+    out_clip(o, e->status, &used, status_cols);
   }
-  out_clip(o, b->path, &used, status_cols);
-  if (b->dirty && (! active || e->status[0] == '\0')) out_clip(o, " *", &used, status_cols);
-  out_clip(o, " ", &used, status_cols);
   while (used++ < status_cols) out_s(o, " ");
 }
 
@@ -746,7 +865,7 @@ static void render(edit_state * e) {
     size_t pos[8];
     int cursor_row = 0;
     size_t cursor_col = 0;
-    int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
+    int body_rows = pane_body_rows(e, 0);
 
     for (int i = 0; i < e->n_panes; i++) {
       pane * p = &e->panes[i];
@@ -767,14 +886,17 @@ static void render(edit_state * e) {
           render_buffer_line(e, &o, b, &pos[i], (cols > 1) ? (size_t) cols - 1 : 1);
       }
     }
-    out_f(&o, "\x1b[%d;1H", e->rows);
+    out_f(&o, "\x1b[%d;1H", e->rows - 1);
     for (int i = 0; i < e->n_panes; i++) {
-      out_f(&o, "\x1b[%d;%dH\x1b[7m", e->rows, pane_col(e, i) + 1);
-      render_modeline(e, &o, pane_buffer(e, &e->panes[i]),
-                       i == e->active_pane, pane_cols(e, i));
+      out_f(&o, "\x1b[%d;%dH\x1b[7m", e->rows - 1, pane_col(e, i) + 1);
+      render_modeline(e, &o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
       out_s(&o, "\x1b[0m");
     }
+    out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
+    render_keymap(&o, e->cols);
+    out_s(&o, "\x1b[0m");
     out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
+    debug_log_render(e, &o);
     write(STDOUT_FILENO, o.data, o.len);
     free(o.data);
     return;
@@ -802,13 +924,19 @@ static void render(edit_state * e) {
     }
     if (screen_row < e->rows) {
       out_s(&o, "\x1b[7m");
-      render_modeline(e, &o, b, i == e->active_pane, e->cols);
+      render_modeline(e, &o, p, i == e->active_pane, e->cols);
       out_s(&o, "\x1b[0m");
       if (++screen_row < e->rows) out_s(&o, "\r\n");
     }
   }
+  if (screen_row < e->rows) {
+    out_s(&o, "\x1b[90m");
+    render_keymap(&o, e->cols);
+    out_s(&o, "\x1b[0m");
+  }
   out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
+  debug_log_render(e, &o);
   write(STDOUT_FILENO, o.data, o.len);
   free(o.data);
 }
@@ -860,22 +988,31 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
 
-static void snapshot_modeline(output * o, buffer * b, bool active, int cols) {
-  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+static void snapshot_modeline(edit_state * e, output * o, pane * p,
+                              bool active, int cols) {
+  buffer * b = pane_buffer(e, p);
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : SIZE_MAX;
   size_t used = 0;
-  out_s(o, active ? ">" : "=");
-  used++;
-  out_clip(o, b->path, &used, limit);
-  while (used++ < limit) out_s(o, " ");
+  out_clip(o, file_name(b->path), &used, limit);
+  if (b->dirty) out_clip(o, "*", &used, limit);
+  modeline_pos(o, b, p, &used, limit);
+  if (active && e->n_panes > 1) out_clip(o, ">", &used, limit);
+  if (cols > 1) while (used++ < limit) out_s(o, " ");
 }
 
-static void render_snapshot(edit_state * e) {
-  output o = {0};
+static void snapshot_keymap(edit_state * e, output * o) {
+  size_t used = 0;
+  size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
+  out_clip(o, KEYMAP_HINT, &used, limit);
+  out_s(o, "\n");
+}
+
+static void build_snapshot(edit_state * e, output * o) {
   if (e->layout == LAYOUT_COLS) {
     size_t pos[8];
     int cy[8];
     size_t cx[8];
-    int body_rows = (e->rows > 1) ? e->rows - 1 : 1;
+    int body_rows = pane_body_rows(e, 0);
 
     for (int i = 0; i < e->n_panes; i++) {
       pane * p = &e->panes[i];
@@ -886,20 +1023,18 @@ static void render_snapshot(edit_state * e) {
     }
     for (int row = 0; row < body_rows; row++) {
       for (int i = 0; i < e->n_panes; i++)
-        snapshot_cell(e, &o, pane_buffer(e, &e->panes[i]), &pos[i],
+        snapshot_cell(e, o, pane_buffer(e, &e->panes[i]), &pos[i],
                       cy[i], cx[i], row, pane_cols(e, i));
-      out_s(&o, "\n");
+      out_s(o, "\n");
     }
     for (int i = 0; i < e->n_panes; i++)
-      snapshot_modeline(&o, pane_buffer(e, &e->panes[i]),
-                         i == e->active_pane, pane_cols(e, i));
+      snapshot_modeline(e, o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
     if (e->status[0] != '\0') {
-      out_s(&o, " ");
-      out_s(&o, e->status);
+      out_s(o, " ");
+      out_s(o, e->status);
     }
-    out_s(&o, "\n");
-    fwrite(o.data, 1, o.len, stdout);
-    free(o.data);
+    out_s(o, "\n");
+    snapshot_keymap(e, o);
     return;
   }
   for (int i = 0; i < e->n_panes; i++) {
@@ -912,33 +1047,155 @@ static void render_snapshot(edit_state * e) {
     size_t pos = p->top;
 
     for (int row = 0; row < body_rows; row++) {
-      if (pos < buffer_len(b)) snapshot_line(e, &o, b, &pos, cy, cx, row);
-      else if (row == cy && cx == 0) out_s(&o, "|");
-      out_s(&o, "\n");
+      if (pos < buffer_len(b)) snapshot_line(e, o, b, &pos, cy, cx, row);
+      else if (row == cy && cx == 0) out_s(o, "|");
+      out_s(o, "\n");
     }
     if (e->n_panes > 1) {
-      out_s(&o, (i == e->active_pane) ? ">" : "=");
-      out_s(&o, b->path);
-      if (b->dirty) out_s(&o, "*");
+      snapshot_modeline(e, o, p, i == e->active_pane, 0);
       if (i == e->active_pane && e->status[0] != '\0') {
-        out_s(&o, " ");
-        out_s(&o, e->status);
+        out_s(o, " ");
+        out_s(o, e->status);
       }
-      out_s(&o, "\n");
+      out_s(o, "\n");
     }
   }
   if (e->n_panes == 1) {
-    out_s(&o, "=");
-    out_s(&o, active_buffer(e)->path);
-    if (active_buffer(e)->dirty) out_s(&o, "*");
+    snapshot_modeline(e, o, active_pane(e), false, 0);
     if (e->status[0] != '\0') {
-      out_s(&o, " ");
-      out_s(&o, e->status);
+      out_s(o, " ");
+      out_s(o, e->status);
     }
-    out_s(&o, "\n");
+    out_s(o, "\n");
   }
+  snapshot_keymap(e, o);
+}
+
+static void render_snapshot(edit_state * e) {
+  output o = {0};
+  build_snapshot(e, &o);
   fwrite(o.data, 1, o.len, stdout);
   free(o.data);
+}
+
+static void debug_log_state(edit_state * e, const char * label) {
+  if (e->debug_log == NULL) return;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t line;
+  size_t col;
+  pos_line_col(b, p->cursor, &line, &col);
+  fprintf(e->debug_log,
+          "state %s active=%d panes=%d layout=%d cursor=%zu line=%zu col=%zu top=%zu preferred=%zu prefix=%d search=%d dirty=%d len=%zu status=%s\n",
+          label, e->active_pane, e->n_panes, e->layout, p->cursor, line, col,
+          p->top, p->preferred_col, e->prefix, e->search_prompt, b->dirty,
+          buffer_len(b), e->status);
+  for (int i = 0; i < e->n_panes; i++)
+    fprintf(e->debug_log, "pane %d buffer=%d cursor=%zu top=%zu preferred=%zu\n",
+            i, e->panes[i].buffer, e->panes[i].cursor, e->panes[i].top,
+            e->panes[i].preferred_col);
+}
+
+static void debug_log_render(edit_state * e, output * o) {
+  if (e->debug_log == NULL) return;
+  output snap = {0};
+  build_snapshot(e, &snap);
+  fprintf(e->debug_log,
+          "\nrender event=%u time_ms=%lld rows=%d cols=%d layout=%d active=%d\nansi_hex=",
+          ++e->debug_event, now_ms(), e->rows, e->cols, e->layout, e->active_pane);
+  for (size_t i = 0; i < o->len; i++)
+    fprintf(e->debug_log, "%02x%s", (unsigned char) o->data[i],
+            (i + 1 == o->len) ? "" : " ");
+  fprintf(e->debug_log, "\nsnapshot:\n%.*s", (int) snap.len, snap.data ? snap.data : "");
+  fprintf(e->debug_log, "end_render\n");
+  free(snap.data);
+  fflush(e->debug_log);
+}
+
+static void debug_log_key(edit_state * e, key_event * ev, const char * when) {
+  if (e->debug_log == NULL) return;
+  char name[32];
+  output hex = {0};
+  key_text(ev->key, name, sizeof(name));
+  out_hex(&hex, ev->raw, (size_t) ev->n_raw);
+  fprintf(e->debug_log,
+          "\nkey event=%u %s start_ms=%lld end_ms=%lld kind=%s key=%s raw=%s\n",
+          ++e->debug_event, when, ev->start_ms, ev->end_ms, ev->kind, name,
+          hex.data ? hex.data : "");
+  free(hex.data);
+}
+
+static void debug_log_env(edit_state * e, const char * name) {
+  const char * value = getenv(name);
+  fprintf(e->debug_log, "env %s=%s\n", name, value ? value : "");
+}
+
+static int debug_start(edit_state * e, const char * path) {
+  const char * override = getenv("EDIT_DEBUG_LOG");
+  if (override != NULL && override[0] != '\0') snprintf(e->debug_path, sizeof(e->debug_path), "%s", override);
+  else {
+    time_t t = time(NULL);
+    struct tm * tm = localtime(&t);
+    snprintf(e->debug_path, sizeof(e->debug_path),
+             "logs/debug-%04d%02d%02d-%02d%02d%02d-%d.log",
+             tm ? tm->tm_year + 1900 : 0, tm ? tm->tm_mon + 1 : 0,
+             tm ? tm->tm_mday : 0, tm ? tm->tm_hour : 0, tm ? tm->tm_min : 0,
+             tm ? tm->tm_sec : 0, (int) getpid());
+  }
+  e->debug_log = fopen(e->debug_path, "w");
+  if (e->debug_log == NULL) return set_status(e, "debug log failed"), -1;
+
+  char cwd[DEBUG_PATH_SIZE];
+  if (getcwd(cwd, sizeof(cwd)) == NULL) snprintf(cwd, sizeof(cwd), "?");
+  fprintf(e->debug_log, "edit debug recording\npid=%d\ncwd=%s\nfile=%s\nlog=%s\n",
+          (int) getpid(), cwd, path, e->debug_path);
+  fprintf(e->debug_log, "termios saved iflag=%lu oflag=%lu cflag=%lu lflag=%lu\n",
+          (unsigned long) e->saved_termios.c_iflag, (unsigned long) e->saved_termios.c_oflag,
+          (unsigned long) e->saved_termios.c_cflag, (unsigned long) e->saved_termios.c_lflag);
+  fprintf(e->debug_log, "termios raw iflag=%lu oflag=%lu cflag=%lu lflag=%lu\n",
+          (unsigned long) e->raw_termios.c_iflag, (unsigned long) e->raw_termios.c_oflag,
+          (unsigned long) e->raw_termios.c_cflag, (unsigned long) e->raw_termios.c_lflag);
+  debug_log_env(e, "TERM");
+  debug_log_env(e, "COLORTERM");
+  debug_log_env(e, "LANG");
+  debug_log_env(e, "LC_CTYPE");
+  debug_log_env(e, "SHELL");
+  debug_log_env(e, "EDIT_GRAMMAR");
+  debug_log_env(e, "PATH");
+  e->debug_recording = true;
+  e->debug_event = 0;
+  set_status(e, "debug recording; Esc stops");
+  debug_log_state(e, "start");
+  fflush(e->debug_log);
+  return 0;
+}
+
+static void debug_stop_prompt(edit_state * e) {
+  if (e->debug_log == NULL) return;
+  e->debug_recording = false;
+  e->debug_note_prompt = true;
+  e->debug_note_len = 0;
+  e->debug_note[0] = '\0';
+  set_status(e, "debug note: ");
+}
+
+static const char * debug_note_key(edit_state * e, key_event * ev) {
+  if (ev->key == KEY_ENTER) {
+    fprintf(e->debug_log, "action=debug-note-saved\nnote=%s\nend_debug\n", e->debug_note);
+    fclose(e->debug_log);
+    e->debug_log = NULL;
+    e->debug_note_prompt = false;
+    set_status(e, "debug saved %s", e->debug_path);
+    return "debug-note-saved";
+  }
+  if ((ev->key == KEY_BACKSPACE || ev->key == KEY_CTRL('h')) && e->debug_note_len > 0)
+    e->debug_note[--e->debug_note_len] = '\0';
+  else if (ev->key >= 32 && ev->key < 127 && e->debug_note_len + 1 < sizeof(e->debug_note)) {
+    e->debug_note[e->debug_note_len++] = (char) ev->key;
+    e->debug_note[e->debug_note_len] = '\0';
+  }
+  set_status(e, "debug note: %s", e->debug_note);
+  return "debug-note";
 }
 
 static void render_color_snapshot(edit_state * e) {
@@ -1026,6 +1283,10 @@ static int key_name(char c) {
   if (c == 'l') return KEY_CTRL('l');
   if (c == 's') return KEY_CTRL('s');
   if (c == 'v') return KEY_CTRL('v');
+  if (c == 'B') return KEY_META('b');
+  if (c == 'F') return KEY_META('f');
+  if (c == 'N') return KEY_META('n');
+  if (c == 'P') return KEY_META('p');
   if (c == 'V') return KEY_META('v');
   if (c == 'x') return KEY_CTRL('x');
   if (c == '/') return KEY_CTRL('_');
@@ -1101,6 +1362,47 @@ static int cmd_page_down(edit_state * e, int key) {
 static int cmd_page_up(edit_state * e, int key) {
   int n = pane_body_rows(e, e->active_pane);
   for (int i = 0; i < n; i++) cmd_up(e, key);
+  return 0;
+}
+
+static int cmd_down_10(edit_state * e, int key) {
+  for (int i = 0; i < 10; i++) cmd_down(e, key);
+  return 0;
+}
+
+static int cmd_up_10(edit_state * e, int key) {
+  for (int i = 0; i < 10; i++) cmd_up(e, key);
+  return 0;
+}
+
+static bool word_byte(buffer * b, size_t pos) {
+  char s[2] = {0};
+  int start = -1;
+  int end = -1;
+  if (pos >= buffer_len(b)) return false;
+  s[0] = buffer_at(b, pos);
+  match("{.}[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]",
+        s, &start, &end);
+  return start == 0 && end == 1;
+}
+
+static int cmd_word_forward(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  while (p->cursor < buffer_len(b) && ! word_byte(b, p->cursor)) p->cursor++;
+  while (p->cursor < buffer_len(b) && word_byte(b, p->cursor)) p->cursor++;
+  p->preferred_col = SIZE_MAX;
+  (void) key;
+  return 0;
+}
+
+static int cmd_word_back(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  while (p->cursor > 0 && ! word_byte(b, p->cursor - 1)) p->cursor--;
+  while (p->cursor > 0 && word_byte(b, p->cursor - 1)) p->cursor--;
+  p->preferred_col = SIZE_MAX;
+  (void) key;
   return 0;
 }
 
@@ -1293,6 +1595,10 @@ static binding bindings[] = {
   {{KEY_CTRL('n'), 0}, 1, cmd_down},
   {{KEY_CTRL('l'), 0}, 1, cmd_recenter},
   {{KEY_CTRL('v'), 0}, 1, cmd_page_down},
+  {{KEY_META('b'), 0}, 1, cmd_word_back},
+  {{KEY_META('f'), 0}, 1, cmd_word_forward},
+  {{KEY_META('n'), 0}, 1, cmd_down_10},
+  {{KEY_META('p'), 0}, 1, cmd_up_10},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_CTRL('a'), 0}, 1, cmd_line_start},
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
@@ -1381,7 +1687,7 @@ static int tui(const char * path) {
   e.panes[0].buffer = 0;
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
-  snprintf(e.status, sizeof(e.status), "C-s search, C-x C-s save, C-x C-c quit");
+  snprintf(e.status, sizeof(e.status), "C-s search, Esc r debug, C-x C-s save, C-x C-c quit");
 
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0) {
@@ -1398,13 +1704,55 @@ static int tui(const char * path) {
 
   while (! e.quit) {
     render(&e);
-    int key = read_key();
-    if (key != KEY_ESC) dispatch(&e, key);
+    key_event ev = read_key_event();
+    const char * action = "ignored";
+    int key = ev.key;
+    if (e.debug_log != NULL) {
+      debug_log_key(&e, &ev, "before");
+      debug_log_state(&e, "before");
+    }
+
+    if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC) {
+      e.prefix = 0;
+      if (key >= 0 && key < 128) {
+        key = KEY_META(key);
+        action = "esc-meta";
+      }
+    }
+
+    if (e.debug_note_prompt) action = debug_note_key(&e, &ev);
+    else if (e.debug_recording && key == KEY_ESC) {
+      debug_stop_prompt(&e);
+      action = "debug-stop";
+    } else if (! e.debug_recording && key == KEY_ESC) {
+      e.prefix = KEY_ESC;
+      set_status(&e, "Esc");
+      action = "esc-prefix";
+    } else if (key == KEY_META('r')) {
+      if (e.debug_log == NULL && debug_start(&e, path) == 0) {
+        debug_log_key(&e, &ev, "before");
+        debug_log_state(&e, "before");
+        action = "debug-start";
+      } else action = "debug-already-recording";
+    } else if (key != KEY_ESC && key != -1) {
+      dispatch(&e, key);
+      if (strcmp(action, "esc-meta") != 0) action = "dispatch";
+    }
+
+    if (e.debug_log != NULL) {
+      fprintf(e.debug_log, "action=%s\n", action);
+      debug_log_state(&e, "after");
+      fflush(e.debug_log);
+    }
   }
 
   raw_off(&e);
   const char * clear = "\x1b[?25h\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
+  if (e.debug_log != NULL) {
+    fprintf(e.debug_log, "end_debug aborted\n");
+    fclose(e.debug_log);
+  }
   history_free(&e);
   buffer_free(&e.buffers[0]);
   return 0;
