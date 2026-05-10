@@ -59,13 +59,35 @@ printf '%s[33mint%s[0m tint %s[33mreturn%s[0m\n\n' \
 
 printf 'abc\n  def\n\tghi\n' > "$tmp"
 ./edit --render 5:12 "$tmp" > "$out"
-printf '|abc\n..def\n>ghi\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
+printf '|abc\n..def\n>..ghi\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
 
 ./edit --render-at 5:12 2:2 "$tmp" > "$out"
-printf 'abc\n.|.def\n>ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abc\n.|.def\n>..ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
 
 ./edit --render-keys 5:12 nf "$tmp" > "$out"
-printf 'abc\n.|.def\n>ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abc\n.|.def\n>..ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
+
+./edit --render-at 5:12 3:2 "$tmp" > "$out"
+printf 'abc\n..def\n>..|ghi\n%s 3:2\nC-s search \n' "$base" | cmp -s - "$out"
+
+EDIT_TAB_WIDTH=4 ./edit --render 5:12 "$tmp" > "$out"
+printf '|abc\n..def\n>...ghi\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
+
+printf 'abc\n' > "$tmp"
+./edit --render-keys 4:20 "$(printf '\t')" "$tmp" > "$out"
+printf '...|abc\n\n%s* 1:4\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+EDIT_TAB_WIDTH=2 ./edit --render-keys 4:20 "$(printf '\t')" "$tmp" > "$out"
+printf '..|abc\n\n%s* 1:3\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+./edit --render-keys 4:20 "$(printf '\t')_" "$tmp" > "$out"
+printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+./edit --render-keys 4:20 "q$(printf '\t')" "$tmp" > "$out"
+printf '>..|abc\n\n%s* 1:2 C-q\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+./edit --render-keys 4:20 "q$(printf '\t')_" "$tmp" > "$out"
+printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
 
 printf 'abcdef\nabc\n' > "$tmp"
 ./edit --render-keys 5:12 fffn "$tmp" > "$out"
@@ -228,6 +250,24 @@ printf 'one.two.one.|two\n\n%s 1:13 match two\nC-s search  C-r reverse  C-g canc
 ./edit --render-keys 4:40 "stwo${enter}ssr" "$tmp" > "$out"
 printf 'one.|two.one.two\n\n%s 1:5 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
 
+./edit --render-keys-color 4:40 "stwo${enter}" "$tmp" > "$out"
+printf 'one %s[103;30;1mtwo%s[0m one %s[43;30mtwo%s[0m\n\n\n' \
+  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+./edit --render-keys-color 4:40 "stwo${enter}ss" "$tmp" > "$out"
+printf 'one %s[43;30mtwo%s[0m one %s[103;30;1mtwo%s[0m\n\n\n' \
+  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+./edit --render-keys-color 4:40 "stwo${enter}ssr" "$tmp" > "$out"
+printf 'one %s[103;30;1mtwo%s[0m one %s[43;30mtwo%s[0m\n\n\n' \
+  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+printf '42 42\n' > "$tmp"
+./edit --render-keys-color 3:40 "s42${enter}" "$tmp" > "$out"
+printf '%s[103;30;1m42%s[0m %s[43;30m42%s[0m\n\n' \
+  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+printf 'one two one two\n' > "$tmp"
 ./edit --render-keys 4:40 "stwogA" "$tmp" > "$out"
 printf 'A|one.two.one.two\n\n%s* 1:2 cancel\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
 

@@ -15,6 +15,7 @@
 //    edit --render rows:cols file
 //    edit --render-at rows:cols line:col file
 //    edit --render-keys rows:cols keys file
+//    edit --render-keys-color rows:cols keys file
 //    edit --render-color rows:cols file
 //
 // COMPILATION
@@ -58,6 +59,9 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define HISTORY_MAX 1024
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
+#define DEFAULT_TAB_WIDTH 3
+#define SEARCH_SGR "43;30"
+#define SEARCH_CURRENT_SGR "103;30;1"
 #define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x C-s save  C-x C-c quit  Esc r debug"
 
 enum { HIST_INSERT, HIST_DELETE };
@@ -122,6 +126,7 @@ struct edit_state {
   int layout;
   int rows;
   int cols;
+  int tab_width;
   int prefix;
   bool search_prompt;
   bool search_reverse;
@@ -153,6 +158,19 @@ struct edit_state {
   grammar grammar;
   bool has_grammar;
 };
+
+static int env_tab_width(void) {
+  const char * s = getenv("EDIT_TAB_WIDTH");
+  char * end = NULL;
+  long n = s ? strtol(s, &end, 10) : 0;
+  return (s != NULL && end > s && *end == '\0' && n > 0 && n < 1000) ?
+    (int) n : DEFAULT_TAB_WIDTH;
+}
+
+static void init_state(edit_state * e) {
+  memset(e, 0, sizeof(*e));
+  e->tab_width = env_tab_width();
+}
 
 static char * _dup(const char * s) {
   size_t n = strlen(s) + 1;
@@ -386,10 +404,29 @@ static size_t prev_line(buffer * b, size_t pos) {
   return (pos == 0) ? 0 : line_start(b, pos - 1);
 }
 
-static size_t line_column(buffer * b, size_t start, size_t preferred) {
+static size_t tab_stop(edit_state * e, size_t col) {
+  return (size_t) e->tab_width - (col % (size_t) e->tab_width);
+}
+
+static size_t visual_col(edit_state * e, buffer * b, size_t start, size_t pos) {
+  size_t col = 0;
+  while (start < pos && start < buffer_len(b) && buffer_at(b, start) != '\n') {
+    col += (buffer_at(b, start) == '\t') ? tab_stop(e, col) : 1;
+    start++;
+  }
+  return col;
+}
+
+static size_t visual_column_pos(edit_state * e, buffer * b,
+                                size_t start, size_t preferred) {
   size_t end = line_end(b, start);
-  size_t len = end - start;
-  return start + ((preferred > len) ? len : preferred);
+  size_t col = 0;
+  for (size_t pos = start; pos < end; pos++) {
+    size_t next = col + ((buffer_at(b, pos) == '\t') ? tab_stop(e, col) : 1);
+    if (preferred < next) return pos;
+    col = next;
+  }
+  return end;
 }
 
 static size_t line_col_pos(buffer * b, size_t line, size_t col) {
@@ -933,9 +970,35 @@ static void ensure_visible(edit_state * e) {
 
 static void debug_log_render(edit_state * e, output * o);
 
+static void paint_search(edit_state * e, const char * line, size_t len,
+                         size_t start, const char ** sgrs) {
+  if (e->search_len == 0 || len == 0) return;
+
+  for (size_t from = 0; from < len;) {
+    int a = -1;
+    int z = -1;
+    match(e->search, line + from, &a, &z);
+    if (a < 0) return;
+
+    size_t s = from + (size_t) a;
+    size_t t = from + (size_t) z;
+    if (t > len) t = len;
+    if (t <= s) {
+      from = s + 1;
+      continue;
+    }
+
+    const char * sgr = (start + s == active_pane(e)->cursor) ?
+      SEARCH_CURRENT_SGR : SEARCH_SGR;
+    for (size_t i = s; i < t; i++) sgrs[i] = sgr;
+    from = t;
+  }
+}
+
 static void render_buffer_line(edit_state * e, output * o, buffer * b,
                                size_t * pos, size_t limit) {
   char line[LINE_RENDER_MAX];
+  const char * search_sgrs[LINE_RENDER_MAX];
   size_t n = 0;
   size_t start = *pos;
 
@@ -944,32 +1007,41 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
     (*pos)++;
   }
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
+  line[n] = '\0';
 
   grammar_span spans[GRAMMAR_MAX_SPANS];
   int n_spans = e->has_grammar ?
     grammar_highlight(&e->grammar, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
   int span = 0;
-  bool color = false;
+  const char * color = NULL;
+
+  for (size_t i = 0; i < n; i++) search_sgrs[i] = NULL;
+  paint_search(e, line, n, start, search_sgrs);
 
   size_t shown = 0;
   for (size_t i = 0; i < n && shown < limit; i++) {
-    while (span < n_spans && i >= spans[span].end) {
-      out_s(o, "\x1b[0m");
-      color = false;
+    while (span < n_spans && i >= spans[span].end)
       span++;
+    const char * sgr = search_sgrs[i] ? search_sgrs[i] :
+      (span < n_spans && i >= spans[span].start) ? spans[span].sgr : NULL;
+    if (sgr != color) {
+      if (color != NULL)
+        out_s(o, "\x1b[0m");
+      if (sgr != NULL)
+        out_f(o, "\x1b[%sm", sgr);
+      color = sgr;
     }
-    if (span < n_spans && i == spans[span].start) {
-      out_f(o, "\x1b[%sm", spans[span].sgr);
-      color = true;
-    }
+
     char c = line[i];
-    if (c == '\t') c = ' ';
+    size_t width = (c == '\t') ? tab_stop(e, shown) : 1;
     if ((unsigned char) c < 32) c = ' ';
-    out_add(o, &c, 1);
-    shown++;
+    for (size_t j = 0; j < width && shown < limit; j++, shown++) {
+      char out = (c == '\t') ? ' ' : c;
+      out_add(o, &out, 1);
+    }
   }
-  if (color) out_s(o, "\x1b[0m");
-  (void) start;
+  if (color != NULL)
+    out_s(o, "\x1b[0m");
 }
 
 static void render_line(edit_state * e, output * o, size_t * pos) {
@@ -990,7 +1062,7 @@ static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
 
 static size_t pane_cursor_col(edit_state * e, pane * p) {
   buffer * b = pane_buffer(e, p);
-  size_t cx = p->cursor - line_start(b, p->cursor);
+  size_t cx = visual_col(e, b, line_start(b, p->cursor), p->cursor);
   int cols = pane_cols(e, (int) (p - e->panes));
   size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
   return (cx > limit) ? limit : cx;
@@ -1127,12 +1199,14 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
          col < limit) {
     if ((row == cursor_row) && (col == cursor_col)) out_s(o, "|");
     char c = buffer_at(b, *pos);
-    if (c == ' ') c = '.';
-    if (c == '\t') c = '>';
-    if ((unsigned char) c < 32) c = '?';
-    out_add(o, &c, 1);
+    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    for (size_t i = 0; i < width && col + i < limit; i++) {
+      char out = (c == '\t') ? (i == 0 ? '>' : '.') :
+        (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
+      out_add(o, &out, 1);
+    }
     (*pos)++;
-    col++;
+    col += width;
   }
   if ((row == cursor_row) && (col == cursor_col)) out_s(o, "|");
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
@@ -1141,7 +1215,6 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
 
 static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
                           int cursor_row, size_t cursor_col, int row, int cols) {
-  (void) e;
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t col = 0;
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && col < limit) {
@@ -1150,12 +1223,14 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
       col++;
     }
     char c = buffer_at(b, *pos);
-    if (c == ' ') c = '.';
-    if (c == '\t') c = '>';
-    if ((unsigned char) c < 32) c = '?';
-    out_add(o, &c, 1);
+    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    for (size_t j = 0; j < width && col + j < limit; j++) {
+      char out = (c == '\t') ? (j == 0 ? '>' : '.') :
+        (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
+      out_add(o, &out, 1);
+    }
     (*pos)++;
-    col++;
+    col += width;
   }
   if ((row == cursor_row) && (col == cursor_col) && col < limit) {
     out_s(o, "|");
@@ -1339,6 +1414,7 @@ static int debug_start(edit_state * e, const char * path) {
   debug_log_env(e, "LC_CTYPE");
   debug_log_env(e, "SHELL");
   debug_log_env(e, "EDIT_GRAMMAR");
+  debug_log_env(e, "EDIT_TAB_WIDTH");
   debug_log_env(e, "PATH");
   e->debug_recording = true;
   e->debug_event = 0;
@@ -1391,7 +1467,7 @@ static void render_color_snapshot(edit_state * e) {
 
 static int cli_render(const char * size, const char * path) {
   edit_state e;
-  memset(&e, 0, sizeof(e));
+  init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;
@@ -1408,7 +1484,7 @@ static int cli_render(const char * size, const char * path) {
 
 static int cli_render_color(const char * size, const char * path) {
   edit_state e;
-  memset(&e, 0, sizeof(e));
+  init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;
@@ -1426,7 +1502,7 @@ static int cli_render_color(const char * size, const char * path) {
 
 static int cli_render_at(const char * size, const char * point, const char * path) {
   edit_state e;
-  memset(&e, 0, sizeof(e));
+  init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;
@@ -1450,6 +1526,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
 
 static int key_name(char c) {
   if (c == '\n') return KEY_ENTER;
+  if (c == '\t') return KEY_CTRL('i');
   if (c == 'b') return KEY_CTRL('b');
   if (c == 'f') return KEY_CTRL('f');
   if (c == 'p') return KEY_CTRL('p');
@@ -1460,6 +1537,7 @@ static int key_name(char c) {
   if (c == 'h') return KEY_CTRL('h');
   if (c == 'l') return KEY_CTRL('l');
   if (c == 'g') return KEY_CTRL('g');
+  if (c == 'q') return KEY_CTRL('q');
   if (c == 'r') return KEY_CTRL('r');
   if (c == 's') return KEY_CTRL('s');
   if (c == 'v') return KEY_CTRL('v');
@@ -1476,7 +1554,7 @@ static int key_name(char c) {
 
 static int cli_render_keys(const char * size, const char * keys, const char * path) {
   edit_state e;
-  memset(&e, 0, sizeof(e));
+  init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;
@@ -1489,6 +1567,27 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_snapshot(&e);
+  history_free(&e);
+  buffer_free(&e.buffers[0]);
+  return 0;
+}
+
+static int cli_render_keys_color(const char * size, const char * keys, const char * path) {
+  edit_state e;
+  init_state(&e);
+  e.n_buffers = 1;
+  e.n_panes = 1;
+  e.panes[0].buffer = 0;
+  e.panes[0].cursor = 0;
+  e.panes[0].preferred_col = SIZE_MAX;
+  if (sscanf(size, "%d:%d", &e.rows, &e.cols) != 2 || e.rows < 2 || e.cols < 1)
+    return fprintf(stderr, "edit: bad render size\n"), 1;
+  load_grammar(&e);
+  if (buffer_load(&e.buffers[0], path) != 0)
+    return fprintf(stderr, "edit: open failed\n"), 1;
+
+  for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
+  render_color_snapshot(&e);
   history_free(&e);
   buffer_free(&e.buffers[0]);
   return 0;
@@ -1515,9 +1614,9 @@ static int cmd_up(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   size_t current = line_start(b, p->cursor);
-  if (p->preferred_col == SIZE_MAX) p->preferred_col = p->cursor - current;
+  if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t prev = prev_line(b, p->cursor);
-  p->cursor = line_column(b, prev, p->preferred_col);
+  p->cursor = visual_column_pos(e, b, prev, p->preferred_col);
   (void) key;
   return 0;
 }
@@ -1526,9 +1625,9 @@ static int cmd_down(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   size_t current = line_start(b, p->cursor);
-  if (p->preferred_col == SIZE_MAX) p->preferred_col = p->cursor - current;
+  if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t next = next_line(b, p->cursor);
-  p->cursor = line_column(b, next, p->preferred_col);
+  p->cursor = visual_column_pos(e, b, next, p->preferred_col);
   (void) key;
   return 0;
 }
@@ -1638,6 +1737,36 @@ static int cmd_backspace(edit_state * e, int key) {
 
 static int cmd_insert(edit_state * e, int key) {
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
+  pane * p = active_pane(e);
+  edit_insert(e, p->cursor, &c, 1, ++e->history_group, true);
+  p->cursor++;
+  p->preferred_col = SIZE_MAX;
+  return 0;
+}
+
+static int cmd_tab(edit_state * e, int key) {
+  size_t n = (size_t) e->tab_width;
+  char * spaces = malloc(n);
+  pane * p = active_pane(e);
+  if (spaces == NULL) return 0;
+  memset(spaces, ' ', n);
+  if (edit_insert(e, p->cursor, spaces, n, ++e->history_group, true) == 0)
+    p->cursor += n;
+  free(spaces);
+  p->preferred_col = SIZE_MAX;
+  (void) key;
+  return 0;
+}
+
+static int cmd_quote(edit_state * e, int key) {
+  e->prefix = key;
+  set_status(e, "C-q");
+  return 0;
+}
+
+static int cmd_literal(edit_state * e, int key) {
+  char c = (key == KEY_ENTER) ? '\n' :
+    (key == KEY_CTRL('i')) ? '\t' : (char) key;
   pane * p = active_pane(e);
   edit_insert(e, p->cursor, &c, 1, ++e->history_group, true);
   p->cursor++;
@@ -1888,8 +2017,10 @@ static binding bindings[] = {
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
   {{KEY_BACKSPACE, 0}, 1, cmd_backspace},
   {{KEY_CTRL('h'), 0}, 1, cmd_backspace},
+  {{KEY_CTRL('i'), 0}, 1, cmd_tab},
   {{KEY_ENTER, 0}, 1, cmd_insert},
   {{KEY_CTRL('g'), 0}, 1, cmd_cancel},
+  {{KEY_CTRL('q'), 0}, 1, cmd_quote},
   {{KEY_CTRL('r'), 0}, 1, cmd_reverse_search},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
@@ -1969,6 +2100,7 @@ static int dispatch(edit_state * e, int key) {
     keys[1] = key;
     n_keys = 2;
     e->prefix = 0;
+    if (keys[0] == KEY_CTRL('q')) return cmd_literal(e, key);
   } else if (key == KEY_CTRL('x')) {
     e->prefix = key;
     set_status(e, "C-x");
@@ -1994,7 +2126,7 @@ static int dispatch(edit_state * e, int key) {
 static int tui(const char * path) {
   edit_state e;
   char open_path[DEBUG_PATH_SIZE];
-  memset(&e, 0, sizeof(e));
+  init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;
@@ -2176,6 +2308,7 @@ static void usage(void) {
     "  edit --render rows:cols file\n"
     "  edit --render-at rows:cols line:col file\n"
     "  edit --render-keys rows:cols keys file\n"
+    "  edit --render-keys-color rows:cols keys file\n"
     "  edit --render-color rows:cols file\n");
 }
 
@@ -2189,6 +2322,8 @@ int main(int argc, char ** argv) {
     return cli_render_at(argv[2], argv[3], argv[4]);
   if (argc == 5 && strcmp(argv[1], "--render-keys") == 0)
     return cli_render_keys(argv[2], argv[3], argv[4]);
+  if (argc == 5 && strcmp(argv[1], "--render-keys-color") == 0)
+    return cli_render_keys_color(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "--print") == 0)
     return cli_print(argv[2], argv[3]);
   if (argc == 5 && strcmp(argv[1], "--search") == 0)

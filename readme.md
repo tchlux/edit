@@ -19,6 +19,7 @@ Keys: `C-l` recenter, `C-s` search forward, `C-r` search backward,
 repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `Esc f`/`Esc b` word movement,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
+`Tab` insert spaces, `C-q` quote the next key for literal insertion,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
 `C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
@@ -26,6 +27,10 @@ plain `Esc`, then prompts for a note.
 
 `C-x C-f` stores recent files in `$HOME/.edit/recent`; set `EDIT_RECENT` to
 override that path.
+
+Literal tabs display at width 3 by default; set `EDIT_TAB_WIDTH` to another
+positive integer. Pressing `Tab` inserts spaces; press `C-q Tab` for a literal
+tab byte.
 
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
 Use the literal `Esc` prefix for reliable command input.
@@ -41,6 +46,7 @@ Batch use:
 ./edit --render 10:80 file.txt
 ./edit --render-at 10:80 2:1 file.txt
 ./edit --render-keys 10:80 nf file.txt
+./edit --render-keys-color 10:80 nf file.txt
 ./edit --render-color 10:80 file.txt
 ```
 

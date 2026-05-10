@@ -27,6 +27,11 @@ Completed work:
 - Recent files: `C-x C-f` find-file prompt, fast reopen of the most recent
   different file, and global `$HOME/.edit/recent` history with `EDIT_RECENT`
   override for tests/debugging.
+- Configurable tab display and insertion: literal tabs render at
+  `EDIT_TAB_WIDTH` columns with a default of 3, `Tab` inserts spaces, and
+  `C-q Tab` inserts a literal tab.
+- Search highlighting: visible forward/reverse search matches are highlighted
+  in the current view, with the current match emphasized.
 
 Outstanding work for `edit`:
 
@@ -37,9 +42,7 @@ Outstanding work for `edit`:
 
 Preferred customization goals:
 
-- Indentation: use spaces instead of tabs; display literal tabs at width 3.
-- Line display: truncate long lines by default; `C-c C-w` toggles visual line
-  wrapping.
+- Line display: `C-c C-w` toggles visual line wrapping.
 - Theme: dark palette with foreground `#E0E0E0` and background `#202020`.
 - Cursor: solid and non-blinking.
 - JavaScript: indent width 2.
