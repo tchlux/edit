@@ -116,6 +116,29 @@ printf 'l08xx\nl09xx\nl10xx\nl1|1xx\n%s 11:3\nC-s search  C-r rev\n' "$base" | c
 ./edit --render-keys 6:20 ffNP "$tmp" > "$out"
 printf 'l0|1xx\nl02xx\nl03xx\nl04xx\n%s 1:3\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
 
+./edit --render-keys 6:20 ">>" "$tmp" > "$out"
+printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+./edit --render-keys 6:20 ">>nf" "$tmp" > "$out"
+printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx' > "$tmp"
+./edit --render-keys 6:20 ">>nf" "$tmp" > "$out"
+printf 'l09xx\nl10xx\nl11xx\nl12xx|\n%s 12:6\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
+
+./edit --render-keys 6:20 ">>><" "$tmp" > "$out"
+printf '|l01xx\nl02xx\nl03xx\nl04xx\n%s 1:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+
+python3 ./tui_view.py 6:30 '<opt-gt>' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *13:1*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 6:30 '<opt-gt><opt-lt>' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *1:1*) ;; *) exit 1;; esac
+
 printf 'one, two_three 9x\n' > "$tmp"
 ./edit --render-keys 4:30 F "$tmp" > "$out"
 printf 'one|,.two_three.9x\n\n%s 1:4\nC-s search  C-r reverse  C-g \n' "$base" | cmp -s - "$out"
@@ -250,24 +273,33 @@ printf 'one.two.one.|two\n\n%s 1:13 match two\nC-s search  C-r reverse  C-g canc
 ./edit --render-keys 4:40 "stwo${enter}ssr" "$tmp" > "$out"
 printf 'one.|two.one.two\n\n%s 1:5 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
 
+./edit --render-keys 4:40 "stwo${enter}sss" "$tmp" > "$out"
+printf 'one.|two.one.two\n\n%s 1:5 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+
+./edit --render-keys 4:40 "stwo${enter}rr" "$tmp" > "$out"
+printf 'one.two.one.|two\n\n%s 1:13 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+
 ./edit --render-keys-color 4:40 "stwo${enter}" "$tmp" > "$out"
-printf 'one %s[103;30;1mtwo%s[0m one %s[43;30mtwo%s[0m\n\n\n' \
+printf 'one %s[100mtwo%s[0m one %s[40mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ss" "$tmp" > "$out"
-printf 'one %s[43;30mtwo%s[0m one %s[103;30;1mtwo%s[0m\n\n\n' \
+printf 'one %s[40mtwo%s[0m one %s[100mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ssr" "$tmp" > "$out"
-printf 'one %s[103;30;1mtwo%s[0m one %s[43;30mtwo%s[0m\n\n\n' \
+printf 'one %s[100mtwo%s[0m one %s[40mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 printf '42 42\n' > "$tmp"
 ./edit --render-keys-color 3:40 "s42${enter}" "$tmp" > "$out"
-printf '%s[103;30;1m42%s[0m %s[43;30m42%s[0m\n\n' \
+printf '%s[100m42%s[0m %s[40m42%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 printf 'one two one two\n' > "$tmp"
+./edit --render-keys-color 4:40 "stwo${enter}g" "$tmp" > "$out"
+printf 'one two one two\n\n\n' | cmp -s - "$out"
+
 ./edit --render-keys 4:40 "stwogA" "$tmp" > "$out"
 printf 'A|one.two.one.two\n\n%s* 1:2 cancel\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
 

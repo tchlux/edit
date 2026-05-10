@@ -86,6 +86,12 @@ def keys(s):
         elif s.startswith("<opt-r>", i):
             out += bytes([0xC2, 0xAE])
             i += 7
+        elif s.startswith("<opt-lt>", i):
+            out += bytes([0xC2, 0xAF])
+            i += 8
+        elif s.startswith("<opt-gt>", i):
+            out += bytes([0xCB, 0x98])
+            i += 8
         elif s.startswith("<mac-n>", i):
             out += bytes([0xCB, 0x9C])
             i += 7
@@ -101,6 +107,12 @@ def keys(s):
         elif s.startswith("<mac-r>", i):
             out += bytes([0xC2, 0xAE])
             i += 7
+        elif s.startswith("<mac-lt>", i):
+            out += bytes([0xC2, 0xAF])
+            i += 8
+        elif s.startswith("<mac-gt>", i):
+            out += bytes([0xCB, 0x98])
+            i += 8
         elif s.startswith("<c-x>", i):
             out += ctrl("x")
             i += 5

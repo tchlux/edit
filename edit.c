@@ -60,8 +60,9 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
 #define DEFAULT_TAB_WIDTH 3
-#define SEARCH_SGR "43;30"
-#define SEARCH_CURRENT_SGR "103;30;1"
+#define SEARCH_SGR "40"
+#define SEARCH_CURRENT_SGR "100"
+#define SEARCH_BLINK_MS 500
 #define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x C-s save  C-x C-c quit  Esc r debug"
 
 enum { HIST_INSERT, HIST_DELETE };
@@ -840,11 +841,23 @@ static int raw_on(edit_state * e) {
   return 0;
 }
 
-static key_event read_key_event(void) {
+static key_event read_key_event(int timeout_ms) {
   key_event ev;
   memset(&ev, 0, sizeof(ev));
   ev.key = -1;
   ev.start_ms = now_ms();
+
+  if (timeout_ms >= 0) {
+    fd_set set;
+    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    FD_ZERO(&set);
+    FD_SET(STDIN_FILENO, &set);
+    if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) {
+      ev.end_ms = now_ms();
+      snprintf(ev.kind, sizeof(ev.kind), "timeout");
+      return ev;
+    }
+  }
 
   char c;
   if (read(STDIN_FILENO, &c, 1) != 1) return ev;
@@ -866,6 +879,8 @@ static key_event read_key_event(void) {
     else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xae) ev.key = KEY_META('r');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x9c) ev.key = KEY_META('n');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcf && ev.raw[1] == 0x80) ev.key = KEY_META('p');
+    else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xaf) ev.key = KEY_META('<');
+    else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x98) ev.key = KEY_META('>');
     if (ev.key >= KEY_META(0)) {
       snprintf(ev.kind, sizeof(ev.kind), "mac-option");
       ev.end_ms = now_ms();
@@ -947,6 +962,18 @@ static int pane_col(edit_state * e, int i) {
   return x;
 }
 
+static int file_rows_from(buffer * b, size_t top) {
+  size_t len = buffer_len(b);
+  int rows = 0;
+  if (len == 0) return 1;
+  while (top < len) {
+    rows++;
+    top = next_line(b, top);
+  }
+  if (len > 0 && buffer_at(b, len - 1) == '\n') rows++;
+  return rows;
+}
+
 static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
   buffer * b = pane_buffer(e, p);
   size_t cursor = p->cursor;
@@ -959,9 +986,11 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
       if (buffer_at(b, pos) == '\n') row++;
       pos++;
     }
-    if (row < body_rows) return;
+    if (row < body_rows) break;
     p->top = next_line(b, p->top);
   }
+  while (p->top > 0 && file_rows_from(b, p->top) < body_rows)
+    p->top = prev_line(b, p->top);
 }
 
 static void ensure_visible(edit_state * e) {
@@ -988,8 +1017,9 @@ static void paint_search(edit_state * e, const char * line, size_t len,
       continue;
     }
 
-    const char * sgr = (start + s == active_pane(e)->cursor) ?
-      SEARCH_CURRENT_SGR : SEARCH_SGR;
+    bool current = start + s == active_pane(e)->cursor;
+    bool blink = e->raw && ((now_ms() / SEARCH_BLINK_MS) % 2);
+    const char * sgr = current && ! blink ? SEARCH_CURRENT_SGR : SEARCH_SGR;
     for (size_t i = s; i < t; i++) sgrs[i] = sgr;
     from = t;
   }
@@ -1546,6 +1576,8 @@ static int key_name(char c) {
   if (c == 'N') return KEY_META('n');
   if (c == 'P') return KEY_META('p');
   if (c == 'V') return KEY_META('v');
+  if (c == '<') return KEY_META('<');
+  if (c == '>') return KEY_META('>');
   if (c == 'x') return KEY_CTRL('x');
   if (c == '/') return KEY_CTRL('_');
   if (c == '_') return KEY_CTRL('_');
@@ -1651,6 +1683,25 @@ static int cmd_down_10(edit_state * e, int key) {
 
 static int cmd_up_10(edit_state * e, int key) {
   for (int i = 0; i < 10; i++) cmd_up(e, key);
+  return 0;
+}
+
+static int cmd_file_start(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  p->cursor = 0;
+  p->top = 0;
+  p->preferred_col = SIZE_MAX;
+  (void) key;
+  return 0;
+}
+
+static int cmd_file_end(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  p->cursor = buffer_len(b);
+  p->top = line_start(b, p->cursor);
+  p->preferred_col = SIZE_MAX;
+  (void) key;
   return 0;
 }
 
@@ -1879,9 +1930,13 @@ static int search_move(edit_state * e, bool reverse, bool skip_current) {
   if (reverse) {
     if (skip_current && from > 0) from--;
     rc = buffer_search_back(b, from, e->search, &start, &end);
+    if (rc == 0)
+      rc = buffer_search_back(b, buffer_len(b), e->search, &start, &end);
   } else {
     if (skip_current && from < buffer_len(b)) from++;
     rc = buffer_search(b, from, e->search, &start, &end);
+    if (rc == 0)
+      rc = buffer_search(b, 0, e->search, &start, &end);
   }
   if (rc == 1) {
     p->cursor = start;
@@ -1915,6 +1970,8 @@ static int cmd_cancel(edit_state * e, int key) {
   e->prefix = 0;
   e->search_prompt = false;
   e->search_reuse = false;
+  e->search_len = 0;
+  e->search[0] = '\0';
   e->find_prompt = false;
   e->find_reuse = false;
   e->quit_confirm = false;
@@ -2012,6 +2069,8 @@ static binding bindings[] = {
   {{KEY_META('n'), 0}, 1, cmd_down_10},
   {{KEY_META('p'), 0}, 1, cmd_up_10},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
+  {{KEY_META('<'), 0}, 1, cmd_file_start},
+  {{KEY_META('>'), 0}, 1, cmd_file_end},
   {{KEY_CTRL('a'), 0}, 1, cmd_line_start},
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
@@ -2152,7 +2211,7 @@ static int tui(const char * path) {
 
   while (! e.quit) {
     render(&e);
-    key_event ev = read_key_event();
+    key_event ev = read_key_event(e.search_len > 0 ? SEARCH_BLINK_MS : -1);
     const char * action = "ignored";
     int key = ev.key;
     if (e.debug_log != NULL) {

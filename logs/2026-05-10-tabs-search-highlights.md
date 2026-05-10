@@ -14,6 +14,19 @@ Implemented editor polish for tab handling and search visibility:
   positions.
 - Highlighted all visible search matches during forward/reverse search, with a
   brighter style for the current match at the active cursor.
+- Made forward/reverse repeated search wrap around the file when no match
+  remains in the current direction.
+- Added `M-<` and `M->` movement to jump to the beginning and end of the file.
+- Added macOS Option byte decoding for `Opt+<` (`c2 af`) and `Opt+>`
+  (`cb 98`) after local terminal capture.
+- Clamped near-EOF viewports so jumping to the end backfills the window with
+  real file lines instead of blank rows.
+- Preserved the real EOF cursor position after a trailing newline without
+  drawing it on top of the previous line.
+- Tuned search highlight colors to use grey backgrounds and clear all search
+  highlighting on `C-g` cancel.
+- Made the current search match blink between subtle and active styles while
+  the TUI is idle, so it draws attention without a harsher static color.
 - Added `--render-keys-color` to regression-test color output after simulated
   key input.
 - Updated README and goals to document the completed behavior.
