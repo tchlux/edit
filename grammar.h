@@ -18,7 +18,7 @@
 
 #include <stddef.h>
 
-#define GRAMMAR_MAX_RULES 128
+#define GRAMMAR_MAX_RULES 256
 #define GRAMMAR_MAX_STYLES 128
 #define GRAMMAR_SCOPE_SIZE 32
 #define GRAMMAR_SGR_SIZE 32
@@ -41,6 +41,8 @@ typedef struct {
   grammar_style styles[GRAMMAR_MAX_STYLES];
   int n_rules;
   int n_styles;
+  int is_default;
+  char triple_quote;
 } grammar;
 
 typedef struct {

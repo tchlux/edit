@@ -42,8 +42,10 @@ printf 'one' | cmp -s - "$out"
 esc=$(printf '\033')
 printf 'int tint = 42; // return 7\nchar *s = "hi";\n' > "$tmp"
 ./edit --render-color 4:80 "$tmp" > "$out"
-printf '%s[35mint%s[0m tint = %s[36m42%s[0m; %s[90m// return 7%s[0m\n%s[35mchar%s[0m *s = %s[32m"hi"%s[0m;\n\n' \
-  "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" |
+printf '%s[38;5;111mint%s[0m %s[38;5;180mtint%s[0m %s[38;5;244m=%s[0m %s[38;5;81m42%s[0m%s[38;5;244m;%s[0m %s[38;5;208m// return 7%s[0m\n%s[38;5;111mchar%s[0m %s[38;5;244m*%s[0m%s[38;5;180ms%s[0m %s[38;5;244m=%s[0m %s[32m"hi"%s[0m%s[38;5;244m;%s[0m\n\n' \
+  "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" \
+  "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" \
+  "$esc" "$esc" "$esc" "$esc" |
   cmp -s - "$out"
 
 printf 'style comment 31\nrule comment //.*\n' > "$tmp.grammar"
@@ -56,6 +58,46 @@ printf 'int tint return\n' > "$tmp"
 EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$tmp" > "$out"
 printf '%s[33mint%s[0m tint %s[33mreturn%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+printf 'printf "$(date +%%S)"\n' > "$tmp"
+./edit --render-color 3:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;75mdate%s[0m' "$esc" "$esc")" "$out"
+
+printf 'x = """\nline\n"""\n' > "$tmp"
+./edit --render-color 5:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[32mline%s[0m' "$esc" "$esc")" "$out"
+
+printf 'print(f"{value + 1}")\n' > "$tmp"
+./edit --render-color 3:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;203mf%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;5;81m1%s[0m' "$esc" "$esc")" "$out"
+
+printf 'x = r"raw"\n' > "$tmp"
+./edit --render-color 3:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;203mr%s[0m' "$esc" "$esc")" "$out"
+
+printf 'def foo():\n    return list()\n' > "$tmp"
+./edit --render-color 4:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;159mdef%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;5;67mfoo%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;5;250mlist%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;5;67mlist%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+
+printf 'value: list = []\n' > "$tmp"
+./edit --render-color 3:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;111mlist%s[0m' "$esc" "$esc")" "$out"
+
+printf 'class Foo:\n    pass\nvalue = Path("x")\n' > "$tmp"
+./edit --render-color 3:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;118mFoo%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;5;118mPath%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+
+printf 'answer: int = 42\nif answer == 42:\n    obj.answer = 1\ndef f(limit: int = 0): pass\n' > "$tmp"
+./edit --render-color 6:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;5;180manswer%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf 'obj.%s[38;5;180manswer%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;5;180mint%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;5;180mlimit%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
 printf 'abc\n  def\n\tghi\n' > "$tmp"
 ./edit --render 5:12 "$tmp" > "$out"

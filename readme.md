@@ -67,9 +67,11 @@ terminal for modifier/debugging work.
 
 Highlighting:
 
-`edit` has default C-like highlighting for comments, strings, numbers, and a
-small keyword set. Set `EDIT_GRAMMAR=path` to fully override it with a line
-based grammar:
+`edit` has default highlighting for C, shell, and Python-ish text: comments,
+strings, numbers, keywords, types, builtins, constants, preprocessor lines,
+decorators, variables, operators, shell command substitutions, and Python
+triple-quoted strings and f-string expressions. See `color-tests/` for sample files.
+Set `EDIT_GRAMMAR=path` to fully override it with a line based grammar:
 
 ```
 style comment 90

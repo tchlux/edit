@@ -1061,6 +1061,7 @@ static key_event read_key_event(int timeout_ms) {
     }
     if (ev.n_raw == 2 && ev.raw[0] == 0xc6 && ev.raw[1] == 0x92) ev.key = KEY_META('f');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0xab) ev.key = KEY_META('b');
+    else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x9a) ev.key = KEY_META('v');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xae) ev.key = KEY_META('r');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x9c) ev.key = KEY_META('n');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcf && ev.raw[1] == 0x80) ev.key = KEY_META('p');
@@ -1210,6 +1211,19 @@ static void paint_search(edit_state * e, const char * line, size_t len,
   }
 }
 
+static char triple_quote_before(buffer * b, size_t end) {
+  char quote = '\0';
+  for (size_t i = 0; i + 2 < end; i++) {
+    char c = buffer_at(b, i);
+    if ((c == '"' || c == '\'') &&
+        buffer_at(b, i + 1) == c && buffer_at(b, i + 2) == c) {
+      quote = (quote == c) ? '\0' : quote ? quote : c;
+      i += 2;
+    }
+  }
+  return quote;
+}
+
 static void render_buffer_line(edit_state * e, output * o, buffer * b,
                                size_t * pos, size_t limit) {
   char line[LINE_RENDER_MAX];
@@ -1225,6 +1239,8 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
   line[n] = '\0';
 
   grammar_span spans[GRAMMAR_MAX_SPANS];
+  if (e->has_grammar && e->grammar.is_default)
+    e->grammar.triple_quote = triple_quote_before(b, start);
   int n_spans = e->has_grammar ?
     grammar_highlight(&e->grammar, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
   int span = 0;
