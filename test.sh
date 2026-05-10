@@ -355,6 +355,68 @@ printf 'beta\n' > "$dir/b"
 printf 'gamma\n' > "$dir/gamma"
 mkdir "$dir/sub"
 printf 'child\n' > "$dir/sub/child"
+
+./edit --render-keys 5:30 xk "$dir/a" > "$out"
+grep -q '\*scratch\*' "$out"
+
+printf '%s\n' "$dir/b" > "$recent"
+./edit --render-keys 5:50 "xf
+xk" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+
+printf 'alpha\n' > "$dir/a"
+./edit --render-keys 5:30 Xxk "$dir/a" > "$out"
+printf 'Xalpha\n' | cmp -s - "$dir/a"
+
+./edit --render-keys 5:160 xb "$dir/a" > "$out"
+grep -q '\*buffers\*' "$out"
+grep -Fq "$dir/a" "$out"
+
+printf '%s\n' "$dir/b" > "$recent"
+./edit --render-keys 5:160 "xf
+xb
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 5:120 "^x^b^x^f$dir/gamma
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*gamma*) ;; *) exit 1;; esac
+
+printf 'gamut\n' > "$dir/gamut"
+python3 ./tui_view.py 5:120 "^x^b^x^f$dir/ga<tab>" "$dir/a" > "$out"
+grep -q 'gamma' "$out"
+grep -q 'gamut' "$out"
+rm -f "$dir/gamut"
+
+printf '%s\n' "$dir/b" > "$recent"
+python3 ./tui_view.py 5:80 '^x^f
+<c-x>b' "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 5:100 "^x^f$dir/b
+^x^f$dir/gamma
+<c-x>b<c-x>3<c-x>o<c-x>b<c-x>b<c-x>o<c-x>b" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *beta*gamma*) ;; *) exit 1;; esac
+
+printf 'alpha\n' > "$dir/a"
+printf '%s\n' "$dir/b" > "$recent"
+python3 ./tui_view.py 5:80 '<right>X^x^f
+<c-x>b^_' "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+sed -n '4p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *undo*) ;; *) exit 1;; esac
+
+test ! -e '*scratch*'
+./edit --render-keys 5:40 "xkXxs" "$dir/a" > "$out"
+grep -q 'scratch not saved' "$out"
+test ! -e '*scratch*'
+
 printf '%s\n' "$dir/b" > "$recent"
 python3 ./tui_view.py 5:50 '^x^f
 ' "$dir/a" > "$out"
@@ -384,9 +446,12 @@ grep -q 'gamma' "$out"
 grep -q 'sub/' "$out"
 
 printf '%s\n' "$dir/b" > "$recent"
-python3 ./tui_view.py 5:50 'X^x^f' "$dir/a" > "$out"
-sed -n '4p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *modified*save*first*) ;; *) exit 1;; esac
+printf 'alpha\n' > "$dir/a"
+python3 ./tui_view.py 5:50 'X^x^f
+' "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
+printf 'Xalpha\n' | cmp -s - "$dir/a"
 
 home="$dir/home"
 mkdir "$home"

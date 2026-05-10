@@ -63,10 +63,19 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define SEARCH_SGR "40"
 #define SEARCH_CURRENT_SGR "100"
 #define SEARCH_BLINK_MS 500
-#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x C-s save  C-x C-c quit  Esc r debug"
+#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x b rotate  C-x k kill  C-x C-b buffers  C-x C-s save  C-x C-c quit"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
+enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST };
+
+typedef struct {
+  int kind;
+  size_t pos;
+  size_t len;
+  char * text;
+  unsigned group;
+} history;
 
 typedef struct {
   char * data;
@@ -74,7 +83,16 @@ typedef struct {
   size_t cap;
   size_t gap_a;
   size_t gap_b;
+  size_t cursor;
+  size_t top;
+  off_t disk_size;
+  time_t disk_mtime;
+  history history[HISTORY_MAX];
+  int n_history;
+  int undo_at;
+  unsigned history_group;
   bool dirty;
+  int kind;
 } buffer;
 
 typedef struct {
@@ -91,14 +109,6 @@ typedef struct {
   size_t len;
   size_t cap;
 } output;
-
-typedef struct {
-  int kind;
-  size_t pos;
-  size_t len;
-  char * text;
-  unsigned group;
-} history;
 
 typedef struct edit_state edit_state;
 typedef int (*command_fn)(edit_state * e, int key);
@@ -150,10 +160,6 @@ struct edit_state {
   char debug_note[STATUS_SIZE];
   size_t debug_note_len;
   unsigned debug_event;
-  history history[HISTORY_MAX];
-  int n_history;
-  int undo_at;
-  unsigned history_group;
   struct termios saved_termios;
   struct termios raw_termios;
   grammar grammar;
@@ -190,7 +196,7 @@ static char buffer_at(buffer * b, size_t i) {
 
 static void buffer_free(buffer * b);
 
-static int buffer_blank(buffer * b, const char * path) {
+static int buffer_blank_kind(buffer * b, const char * path, int kind) {
   b->cap = GAP_SIZE;
   b->data = calloc(b->cap, 1);
   b->path = _dup(path);
@@ -200,8 +206,21 @@ static int buffer_blank(buffer * b, const char * path) {
   }
   b->gap_a = 0;
   b->gap_b = b->cap;
+  b->cursor = 0;
+  b->top = 0;
+  b->disk_size = 0;
+  b->disk_mtime = 0;
   b->dirty = false;
+  b->kind = kind;
   return 0;
+}
+
+static int buffer_blank(buffer * b, const char * path) {
+  return buffer_blank_kind(b, path, BUFFER_FILE);
+}
+
+static int buffer_scratch(buffer * b) {
+  return buffer_blank_kind(b, "*scratch*", BUFFER_SCRATCH);
 }
 
 static int buffer_load(buffer * b, const char * path) {
@@ -239,17 +258,40 @@ static int buffer_load(buffer * b, const char * path) {
   }
   fclose(f);
 
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    b->disk_size = st.st_size;
+    b->disk_mtime = st.st_mtime;
+  } else {
+    b->disk_size = 0;
+    b->disk_mtime = 0;
+  }
+  b->cursor = 0;
+  b->top = 0;
   b->dirty = false;
+  b->kind = BUFFER_FILE;
   return 0;
 }
 
+static void history_free_buffer(buffer * b) {
+  for (int i = 0; i < b->n_history; i++) free(b->history[i].text);
+  b->n_history = 0;
+  b->undo_at = 0;
+}
+
 static void buffer_free(buffer * b) {
+  history_free_buffer(b);
   free(b->data);
   free(b->path);
   memset(b, 0, sizeof(*b));
 }
 
+static void buffers_free(edit_state * e) {
+  for (int i = 0; i < 8; i++) buffer_free(&e->buffers[i]);
+}
+
 static int buffer_save(buffer * b) {
+  if (b->kind != BUFFER_FILE) return -1;
   size_t n = strlen(b->path) + 12;
   char * tmp = malloc(n);
   if (tmp == NULL) return -1;
@@ -287,6 +329,11 @@ static int buffer_save(buffer * b) {
     return -1;
   }
   free(tmp);
+  struct stat st;
+  if (stat(b->path, &st) == 0) {
+    b->disk_size = st.st_size;
+    b->disk_mtime = st.st_mtime;
+  }
   b->dirty = false;
   return 0;
 }
@@ -590,27 +637,21 @@ static void history_free_one(history * h) {
   memset(h, 0, sizeof(*h));
 }
 
-static void history_free(edit_state * e) {
-  for (int i = 0; i < e->n_history; i++) history_free_one(&e->history[i]);
-  e->n_history = 0;
-  e->undo_at = 0;
-}
-
-static void history_drop_oldest_group(edit_state * e) {
-  if (e->n_history == 0) return;
-  unsigned group = e->history[0].group;
+static void history_drop_oldest_group(buffer * b) {
+  if (b->n_history == 0) return;
+  unsigned group = b->history[0].group;
   int n = 0;
-  while (n < e->n_history && e->history[n].group == group) n++;
-  for (int i = 0; i < n; i++) history_free_one(&e->history[i]);
-  memmove(e->history, e->history + n, (size_t) (e->n_history - n) * sizeof(history));
-  e->n_history -= n;
-  e->undo_at = (e->undo_at > n) ? e->undo_at - n : 0;
+  while (n < b->n_history && b->history[n].group == group) n++;
+  for (int i = 0; i < n; i++) history_free_one(&b->history[i]);
+  memmove(b->history, b->history + n, (size_t) (b->n_history - n) * sizeof(history));
+  b->n_history -= n;
+  b->undo_at = (b->undo_at > n) ? b->undo_at - n : 0;
 }
 
-static int history_add(edit_state * e, int kind, size_t pos,
+static int history_add(buffer * b, int kind, size_t pos,
                        const char * text, size_t len, unsigned group) {
-  while (e->n_history >= HISTORY_MAX) history_drop_oldest_group(e);
-  history * h = &e->history[e->n_history];
+  while (b->n_history >= HISTORY_MAX) history_drop_oldest_group(b);
+  history * h = &b->history[b->n_history];
   h->text = malloc(len ? len : 1);
   if (h->text == NULL) return -1;
   if (len) memcpy(h->text, text, len);
@@ -618,21 +659,24 @@ static int history_add(edit_state * e, int kind, size_t pos,
   h->pos = pos;
   h->len = len;
   h->group = group;
-  e->n_history++;
+  b->n_history++;
   return 0;
 }
 
 static int edit_insert(edit_state * e, size_t pos, const char * text,
                        size_t len, unsigned group, bool reset_undo) {
   if (len == 0) return 0;
-  if (buffer_insert(active_buffer(e), pos, text, len) != 0) return -1;
+  int bnum = active_pane(e)->buffer;
+  buffer * b = active_buffer(e);
+  if (buffer_insert(b, pos, text, len) != 0) return -1;
   for (int i = 0; i < e->n_panes; i++) {
     if (i == e->active_pane) continue;
+    if (e->panes[i].buffer != bnum) continue;
     if (e->panes[i].cursor >= pos) e->panes[i].cursor += len;
     if (e->panes[i].top > pos) e->panes[i].top += len;
   }
-  if (history_add(e, HIST_INSERT, pos, text, len, group) != 0) return -1;
-  if (reset_undo) e->undo_at = e->n_history;
+  if (history_add(b, HIST_INSERT, pos, text, len, group) != 0) return -1;
+  if (reset_undo) b->undo_at = b->n_history;
   return 0;
 }
 
@@ -644,6 +688,7 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (end > len) end = len;
   if (end <= start) return 0;
 
+  int bnum = active_pane(e)->buffer;
   size_t n = end - start;
   char * text = malloc(n);
   if (text == NULL) return -1;
@@ -652,13 +697,14 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
     if (i == e->active_pane) continue;
+    if (p->buffer != bnum) continue;
     if (p->cursor > start) p->cursor = (p->cursor >= end) ? p->cursor - n : start;
     if (p->top > start) p->top = (p->top >= end) ? p->top - n : start;
   }
-  int rc = history_add(e, HIST_DELETE, start, text, n, group);
+  int rc = history_add(b, HIST_DELETE, start, text, n, group);
   free(text);
   if (rc != 0) return -1;
-  if (reset_undo) e->undo_at = e->n_history;
+  if (reset_undo) b->undo_at = b->n_history;
   return 0;
 }
 
@@ -671,6 +717,146 @@ static int path_absolute(const char * path, char * out, size_t n) {
 
 static void chomp(char * s) {
   s[strcspn(s, "\r\n")] = '\0';
+}
+
+static int recent_save(const char * path);
+static int selected_buffer(edit_state * e);
+static int split_pane(edit_state * e, int layout);
+static void refresh_buffer_list(edit_state * e);
+static const char * file_name(const char * path);
+
+static int save_current_file(edit_state * e) {
+  buffer * b = active_buffer(e);
+  if (b->kind == BUFFER_FILE && b->dirty && buffer_save(b) != 0)
+    return set_status(e, "save failed"), -1;
+  return 0;
+}
+
+static int buffer_set_text(buffer * b, const char * name, int kind, const char * text) {
+  buffer_free(b);
+  if (buffer_blank_kind(b, name, kind) != 0) return -1;
+  if (buffer_insert(b, 0, text, strlen(text)) != 0) return -1;
+  b->dirty = false;
+  return 0;
+}
+
+static void save_pane_state(edit_state * e) {
+  pane * p = active_pane(e);
+  buffer * b = pane_buffer(e, p);
+  if (b->kind == BUFFER_LIST) return;
+  b->cursor = p->cursor;
+  b->top = p->top;
+}
+
+static int list_buffer(edit_state * e) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_LIST) return i;
+  return -1;
+}
+
+static int path_buffer(edit_state * e, const char * path) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_FILE && strcmp(e->buffers[i].path, path) == 0)
+      return i;
+  return -1;
+}
+
+static int next_real_buffer(edit_state * e, int from) {
+  for (int step = 1; step <= e->n_buffers; step++) {
+    int i = (from + step) % e->n_buffers;
+    if (e->buffers[i].kind != BUFFER_LIST) return i;
+  }
+  return -1;
+}
+
+static bool buffer_visible_elsewhere(edit_state * e, int buffer) {
+  for (int i = 0; i < e->n_panes; i++)
+    if (i != e->active_pane && e->panes[i].buffer == buffer) return true;
+  return false;
+}
+
+static int next_hidden_buffer(edit_state * e, int from) {
+  for (int step = 1; step <= e->n_buffers; step++) {
+    int i = (from + step) % e->n_buffers;
+    if (e->buffers[i].kind != BUFFER_LIST && ! buffer_visible_elsewhere(e, i))
+      return i;
+  }
+  return -1;
+}
+
+static int previous_real_buffer(edit_state * e, int from) {
+  for (int step = 1; step <= e->n_buffers; step++) {
+    int i = (from - step + e->n_buffers) % e->n_buffers;
+    if (e->buffers[i].kind != BUFFER_LIST) return i;
+  }
+  return -1;
+}
+
+static bool buffer_changed(buffer * b) {
+  struct stat st;
+  if (b->kind != BUFFER_FILE || b->dirty) return false;
+  if (stat(b->path, &st) != 0) return false;
+  return st.st_size != b->disk_size || st.st_mtime != b->disk_mtime;
+}
+
+static int reload_buffer(buffer * b) {
+  char path[DEBUG_PATH_SIZE];
+  snprintf(path, sizeof(path), "%s", b->path);
+  buffer_free(b);
+  return buffer_load(b, path);
+}
+
+static int ensure_scratch(edit_state * e) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_SCRATCH) return i;
+  if (e->n_buffers >= 8) return -1;
+  return buffer_scratch(&e->buffers[e->n_buffers]) == 0 ? e->n_buffers++ : -1;
+}
+
+static int switch_to_buffer(edit_state * e, int i) {
+  if (i < 0 || i >= e->n_buffers) return set_status(e, "no buffer"), 0;
+  if (save_current_file(e) != 0) return 0;
+  save_pane_state(e);
+  if (buffer_changed(&e->buffers[i]) && reload_buffer(&e->buffers[i]) != 0)
+    return set_status(e, "open failed"), 0;
+  active_pane(e)->buffer = i;
+  active_pane(e)->cursor = e->buffers[i].cursor;
+  active_pane(e)->top = e->buffers[i].top;
+  active_pane(e)->preferred_col = SIZE_MAX;
+  if (e->buffers[i].kind == BUFFER_FILE) recent_save(e->buffers[i].path);
+  refresh_buffer_list(e);
+  set_status(e, "opened %s", file_name(e->buffers[i].path));
+  return 0;
+}
+
+static int switch_to_path(edit_state * e, const char * path) {
+  int i = path_buffer(e, path);
+  if (i >= 0) return switch_to_buffer(e, i);
+  if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
+  if (save_current_file(e) != 0) return 0;
+  save_pane_state(e);
+  if (buffer_load(&e->buffers[e->n_buffers], path) != 0)
+    return set_status(e, "open failed"), 0;
+  i = e->n_buffers++;
+  active_pane(e)->buffer = i;
+  active_pane(e)->cursor = 0;
+  active_pane(e)->top = 0;
+  active_pane(e)->preferred_col = SIZE_MAX;
+  recent_save(path);
+  refresh_buffer_list(e);
+  set_status(e, "opened %s", file_name(path));
+  return 0;
+}
+
+static void refresh_buffer_list(edit_state * e) {
+  int list = list_buffer(e);
+  if (list < 0) return;
+  output o = {0};
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind != BUFFER_LIST)
+      out_f(&o, "%c %s\n", (i == active_pane(e)->buffer) ? '*' : ' ', e->buffers[i].path);
+  buffer_set_text(&e->buffers[list], "*buffers*", BUFFER_LIST, o.data ? o.data : "");
+  free(o.data);
 }
 
 static int recent_path(char * out, size_t n, bool create) {
@@ -781,13 +967,11 @@ static int find_complete(edit_state * e) {
     if (! starts_with(ent->d_name, base)) continue;
     if (n == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
     else common_prefix(match, ent->d_name);
-    if (base[0] == '\0') {
-      char path[DEBUG_PATH_SIZE];
-      size_t used = strlen(list);
-      snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
-      snprintf(list + used, sizeof(list) - used, "%s%s%s",
-               used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
-    }
+    char path[DEBUG_PATH_SIZE];
+    size_t used = strlen(list);
+    snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
+    snprintf(list + used, sizeof(list) - used, "%s%s%s",
+             used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
     n++;
   }
   closedir(d);
@@ -799,6 +983,7 @@ static int find_complete(edit_state * e) {
   snprintf(path, sizeof(path), "%s%s", prefix, match);
   if (n == 1 && directory_path(path) && strlen(path) + 1 < sizeof(path))
     strcat(path, "/");
+  if (n > 1) set_footer(e, "%s", list);
   find_set(e, path);
   set_status(e, "find file: %s", e->find_path);
   return 0;
@@ -1508,7 +1693,7 @@ static int cli_render(const char * size, const char * path) {
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
   render_snapshot(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
@@ -1526,7 +1711,7 @@ static int cli_render_color(const char * size, const char * path) {
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
   render_color_snapshot(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
@@ -1550,7 +1735,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
   }
   e.panes[0].cursor = pos;
   render_snapshot(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
@@ -1599,8 +1784,7 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_snapshot(&e);
-  history_free(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
@@ -1620,8 +1804,7 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_color_snapshot(&e);
-  history_free(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
@@ -1768,18 +1951,21 @@ static int cmd_line_end(edit_state * e, int key) {
 }
 
 static int cmd_delete_next(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor < buffer_len(b))
-    edit_delete(e, p->cursor, p->cursor + 1, ++e->history_group, true);
+    edit_delete(e, p->cursor, p->cursor + 1, ++b->history_group, true);
   (void) key;
   return 0;
 }
 
 static int cmd_backspace(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor > 0) {
-    edit_delete(e, p->cursor - 1, p->cursor, ++e->history_group, true);
+    edit_delete(e, p->cursor - 1, p->cursor, ++b->history_group, true);
     p->cursor--;
   }
   (void) key;
@@ -1787,21 +1973,28 @@ static int cmd_backspace(edit_state * e, int key) {
 }
 
 static int cmd_insert(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) {
+    if (key == KEY_ENTER) return switch_to_buffer(e, selected_buffer(e));
+    return set_status(e, "read only"), 0;
+  }
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
   pane * p = active_pane(e);
-  edit_insert(e, p->cursor, &c, 1, ++e->history_group, true);
+  buffer * b = active_buffer(e);
+  edit_insert(e, p->cursor, &c, 1, ++b->history_group, true);
   p->cursor++;
   p->preferred_col = SIZE_MAX;
   return 0;
 }
 
 static int cmd_tab(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
   size_t n = (size_t) e->tab_width;
   char * spaces = malloc(n);
   pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
   if (spaces == NULL) return 0;
   memset(spaces, ' ', n);
-  if (edit_insert(e, p->cursor, spaces, n, ++e->history_group, true) == 0)
+  if (edit_insert(e, p->cursor, spaces, n, ++b->history_group, true) == 0)
     p->cursor += n;
   free(spaces);
   p->preferred_col = SIZE_MAX;
@@ -1816,31 +2009,35 @@ static int cmd_quote(edit_state * e, int key) {
 }
 
 static int cmd_literal(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
   char c = (key == KEY_ENTER) ? '\n' :
     (key == KEY_CTRL('i')) ? '\t' : (char) key;
   pane * p = active_pane(e);
-  edit_insert(e, p->cursor, &c, 1, ++e->history_group, true);
+  buffer * b = active_buffer(e);
+  edit_insert(e, p->cursor, &c, 1, ++b->history_group, true);
   p->cursor++;
   p->preferred_col = SIZE_MAX;
   return 0;
 }
 
 static int cmd_undo(edit_state * e, int key) {
-  if (e->undo_at <= 0) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  if (b->undo_at <= 0) {
     set_status(e, "no undo");
     (void) key;
     return 0;
   }
 
-  int end = e->undo_at;
-  unsigned group = e->history[end - 1].group;
+  int end = b->undo_at;
+  unsigned group = b->history[end - 1].group;
   int start = end - 1;
-  while (start > 0 && e->history[start - 1].group == group) start--;
+  while (start > 0 && b->history[start - 1].group == group) start--;
 
-  unsigned undo_group = ++e->history_group;
+  unsigned undo_group = ++b->history_group;
   pane * p = active_pane(e);
   for (int i = end - 1; i >= start; i--) {
-    history * h = &e->history[i];
+    history * h = &b->history[i];
     if (h->kind == HIST_INSERT) {
       edit_delete(e, h->pos, h->pos + h->len, undo_group, false);
       p->cursor = h->pos;
@@ -1850,27 +2047,19 @@ static int cmd_undo(edit_state * e, int key) {
     }
   }
   p->preferred_col = SIZE_MAX;
-  e->undo_at = start;
+  b->undo_at = start;
   set_status(e, "undo");
   (void) key;
   return 0;
 }
 
 static int cmd_save(edit_state * e, int key) {
-  set_status(e, (buffer_save(active_buffer(e)) == 0) ? "saved" : "save failed");
+  buffer * b = active_buffer(e);
+  if (b->kind == BUFFER_SCRATCH) set_status(e, "scratch not saved");
+  else if (b->kind == BUFFER_LIST) set_status(e, "read only");
+  else set_status(e, (buffer_save(b) == 0) ? "saved" : "save failed");
   (void) key;
   return 0;
-}
-
-static void reset_panes(edit_state * e) {
-  for (int i = 0; i < e->n_panes; i++) {
-    e->panes[i].buffer = 0;
-    e->panes[i].cursor = 0;
-    e->panes[i].top = 0;
-    e->panes[i].preferred_col = SIZE_MAX;
-    e->panes[i].recenter = 0;
-  }
-  e->active_pane = 0;
 }
 
 static int open_find_path(edit_state * e) {
@@ -1878,44 +2067,127 @@ static int open_find_path(edit_state * e) {
     e->find_prompt = false;
     return set_status(e, "no file"), 0;
   }
-  if (active_buffer(e)->dirty) return set_status(e, "modified; save first"), 0;
-
   char path[DEBUG_PATH_SIZE];
   if (path_absolute(e->find_path, path, sizeof(path)) != 0) {
     e->find_prompt = false;
     return set_status(e, "bad path"), 0;
   }
 
-  buffer next;
-  if (buffer_load(&next, path) != 0) {
-    e->find_prompt = false;
-    return set_status(e, "open failed"), 0;
-  }
-  buffer_free(active_buffer(e));
-  e->buffers[0] = next;
-  e->n_buffers = 1;
-  reset_panes(e);
-  history_free(e);
-  recent_save(path);
   e->find_prompt = false;
   e->find_reuse = false;
-  set_status(e, "opened %s", file_name(path));
-  return 0;
+  return switch_to_path(e, path);
 }
 
 static int cmd_find_file(edit_state * e, int key) {
   char current[DEBUG_PATH_SIZE];
   (void) key;
-  if (active_buffer(e)->dirty) return set_status(e, "modified; save first"), 0;
-  if (path_absolute(active_buffer(e)->path, current, sizeof(current)) != 0)
-    snprintf(current, sizeof(current), "%s", active_buffer(e)->path);
-  if (recent_other(current, e->find_path, sizeof(e->find_path)) != 0)
+  if (active_buffer(e)->kind == BUFFER_FILE &&
+      path_absolute(active_buffer(e)->path, current, sizeof(current)) == 0 &&
+      recent_other(current, e->find_path, sizeof(e->find_path)) == 0) {
+  } else {
     e->find_path[0] = '\0';
+  }
   e->find_len = strlen(e->find_path);
   e->find_prompt = true;
   e->find_reuse = e->find_len > 0;
   set_status(e, "find file: %s", e->find_path);
   return 0;
+}
+
+static int cmd_kill_buffer(edit_state * e, int key) {
+  int dead = active_pane(e)->buffer;
+  buffer * b = active_buffer(e);
+  (void) key;
+  if (b->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (b->kind == BUFFER_SCRATCH) {
+    buffer_free(b);
+    buffer_scratch(b);
+    active_pane(e)->cursor = 0;
+    active_pane(e)->top = 0;
+    set_status(e, "scratch");
+    return 0;
+  }
+  if (save_current_file(e) != 0) return 0;
+
+  int next = previous_real_buffer(e, dead);
+  if (next < 0 || next == dead) next = ensure_scratch(e);
+  if (next < 0) return set_status(e, "scratch failed"), 0;
+  for (int i = 0; i < e->n_panes; i++) {
+    if (e->panes[i].buffer == dead) {
+      e->panes[i].buffer = next;
+      e->panes[i].cursor = e->buffers[next].cursor;
+      e->panes[i].top = e->buffers[next].top;
+      e->panes[i].preferred_col = SIZE_MAX;
+    }
+  }
+  buffer_free(&e->buffers[dead]);
+  memmove(e->buffers + dead, e->buffers + dead + 1,
+          (size_t) (e->n_buffers - dead - 1) * sizeof(buffer));
+  e->n_buffers--;
+  memset(&e->buffers[e->n_buffers], 0, sizeof(buffer));
+  for (int i = 0; i < e->n_panes; i++)
+    if (e->panes[i].buffer > dead) e->panes[i].buffer--;
+  set_status(e, "killed");
+  refresh_buffer_list(e);
+  return 0;
+}
+
+static int selected_buffer(edit_state * e) {
+  size_t line;
+  size_t col;
+  pos_line_col(active_buffer(e), active_pane(e)->cursor, &line, &col);
+  (void) col;
+  int n = 0;
+  for (int i = 0; i < e->n_buffers; i++) {
+    if (e->buffers[i].kind == BUFFER_LIST) continue;
+    if (n++ == (int) line - 1) return i;
+  }
+  return -1;
+}
+
+static int cmd_buffer_list(edit_state * e, int key) {
+  int target = -1;
+  (void) key;
+  save_pane_state(e);
+  if (e->n_panes == 1) {
+    int old = e->n_panes;
+    split_pane(e, LAYOUT_COLS);
+    if (e->n_panes == old) return 0;
+    target = e->active_pane + 1;
+  } else {
+    e->layout = LAYOUT_COLS;
+    int list = list_buffer(e);
+    for (int i = 0; i < e->n_panes; i++)
+      if (e->panes[i].buffer == list) target = i;
+    if (target < 0)
+      for (int i = 0; i < e->n_panes; i++)
+        if (i != e->active_pane) {
+          target = i;
+          break;
+        }
+  }
+  if (target < 0) return set_status(e, "cannot show buffers"), 0;
+  int list = list_buffer(e);
+  if (list < 0) {
+    if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
+    list = e->n_buffers++;
+  }
+  buffer_set_text(&e->buffers[list], "*buffers*", BUFFER_LIST, "");
+  refresh_buffer_list(e);
+  e->panes[target].buffer = list;
+  e->panes[target].cursor = 0;
+  e->panes[target].top = 0;
+  e->panes[target].preferred_col = SIZE_MAX;
+  e->active_pane = target;
+  set_status(e, "buffers");
+  return 0;
+}
+
+static int cmd_cycle_buffer(edit_state * e, int key) {
+  int next = next_hidden_buffer(e, active_pane(e)->buffer);
+  (void) key;
+  if (next < 0) next = next_real_buffer(e, active_pane(e)->buffer);
+  return (next < 0) ? set_status(e, "no buffer"), 0 : switch_to_buffer(e, next);
 }
 
 static int search_move(edit_state * e, bool reverse, bool skip_current) {
@@ -2010,13 +2282,16 @@ static int cmd_split_cols(edit_state * e, int key) {
 }
 
 static int cmd_other_pane(edit_state * e, int key) {
+  save_pane_state(e);
   if (e->n_panes > 1) e->active_pane = (e->active_pane + 1) % e->n_panes;
+  refresh_buffer_list(e);
   set_status(e, (e->n_panes > 1) ? "other pane" : "one pane");
   (void) key;
   return 0;
 }
 
 static int cmd_close_pane(edit_state * e, int key) {
+  save_pane_state(e);
   if (e->n_panes <= 1) {
     set_status(e, "one pane");
     (void) key;
@@ -2032,6 +2307,7 @@ static int cmd_close_pane(edit_state * e, int key) {
 }
 
 static int cmd_one_pane(edit_state * e, int key) {
+  save_pane_state(e);
   e->panes[0] = *active_pane(e);
   e->n_panes = 1;
   e->active_pane = 0;
@@ -2042,12 +2318,13 @@ static int cmd_one_pane(edit_state * e, int key) {
 }
 
 static int cmd_quit(edit_state * e, int key) {
-  if (active_buffer(e)->dirty && ! e->quit_confirm) {
-    e->quit_confirm = true;
-    set_status(e, "modified; C-x C-c again to quit");
-    (void) key;
-    return 0;
-  }
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_FILE && e->buffers[i].dirty && ! e->quit_confirm) {
+      e->quit_confirm = true;
+      set_status(e, "modified; C-x C-c again to quit");
+      (void) key;
+      return 0;
+    }
   e->quit = true;
   (void) key;
   return 0;
@@ -2087,7 +2364,10 @@ static binding bindings[] = {
   {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
   {{KEY_CTRL('x'), '2'}, 2, cmd_split},
   {{KEY_CTRL('x'), '3'}, 2, cmd_split_cols},
+  {{KEY_CTRL('x'), 'b'}, 2, cmd_cycle_buffer},
+  {{KEY_CTRL('x'), KEY_CTRL('b')}, 2, cmd_buffer_list},
   {{KEY_CTRL('x'), KEY_CTRL('f')}, 2, cmd_find_file},
+  {{KEY_CTRL('x'), 'k'}, 2, cmd_kill_buffer},
   {{KEY_CTRL('x'), 'o'}, 2, cmd_other_pane},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
   {{KEY_CTRL('x'), 'u'}, 2, cmd_undo},
@@ -2203,8 +2483,7 @@ static int tui(const char * path) {
   recent_save(open_path);
   if (raw_on(&e) != 0) {
     fprintf(stderr, "edit: raw mode failed\n");
-    history_free(&e);
-    buffer_free(&e.buffers[0]);
+    buffers_free(&e);
     return 1;
   }
   write(STDOUT_FILENO, "\x1b[?1049h", 8);
@@ -2261,8 +2540,7 @@ static int tui(const char * path) {
     fprintf(e.debug_log, "end_debug aborted\n");
     fclose(e.debug_log);
   }
-  history_free(&e);
-  buffer_free(&e.buffers[0]);
+  buffers_free(&e);
   return 0;
 }
 
