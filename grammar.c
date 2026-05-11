@@ -81,22 +81,23 @@ static void _parse(grammar * g, char * line) {
 void grammar_load_default(grammar * g) {
   memset(g, 0, sizeof(*g));
   g->is_default = 1;
-  _style(g, "comment", "38;5;208");
-  _style(g, "string", "32");
-  _style(g, "stringtag", "38;5;203");
-  _style(g, "number", "38;5;81");
-  _style(g, "keyword", "38;5;159");
-  _style(g, "type", "38;5;111");
-  _style(g, "class", "38;5;118");
-  _style(g, "function", "38;5;67");
-  _style(g, "call", "38;5;250");
-  _style(g, "builtin", "38;5;75");
-  _style(g, "constant", "38;5;203");
-  _style(g, "preproc", "38;5;178");
-  _style(g, "decorator", "38;5;177");
-  _style(g, "variable", "38;5;120");
-  _style(g, "assign", "38;5;180");
-  _style(g, "operator", "38;5;244");
+  _style(g, "comment", "38;2;255;166;102");
+  _style(g, "string", "38;2;170;255;170");
+  _style(g, "stringtag", "38;2;255;150;170");
+  _style(g, "number", "38;2;120;220;255");
+  _style(g, "keyword", "38;2;120;255;255");
+  _style(g, "type", "38;2;150;190;255");
+  _style(g, "class", "38;2;210;255;90");
+  _style(g, "function", "38;2;80;190;255");
+  _style(g, "call", "38;2;232;232;232");
+  _style(g, "builtin", "38;2;120;220;255");
+  _style(g, "constant", "38;2;255;150;170");
+  _style(g, "preproc", "38;2;255;215;95");
+  _style(g, "preprocarg", "38;2;116;150;200");
+  _style(g, "decorator", "38;2;255;140;255");
+  _style(g, "variable", "38;2;120;255;175");
+  _style(g, "assign", "38;2;255;215;95");
+  _style(g, "operator", "38;2;224;224;224");
 }
 
 int grammar_load(grammar * g, const char * path) {
@@ -260,7 +261,7 @@ static int _assignment_ahead(const char * line, size_t len,
   return 0;
 }
 
-static int _preproc(const char * line, size_t len, size_t * start) {
+static int _preproc(const char * line, size_t len, size_t * start, size_t * end) {
   size_t i = 0;
   while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
   if (i >= len || line[i] != '#') return 0;
@@ -268,6 +269,7 @@ static int _preproc(const char * line, size_t len, size_t * start) {
   while (j < len && isalpha((unsigned char) line[j])) j++;
   if (j == i + 1) return 0;
   *start = i;
+  *end = j;
   return _word_in("include define if ifdef ifndef elif else endif pragma undef error",
                   line + i + 1, j - i - 1);
 }
@@ -358,6 +360,7 @@ static void _default_highlight(grammar * g, const char * line, size_t len,
   const char * constants = "NULL true false True False None stdin stdout stderr";
   size_t i0 = 0;
   size_t start = 0;
+  size_t end = 0;
 
   if (g->triple_quote != '\0') {
     size_t j = _triple_close(line, len, g->triple_quote);
@@ -366,8 +369,9 @@ static void _default_highlight(grammar * g, const char * line, size_t len,
     i0 = j;
   }
 
-  if (i0 == 0 && _preproc(line, len, &start)) {
-    _paint(sgrs, len, start, len, _sgr(g, "preproc"));
+  if (i0 == 0 && _preproc(line, len, &start, &end)) {
+    _paint(sgrs, len, start, end, _sgr(g, "preproc"));
+    _paint(sgrs, len, end, len, _sgr(g, "preprocarg"));
     return;
   }
 

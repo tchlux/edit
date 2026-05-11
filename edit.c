@@ -60,14 +60,14 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
 #define DEFAULT_TAB_WIDTH 3
-#define SEARCH_SGR "40"
-#define SEARCH_CURRENT_SGR "100"
+#define SEARCH_SGR "48;5;238"
+#define SEARCH_CURRENT_SGR "48;5;241"
 #define SEARCH_BLINK_MS 500
-#define KEYMAP_HINT "C-s search  C-r reverse  C-g cancel  Esc f/b word  Esc n/p 10 lines  C-v/Esc v page  C-x 2/3 split  C-x o other  C-x C-f find  C-x b rotate  C-x k kill  C-x C-b buffers  C-x C-s save  C-x C-c quit"
+#define HELP_HINT "C-h help"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
-enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST };
+enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP };
 
 typedef struct {
   int kind;
@@ -740,6 +740,10 @@ static int buffer_set_text(buffer * b, const char * name, int kind, const char *
   return 0;
 }
 
+static bool read_only_buffer(buffer * b) {
+  return b->kind == BUFFER_LIST || b->kind == BUFFER_HELP;
+}
+
 static void save_pane_state(edit_state * e) {
   pane * p = active_pane(e);
   buffer * b = pane_buffer(e, p);
@@ -751,6 +755,12 @@ static void save_pane_state(edit_state * e) {
 static int list_buffer(edit_state * e) {
   for (int i = 0; i < e->n_buffers; i++)
     if (e->buffers[i].kind == BUFFER_LIST) return i;
+  return -1;
+}
+
+static int help_buffer(edit_state * e) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_HELP) return i;
   return -1;
 }
 
@@ -1309,16 +1319,32 @@ static void modeline_pos(output * o, buffer * b, pane * p,
   out_clip(o, s, used, limit);
 }
 
+static void footer_line(edit_state * e, output * o, int cols);
+
 static void render_footer(edit_state * e, output * o, int cols) {
-  size_t used = 0;
-  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
-  out_clip(o, e->footer[0] ? e->footer : KEYMAP_HINT, &used, limit);
-  while (used++ < limit) out_s(o, " ");
+  footer_line(e, o, cols);
 }
 
 static const char * file_name(const char * path) {
   const char * slash = strrchr(path, '/');
   return slash ? slash + 1 : path;
+}
+
+static void footer_line(edit_state * e, output * o, int cols) {
+  const char * msg = e->footer[0] ? e->footer : e->status;
+  size_t used = 0;
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t hint = strlen(HELP_HINT);
+  if (limit <= hint) {
+    out_clip(o, HELP_HINT, &used, limit);
+    return;
+  }
+  out_clip(o, msg, &used, limit - hint);
+  while (used < limit - hint) {
+    out_s(o, " ");
+    used++;
+  }
+  out_clip(o, HELP_HINT, &used, limit);
 }
 
 static void render_modeline(edit_state * e, output * o, pane * p,
@@ -1330,10 +1356,6 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   modeline_pos(o, b, p, &used, status_cols);
   if (b->dirty) out_clip(o, " *", &used, status_cols);
   if (active && e->n_panes > 1) out_clip(o, " >", &used, status_cols);
-  if (active && e->status[0] != '\0') {
-    out_clip(o, "  ", &used, status_cols);
-    out_clip(o, e->status, &used, status_cols);
-  }
   while (used++ < status_cols) out_s(o, " ");
 }
 
@@ -1485,9 +1507,7 @@ static void snapshot_modeline(edit_state * e, output * o, pane * p,
 }
 
 static void snapshot_keymap(edit_state * e, output * o) {
-  size_t used = 0;
-  size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
-  out_clip(o, e->footer[0] ? e->footer : KEYMAP_HINT, &used, limit);
+  footer_line(e, o, e->cols);
   out_s(o, "\n");
 }
 
@@ -1513,10 +1533,6 @@ static void build_snapshot(edit_state * e, output * o) {
     }
     for (int i = 0; i < e->n_panes; i++)
       snapshot_modeline(e, o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
-    if (e->status[0] != '\0') {
-      out_s(o, " ");
-      out_s(o, e->status);
-    }
     out_s(o, "\n");
     snapshot_keymap(e, o);
     return;
@@ -1537,19 +1553,11 @@ static void build_snapshot(edit_state * e, output * o) {
     }
     if (e->n_panes > 1) {
       snapshot_modeline(e, o, p, i == e->active_pane, 0);
-      if (i == e->active_pane && e->status[0] != '\0') {
-        out_s(o, " ");
-        out_s(o, e->status);
-      }
       out_s(o, "\n");
     }
   }
   if (e->n_panes == 1) {
     snapshot_modeline(e, o, active_pane(e), false, 0);
-    if (e->status[0] != '\0') {
-      out_s(o, " ");
-      out_s(o, e->status);
-    }
     out_s(o, "\n");
   }
   snapshot_keymap(e, o);
@@ -1673,7 +1681,7 @@ static const char * debug_note_key(edit_state * e, key_event * ev) {
     set_status(e, "debug saved %s", e->debug_path);
     return "debug-note-saved";
   }
-  if ((ev->key == KEY_BACKSPACE || ev->key == KEY_CTRL('h')) && e->debug_note_len > 0)
+  if (ev->key == KEY_BACKSPACE && e->debug_note_len > 0)
     e->debug_note[--e->debug_note_len] = '\0';
   else if (ev->key >= 32 && ev->key < 127 && e->debug_note_len + 1 < sizeof(e->debug_note)) {
     e->debug_note[e->debug_note_len++] = (char) ev->key;
@@ -1967,7 +1975,7 @@ static int cmd_line_end(edit_state * e, int key) {
 }
 
 static int cmd_delete_next(edit_state * e, int key) {
-  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor < buffer_len(b))
@@ -1977,7 +1985,7 @@ static int cmd_delete_next(edit_state * e, int key) {
 }
 
 static int cmd_backspace(edit_state * e, int key) {
-  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor > 0) {
@@ -1993,6 +2001,7 @@ static int cmd_insert(edit_state * e, int key) {
     if (key == KEY_ENTER) return switch_to_buffer(e, selected_buffer(e));
     return set_status(e, "read only"), 0;
   }
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
@@ -2003,7 +2012,7 @@ static int cmd_insert(edit_state * e, int key) {
 }
 
 static int cmd_tab(edit_state * e, int key) {
-  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   size_t n = (size_t) e->tab_width;
   char * spaces = malloc(n);
   pane * p = active_pane(e);
@@ -2025,7 +2034,7 @@ static int cmd_quote(edit_state * e, int key) {
 }
 
 static int cmd_literal(edit_state * e, int key) {
-  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   char c = (key == KEY_ENTER) ? '\n' :
     (key == KEY_CTRL('i')) ? '\t' : (char) key;
   pane * p = active_pane(e);
@@ -2037,7 +2046,7 @@ static int cmd_literal(edit_state * e, int key) {
 }
 
 static int cmd_undo(edit_state * e, int key) {
-  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   if (b->undo_at <= 0) {
     set_status(e, "no undo");
@@ -2072,7 +2081,7 @@ static int cmd_undo(edit_state * e, int key) {
 static int cmd_save(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   if (b->kind == BUFFER_SCRATCH) set_status(e, "scratch not saved");
-  else if (b->kind == BUFFER_LIST) set_status(e, "read only");
+  else if (read_only_buffer(b)) set_status(e, "read only");
   else set_status(e, (buffer_save(b) == 0) ? "saved" : "save failed");
   (void) key;
   return 0;
@@ -2333,6 +2342,72 @@ static int cmd_one_pane(edit_state * e, int key) {
   return 0;
 }
 
+static const char HELP_TEXT[] =
+  "edit help\n"
+  "\n"
+  "Movement\n"
+  "  Arrow keys, C-b, C-f, C-p, C-n  move by character or line\n"
+  "  Esc f, Esc b                      move by word\n"
+  "  C-a, C-e                          line start and end\n"
+  "  C-v, Esc v                        page down and up\n"
+  "  Esc n, Esc p                      move 10 lines down and up\n"
+  "  Esc <, Esc >                      file start and end\n"
+  "\n"
+  "Editing\n"
+  "  Text                              insert text\n"
+  "  Backspace                         delete previous character\n"
+  "  C-d                               delete next character\n"
+  "  C-q                               insert next key literally\n"
+  "  C-_, C-x u                        undo\n"
+  "\n"
+  "Search\n"
+  "  C-s, C-r                          search forward and reverse\n"
+  "  C-s/C-r again                     repeat search\n"
+  "  Enter                             accept search\n"
+  "  C-g                               cancel\n"
+  "\n"
+  "Files and buffers\n"
+  "  C-x C-f                           find file\n"
+  "  Tab                               complete file prompt\n"
+  "  C-x C-s                           save file\n"
+  "  C-x b                             switch buffer\n"
+  "  C-x C-b                           list buffers\n"
+  "  C-x k                             kill buffer\n"
+  "\n"
+  "Panes/windows\n"
+  "  C-x 2, C-x 3                      split rows and columns\n"
+  "  C-x o                             other pane\n"
+  "  C-x 0, C-x 1                      close pane and one pane\n"
+  "\n"
+  "Quit/debug\n"
+  "  C-x C-c                           quit\n"
+  "  Esc r                             record debug log\n"
+  "\n"
+  "Help\n"
+  "  C-h                               show this help\n";
+
+static int cmd_help(edit_state * e, int key) {
+  int h = help_buffer(e);
+  (void) key;
+  e->find_prompt = false;
+  e->search_prompt = false;
+  e->footer[0] = '\0';
+  if (h < 0) {
+    if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
+    h = e->n_buffers++;
+  }
+  if (buffer_set_text(&e->buffers[h], "*help*", BUFFER_HELP, HELP_TEXT) != 0)
+    return set_status(e, "help failed"), 0;
+  save_pane_state(e);
+  active_pane(e)->buffer = h;
+  active_pane(e)->cursor = 0;
+  active_pane(e)->top = 0;
+  active_pane(e)->preferred_col = SIZE_MAX;
+  set_status(e, "help");
+  refresh_buffer_list(e);
+  return 0;
+}
+
 static int cmd_quit(edit_state * e, int key) {
   for (int i = 0; i < e->n_buffers; i++)
     if (e->buffers[i].kind == BUFFER_FILE && e->buffers[i].dirty && ! e->quit_confirm) {
@@ -2368,7 +2443,7 @@ static binding bindings[] = {
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
   {{KEY_BACKSPACE, 0}, 1, cmd_backspace},
-  {{KEY_CTRL('h'), 0}, 1, cmd_backspace},
+  {{KEY_CTRL('h'), 0}, 1, cmd_help},
   {{KEY_CTRL('i'), 0}, 1, cmd_tab},
   {{KEY_ENTER, 0}, 1, cmd_insert},
   {{KEY_CTRL('g'), 0}, 1, cmd_cancel},
@@ -2399,7 +2474,7 @@ static int find_dispatch(edit_state * e, int key) {
     e->find_path[0] = '\0';
     e->find_reuse = false;
   }
-  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->find_len > 0) {
+  if (key == KEY_BACKSPACE && e->find_len > 0) {
     e->find_path[--e->find_len] = '\0';
     e->find_reuse = false;
   } else if (key >= 32 && key < 127 && e->find_len + 1 < sizeof(e->find_path)) {
@@ -2431,7 +2506,7 @@ static int search_dispatch(edit_state * e, int key) {
     e->search[0] = '\0';
     e->search_reuse = false;
   }
-  if ((key == KEY_BACKSPACE || key == KEY_CTRL('h')) && e->search_len > 0) {
+  if (key == KEY_BACKSPACE && e->search_len > 0) {
     e->search[--e->search_len] = '\0';
     e->search_reuse = false;
   } else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
@@ -2447,6 +2522,7 @@ static int dispatch(edit_state * e, int key) {
   int n_keys = 1;
 
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (key == KEY_CTRL('h')) return cmd_help(e, key);
   if (e->find_prompt) return find_dispatch(e, key);
   if (e->search_prompt) return search_dispatch(e, key);
 

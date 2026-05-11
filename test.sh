@@ -11,6 +11,26 @@ dir=$(mktemp -d)
 export EDIT_RECENT="$recent"
 trap 'rm -rf "$dir"; rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"' EXIT
 
+foot() {
+  width=$1
+  msg=$2
+  hint='C-h help'
+  limit=$((width - 1))
+  left=$((limit - ${#hint}))
+  if [ "$left" -le 0 ]; then
+    printf '%.*s' "$limit" "$hint"
+    return
+  fi
+  printf '%.*s' "$left" "$msg"
+  used=${#msg}
+  [ "$used" -gt "$left" ] && used=$left
+  while [ "$used" -lt "$left" ]; do
+    printf ' '
+    used=$((used + 1))
+  done
+  printf '%s' "$hint"
+}
+
 printf 'one\ntwo\nthree\n' > "$tmp"
 ./edit --print 2:1..3:1 "$tmp" > "$out"
 printf 'two\n' | cmp -s - "$out"
@@ -42,7 +62,7 @@ printf 'one' | cmp -s - "$out"
 esc=$(printf '\033')
 printf 'int tint = 42; // return 7\nchar *s = "hi";\n' > "$tmp"
 ./edit --render-color 4:80 "$tmp" > "$out"
-printf '%s[38;5;111mint%s[0m %s[38;5;180mtint%s[0m %s[38;5;244m=%s[0m %s[38;5;81m42%s[0m%s[38;5;244m;%s[0m %s[38;5;208m// return 7%s[0m\n%s[38;5;111mchar%s[0m %s[38;5;244m*%s[0m%s[38;5;180ms%s[0m %s[38;5;244m=%s[0m %s[32m"hi"%s[0m%s[38;5;244m;%s[0m\n\n' \
+printf '%s[38;2;150;190;255mint%s[0m %s[38;2;255;215;95mtint%s[0m %s[38;2;224;224;224m=%s[0m %s[38;2;120;220;255m42%s[0m%s[38;2;224;224;224m;%s[0m %s[38;2;255;166;102m// return 7%s[0m\n%s[38;2;150;190;255mchar%s[0m %s[38;2;224;224;224m*%s[0m%s[38;2;255;215;95ms%s[0m %s[38;2;224;224;224m=%s[0m %s[38;2;170;255;170m"hi"%s[0m%s[38;2;224;224;224m;%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" \
   "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" "$esc" \
   "$esc" "$esc" "$esc" "$esc" |
@@ -59,119 +79,124 @@ EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$tmp" > "$out"
 printf '%s[33mint%s[0m tint %s[33mreturn%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
+printf '#include <stdio.h>\n#define LIMIT 16\n' > "$tmp"
+./edit --render-color 4:80 "$tmp" > "$out"
+grep -F -q "$(printf '%s[38;2;255;215;95m#include%s[0m%s[38;2;116;150;200m <stdio.h>%s[0m' "$esc" "$esc" "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;215;95m#define%s[0m%s[38;2;116;150;200m LIMIT 16%s[0m' "$esc" "$esc" "$esc" "$esc")" "$out"
+
 printf 'printf "$(date +%%S)"\n' > "$tmp"
 ./edit --render-color 3:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;75mdate%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;220;255mdate%s[0m' "$esc" "$esc")" "$out"
 
 printf 'x = """\nline\n"""\n' > "$tmp"
 ./edit --render-color 5:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[32mline%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;170;255;170mline%s[0m' "$esc" "$esc")" "$out"
 
 printf 'print(f"{value + 1}")\n' > "$tmp"
 ./edit --render-color 3:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;203mf%s[0m' "$esc" "$esc")" "$out"
-grep -F -q "$(printf '%s[38;5;81m1%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;150;170mf%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;220;255m1%s[0m' "$esc" "$esc")" "$out"
 
 printf 'x = r"raw"\n' > "$tmp"
 ./edit --render-color 3:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;203mr%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;150;170mr%s[0m' "$esc" "$esc")" "$out"
 
 printf 'def foo():\n    return list()\n' > "$tmp"
 ./edit --render-color 4:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;159mdef%s[0m' "$esc" "$esc")" "$out"
-grep -F -q "$(printf '%s[38;5;67mfoo%s[0m' "$esc" "$esc")" "$out"
-grep -F -q "$(printf '%s[38;5;250mlist%s[0m' "$esc" "$esc")" "$out"
-if grep -F -q "$(printf '%s[38;5;67mlist%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+grep -F -q "$(printf '%s[38;2;120;255;255mdef%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;80;190;255mfoo%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;232;232;232mlist%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;2;80;190;255mlist%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
 printf 'value: list = []\n' > "$tmp"
 ./edit --render-color 3:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;111mlist%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;150;190;255mlist%s[0m' "$esc" "$esc")" "$out"
 
 printf 'class Foo:\n    pass\nvalue = Path("x")\n' > "$tmp"
 ./edit --render-color 3:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;118mFoo%s[0m' "$esc" "$esc")" "$out"
-if grep -F -q "$(printf '%s[38;5;118mPath%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+grep -F -q "$(printf '%s[38;2;210;255;90mFoo%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;2;210;255;90mPath%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
 printf 'answer: int = 42\nif answer == 42:\n    obj.answer = 1\ndef f(limit: int = 0): pass\n' > "$tmp"
 ./edit --render-color 6:80 "$tmp" > "$out"
-grep -F -q "$(printf '%s[38;5;180manswer%s[0m' "$esc" "$esc")" "$out"
-if grep -F -q "$(printf 'obj.%s[38;5;180manswer%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
-if grep -F -q "$(printf '%s[38;5;180mint%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
-if grep -F -q "$(printf '%s[38;5;180mlimit%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+grep -F -q "$(printf '%s[38;2;255;215;95manswer%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf 'obj.%s[38;2;255;215;95manswer%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;255;215;95mint%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;255;215;95mlimit%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
 printf 'abc\n  def\n\tghi\n' > "$tmp"
 ./edit --render 5:12 "$tmp" > "$out"
-printf '|abc\n..def\n>..ghi\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
+printf '|abc\n..def\n>..ghi\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-at 5:12 2:2 "$tmp" > "$out"
-printf 'abc\n.|.def\n>..ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abc\n.|.def\n>..ghi\n%s 2:2\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:12 nf "$tmp" > "$out"
-printf 'abc\n.|.def\n>..ghi\n%s 2:2\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abc\n.|.def\n>..ghi\n%s 2:2\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-at 5:12 3:2 "$tmp" > "$out"
-printf 'abc\n..def\n>..|ghi\n%s 3:2\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abc\n..def\n>..|ghi\n%s 3:2\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 EDIT_TAB_WIDTH=4 ./edit --render 5:12 "$tmp" > "$out"
-printf '|abc\n..def\n>...ghi\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
+printf '|abc\n..def\n>...ghi\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 "$(printf '\t')" "$tmp" > "$out"
-printf '...|abc\n\n%s* 1:4\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '...|abc\n\n%s* 1:4\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 EDIT_TAB_WIDTH=2 ./edit --render-keys 4:20 "$(printf '\t')" "$tmp" > "$out"
-printf '..|abc\n\n%s* 1:3\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '..|abc\n\n%s* 1:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "$(printf '\t')_" "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "q$(printf '\t')" "$tmp" > "$out"
-printf '>..|abc\n\n%s* 1:2 C-q\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '>..|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "C-q")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "q$(printf '\t')_" "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 printf 'abcdef\nabc\n' > "$tmp"
 ./edit --render-keys 5:12 fffn "$tmp" > "$out"
-printf 'abcdef\nabc|\n\n%s 2:4\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'abcdef\nabc|\n\n%s 2:4\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > "$tmp"
 ./edit --render-keys 5:12 v "$tmp" > "$out"
-printf 'l2\nl3\n|l4\n%s 4:1\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'l2\nl3\n|l4\n%s 4:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:12 vV "$tmp" > "$out"
-printf '|l1\nl2\nl3\n%s 1:1\nC-s search \n' "$base" | cmp -s - "$out"
+printf '|l1\nl2\nl3\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:20 nnnnnl "$tmp" > "$out"
-printf 'l5\n|l6\nl7\n%s 6:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l5\n|l6\nl7\n%s 6:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:20 nnnnnll "$tmp" > "$out"
-printf '|l6\nl7\nl8\n%s 6:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|l6\nl7\nl8\n%s 6:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:20 nnnnnlll "$tmp" > "$out"
-printf 'l4\nl5\n|l6\n%s 6:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l4\nl5\n|l6\n%s 6:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
 ./edit --render-keys 6:20 ffN "$tmp" > "$out"
-printf 'l08xx\nl09xx\nl10xx\nl1|1xx\n%s 11:3\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l08xx\nl09xx\nl10xx\nl1|1xx\n%s 11:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 ffNP "$tmp" > "$out"
-printf 'l0|1xx\nl02xx\nl03xx\nl04xx\n%s 1:3\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l0|1xx\nl02xx\nl03xx\nl04xx\n%s 1:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 ">>" "$tmp" > "$out"
-printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 ">>nf" "$tmp" > "$out"
-printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l10xx\nl11xx\nl12xx\n|\n%s 13:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx' > "$tmp"
 ./edit --render-keys 6:20 ">>nf" "$tmp" > "$out"
-printf 'l09xx\nl10xx\nl11xx\nl12xx|\n%s 12:6\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'l09xx\nl10xx\nl11xx\nl12xx|\n%s 12:6\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
 
 ./edit --render-keys 6:20 ">>><" "$tmp" > "$out"
-printf '|l01xx\nl02xx\nl03xx\nl04xx\n%s 1:1\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|l01xx\nl02xx\nl03xx\nl04xx\n%s 1:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 python3 ./tui_view.py 6:30 '<opt-gt>' "$tmp" > "$out"
 sed -n '5p' "$out" > "$tmp.head"
@@ -183,16 +208,16 @@ case "$(cat "$tmp.head")" in *1:1*) ;; *) exit 1;; esac
 
 printf 'one, two_three 9x\n' > "$tmp"
 ./edit --render-keys 4:30 F "$tmp" > "$out"
-printf 'one|,.two_three.9x\n\n%s 1:4\nC-s search  C-r reverse  C-g \n' "$base" | cmp -s - "$out"
+printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FF "$tmp" > "$out"
-printf 'one,.two_three|.9x\n\n%s 1:15\nC-s search  C-r reverse  C-g \n' "$base" | cmp -s - "$out"
+printf 'one,.two_three|.9x\n\n%s 1:15\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FFB "$tmp" > "$out"
-printf 'one,.|two_three.9x\n\n%s 1:6\nC-s search  C-r reverse  C-g \n' "$base" | cmp -s - "$out"
+printf 'one,.|two_three.9x\n\n%s 1:6\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FffB "$tmp" > "$out"
-printf '|one,.two_three.9x\n\n%s 1:1\nC-s search  C-r reverse  C-g \n' "$base" | cmp -s - "$out"
+printf '|one,.two_three.9x\n\n%s 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 python3 ./tui_view.py 4:40 '<opt-f>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
@@ -264,29 +289,29 @@ cmp -s "$tmp.expected" "$tmp.head"
 
 printf 'one\ntwo\nthree\nfour\n' > "$tmp"
 ./edit --render-keys 6:20 x2 "$tmp" > "$out"
-printf '|one\ntwo\n%s 1:1> split\n|one\n%s 1:1\nC-s search  C-r rev\n' "$base" "$base" | cmp -s - "$out"
+printf '|one\ntwo\n%s 1:1>\n|one\n%s 1:1\n%s\n' "$base" "$base" "$(foot 20 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2nxof "$tmp" > "$out"
-printf 'one\n|two\n%s 2:1\no|ne\n%s 1:2> other pane\nC-s search  C-r rev\n' "$base" "$base" | cmp -s - "$out"
+printf 'one\n|two\n%s 2:1\no|ne\n%s 1:2>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2Xxo "$tmp" > "$out"
-printf 'X|one\ntwo\n%s* 1:2\nX|one\n%s* 1:2> other pane\nC-s search  C-r rev\n' "$base" "$base" | cmp -s - "$out"
+printf 'X|one\ntwo\n%s* 1:2\nX|one\n%s* 1:2>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2X_xo "$tmp" > "$out"
-printf '|one\ntwo\n%s* 1:1\n|one\n%s* 1:1> other pane\nC-s search  C-r rev\n' "$base" "$base" | cmp -s - "$out"
+printf '|one\ntwo\n%s* 1:1\n|one\n%s* 1:1>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2x0 "$tmp" > "$out"
-printf '|one\ntwo\nthree\nfour\n%s 1:1 close pane\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "close pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2x1 "$tmp" > "$out"
-printf '|one\ntwo\nthree\nfour\n%s 1:1 one pane\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "one pane")" | cmp -s - "$out"
 
 ./edit --render-keys 5:24 x3 "$tmp" > "$out"
 head=$(printf '%s' "$base" | cut -c 1-11)
-printf '|one       |one       \ntwo        two        \nthree      three      \n%s%s split\nC-s search  C-r reverse\n' "$head" "$head" | cmp -s - "$out"
+printf '|one       |one       \ntwo        two        \nthree      three      \n%s%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
-printf 'one        o|ne       \n|two       two        \nthree      three      \n%s%s other pane\nC-s search  C-r reverse\n' "$head" "$head" | cmp -s - "$out"
+printf 'one        o|ne       \n|two       two        \nthree      three      \n%s%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
 
 python3 ./tui_view.py 6:30 '<c-x>2<c-x>o' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
@@ -304,38 +329,39 @@ printf 'cursor:1:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 enter=$(printf '\r')
+del=$(printf '\177')
 printf 'one\ntwo\nthree\n' > "$tmp"
 ./edit --render-keys 5:12 "stwo$enter" "$tmp" > "$out"
-printf 'one\n|two\nthree\n%s 2:1 match two\nC-s search \n' "$base" | cmp -s - "$out"
+printf 'one\n|two\nthree\n%s 2:1\n%s\n' "$base" "$(foot 12 "match two")" | cmp -s - "$out"
 
 printf 'one two one two\n' > "$tmp"
 ./edit --render-keys 4:40 "stwo${enter}ss" "$tmp" > "$out"
-printf 'one.two.one.|two\n\n%s 1:13 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'one.two.one.|two\n\n%s 1:13\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
 ./edit --render-keys 4:40 "stwo${enter}ssr" "$tmp" > "$out"
-printf 'one.|two.one.two\n\n%s 1:5 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'one.|two.one.two\n\n%s 1:5\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
 ./edit --render-keys 4:40 "stwo${enter}sss" "$tmp" > "$out"
-printf 'one.|two.one.two\n\n%s 1:5 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'one.|two.one.two\n\n%s 1:5\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
 ./edit --render-keys 4:40 "stwo${enter}rr" "$tmp" > "$out"
-printf 'one.two.one.|two\n\n%s 1:13 match two\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'one.two.one.|two\n\n%s 1:13\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}" "$tmp" > "$out"
-printf 'one %s[100mtwo%s[0m one %s[40mtwo%s[0m\n\n\n' \
+printf 'one %s[48;5;241mtwo%s[0m one %s[48;5;238mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ss" "$tmp" > "$out"
-printf 'one %s[40mtwo%s[0m one %s[100mtwo%s[0m\n\n\n' \
+printf 'one %s[48;5;238mtwo%s[0m one %s[48;5;241mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ssr" "$tmp" > "$out"
-printf 'one %s[100mtwo%s[0m one %s[40mtwo%s[0m\n\n\n' \
+printf 'one %s[48;5;241mtwo%s[0m one %s[48;5;238mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 printf '42 42\n' > "$tmp"
 ./edit --render-keys-color 3:40 "s42${enter}" "$tmp" > "$out"
-printf '%s[100m42%s[0m %s[40m42%s[0m\n\n' \
+printf '%s[48;5;241m42%s[0m %s[48;5;238m42%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 printf 'one two one two\n' > "$tmp"
@@ -343,54 +369,66 @@ printf 'one two one two\n' > "$tmp"
 printf 'one two one two\n\n\n' | cmp -s - "$out"
 
 ./edit --render-keys 4:40 "stwogA" "$tmp" > "$out"
-printf 'A|one.two.one.two\n\n%s* 1:2 cancel\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'A|one.two.one.two\n\n%s* 1:2\n%s\n' "$base" "$(foot 40 "cancel")" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:40 xgA "$tmp" > "$out"
-printf 'A|abc\n\n%s* 1:2 cancel\nC-s search  C-r reverse  C-g cancel  Es\n' "$base" | cmp -s - "$out"
+printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 40 "cancel")" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X "$tmp" > "$out"
-printf 'X|abc\n\n%s* 1:2\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'X|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X_ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 X/ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 Xxu "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
-./edit --render-keys 4:20 fh_ "$tmp" > "$out"
-printf 'a|bc\n\n%s* 1:2 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+./edit --render-keys 4:20 "f${del}" "$tmp" > "$out"
+printf '|bc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
+
+./edit --render-keys 40:80 h "$tmp" > "$out"
+grep -q '\*help\*' "$out"
+grep -q 'C-x.C-f' "$out"
+grep -q 'C-s' "$out"
+grep -q 'Esc.v' "$out"
+grep -q 'C-x.C-c' "$out"
+
+./edit --render-keys 4:20 hX "$tmp" > "$out"
+printf '|edit.help\n\n*help* 1:1\n%s\n' "$(foot 20 "read only")" | cmp -s - "$out"
+
+./edit --render-keys 4:20 fhxk "$tmp" > "$out"
+printf 'a|bc\n\n%s 1:2\n%s\n' "$base" "$(foot 20 "killed")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 d_ "$tmp" > "$out"
-printf 'a|bc\n\n%s* 1:2 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'a|bc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 A_c__ "$tmp" > "$out"
-printf 'A|abc\n\n%s* 1:2 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 Ac__ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1 undo\nC-s search  C-r rev\n' "$base" | cmp -s - "$out"
+printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 python3 ./tui_view.py 5:50 'X^x^s' "$tmp" > "$out"
-sed -n '4p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *saved*) ;; *) exit 1;; esac
+grep -q saved "$out"
 printf 'Xabc\n' | cmp -s - "$tmp"
 
 printf 'abc\n' > "$tmp"
 python3 ./tui_view.py 5:50 '^x^c' "$tmp" > "$out"
 
 python3 ./tui_view.py 5:50 'X^x^c' "$tmp" > "$out"
-sed -n '4p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *modified*again*) ;; *) exit 1;; esac
+grep -q modified "$out"
+grep -q again "$out"
 printf 'abc\n' | cmp -s - "$tmp"
 
 python3 ./tui_view.py 5:50 'X^_^x^c' "$tmp" > "$out"
-sed -n '4p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *modified*again*) ;; *) exit 1;; esac
+grep -q modified "$out"
+grep -q again "$out"
 
 printf 'alpha\n' > "$dir/a"
 printf 'beta\n' > "$dir/b"
@@ -451,8 +489,7 @@ python3 ./tui_view.py 5:80 '<right>X^x^f
 <c-x>b^_' "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
-sed -n '4p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *undo*) ;; *) exit 1;; esac
+grep -q undo "$out"
 
 test ! -e '*scratch*'
 ./edit --render-keys 5:40 "xkXxs" "$dir/a" > "$out"
