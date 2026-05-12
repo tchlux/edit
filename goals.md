@@ -32,6 +32,9 @@ Completed work:
   `C-q Tab` inserts a literal tab.
 - Search highlighting: visible forward/reverse search matches are highlighted
   in the current view, with the current match emphasized.
+- Robust large paste handling: bracketed paste is buffered into one insert and
+  one undo group, with newline normalization, UTF-8 preservation, and pty
+  regression coverage.
 
 Outstanding work for `edit`:
 

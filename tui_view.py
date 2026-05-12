@@ -71,6 +71,12 @@ def keys(s):
         elif s.startswith("<esc>", i):
             out += b"\x1b\x00"
             i += 5
+        elif s.startswith("<paste>", i):
+            out += b"\x1b[200~"
+            i += 7
+        elif s.startswith("</paste>", i):
+            out += b"\x1b[201~"
+            i += 8
         elif s.startswith("<opt-n>", i):
             out += bytes([0xCB, 0x9C])
             i += 7
@@ -228,13 +234,21 @@ def decode(out, rows, cols):
         elif c == 10:
             row = min(rows - 1, row + 1)
             wrap = False
-        elif 32 <= c < 127:
+        elif c >= 32:
+            if c >= 128:
+                j = i + 1
+                while j < len(out) and 128 <= out[j] < 192:
+                    j += 1
+                ch = out[i:j].decode(errors="replace")[:1]
+                i = j - 1
+            else:
+                ch = chr(c)
             if wrap:
                 row = min(rows - 1, row + 1)
                 col = 0
                 wrap = False
             if row < rows and col < cols:
-                screen[row][col] = chr(c)
+                screen[row][col] = ch
             if col == cols - 1:
                 wrap = True
             else:

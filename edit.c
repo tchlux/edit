@@ -53,10 +53,13 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define KEY_DOWN 1001
 #define KEY_RIGHT 1002
 #define KEY_LEFT 1003
+#define KEY_PASTE_START 1004
+#define KEY_PASTE_END 1005
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
 #define LINE_RENDER_MAX 8192
 #define HISTORY_MAX 1024
+#define PASTE_FALLBACK_MAX 65536
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
 #define DEFAULT_TAB_WIDTH 3
@@ -153,6 +156,7 @@ struct edit_state {
   bool quit;
   bool quit_confirm;
   bool raw;
+  output input;
   bool debug_recording;
   bool debug_note_prompt;
   FILE * debug_log;
@@ -607,6 +611,8 @@ static void key_text(int key, char * out, size_t n) {
   else if (key == KEY_DOWN) snprintf(out, n, "DOWN");
   else if (key == KEY_LEFT) snprintf(out, n, "LEFT");
   else if (key == KEY_RIGHT) snprintf(out, n, "RIGHT");
+  else if (key == KEY_PASTE_START) snprintf(out, n, "PASTE-START");
+  else if (key == KEY_PASTE_END) snprintf(out, n, "PASTE-END");
   else if (key >= KEY_META(0) && key < KEY_META(128)) {
     int c = key - KEY_META(0);
     snprintf(out, n, (c >= 32 && c < 127) ? "M-%c" : "M-%d", c);
@@ -1036,18 +1042,45 @@ static int raw_on(edit_state * e) {
   return 0;
 }
 
-static key_event read_key_event(int timeout_ms) {
+static int input_wait(edit_state * e, int usec) {
+  if (e->input.len > 0) return 1;
+  fd_set set;
+  struct timeval tv = {usec / 1000000, usec % 1000000};
+  FD_ZERO(&set);
+  FD_SET(STDIN_FILENO, &set);
+  return select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) == 1;
+}
+
+static int input_read(edit_state * e, char * c) {
+  if (e->input.len > 0) {
+    *c = e->input.data[0];
+    memmove(e->input.data, e->input.data + 1, --e->input.len);
+    return 1;
+  }
+  return read(STDIN_FILENO, c, 1) == 1;
+}
+
+static void input_unread(edit_state * e, char c) {
+  if (e->input.len + 2 > e->input.cap) {
+    size_t cap = e->input.cap ? e->input.cap * 2 : 64;
+    char * data = realloc(e->input.data, cap);
+    if (data == NULL) return;
+    e->input.data = data;
+    e->input.cap = cap;
+  }
+  memmove(e->input.data + 1, e->input.data, e->input.len);
+  e->input.data[0] = c;
+  e->input.len++;
+}
+
+static key_event read_key_event(edit_state * e, int timeout_ms) {
   key_event ev;
   memset(&ev, 0, sizeof(ev));
   ev.key = -1;
   ev.start_ms = now_ms();
 
   if (timeout_ms >= 0) {
-    fd_set set;
-    struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-    FD_ZERO(&set);
-    FD_SET(STDIN_FILENO, &set);
-    if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) {
+    if (! input_wait(e, timeout_ms * 1000)) {
       ev.end_ms = now_ms();
       snprintf(ev.kind, sizeof(ev.kind), "timeout");
       return ev;
@@ -1055,18 +1088,14 @@ static key_event read_key_event(int timeout_ms) {
   }
 
   char c;
-  if (read(STDIN_FILENO, &c, 1) != 1) return ev;
+  if (! input_read(e, &c)) return ev;
   unsigned char uc = (unsigned char) c;
   ev.raw[ev.n_raw++] = uc;
   if (uc != KEY_ESC) {
     int need = (uc >= 0xf0) ? 4 : (uc >= 0xe0) ? 3 : (uc >= 0xc0) ? 2 : 1;
     while (ev.n_raw < need && ev.n_raw < (int) sizeof(ev.raw)) {
-      fd_set set;
-      struct timeval tv = {0, 20000};
-      FD_ZERO(&set);
-      FD_SET(STDIN_FILENO, &set);
-      if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) break;
-      if (read(STDIN_FILENO, &c, 1) != 1) break;
+      if (! input_wait(e, 20000)) break;
+      if (! input_read(e, &c)) break;
       ev.raw[ev.n_raw++] = (unsigned char) c;
     }
     if (ev.n_raw == 2 && ev.raw[0] == 0xc6 && ev.raw[1] == 0x92) ev.key = KEY_META('f');
@@ -1090,13 +1119,9 @@ static key_event read_key_event(int timeout_ms) {
 
   char seq[32];
   int n = 0;
-  fd_set set;
   while (n < (int) sizeof(seq)) {
-    struct timeval tv = {0, 20000};
-    FD_ZERO(&set);
-    FD_SET(STDIN_FILENO, &set);
-    if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) != 1) break;
-    if (read(STDIN_FILENO, &seq[n], 1) != 1) break;
+    if (! input_wait(e, 20000)) break;
+    if (! input_read(e, &seq[n])) break;
     if (ev.n_raw < (int) sizeof(ev.raw)) ev.raw[ev.n_raw++] = (unsigned char) seq[n];
     n++;
     if ((n == 1) && ((seq[0] != '[') && (seq[0] != 'O'))) break;
@@ -1121,7 +1146,9 @@ static key_event read_key_event(int timeout_ms) {
   char final = seq[n-1];
   if ((seq[0] == '[') || (seq[0] == 'O')) {
     snprintf(ev.kind, sizeof(ev.kind), "%s", seq[0] == '[' ? "csi" : "ss3");
-    if (final == 'A') ev.key = KEY_UP;
+    if (seq[0] == '[' && n == 5 && memcmp(seq, "[200~", 5) == 0) ev.key = KEY_PASTE_START;
+    else if (seq[0] == '[' && n == 5 && memcmp(seq, "[201~", 5) == 0) ev.key = KEY_PASTE_END;
+    else if (final == 'A') ev.key = KEY_UP;
     else if (final == 'B') ev.key = KEY_DOWN;
     else if (final == 'C') ev.key = KEY_RIGHT;
     else if (final == 'D') ev.key = KEY_LEFT;
@@ -2011,6 +2038,75 @@ static int cmd_insert(edit_state * e, int key) {
   return 0;
 }
 
+static int insert_text(edit_state * e, const char * text, size_t len) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  if (edit_insert(e, p->cursor, text, len, ++b->history_group, true) == 0)
+    p->cursor += len;
+  p->preferred_col = SIZE_MAX;
+  return 0;
+}
+
+static void paste_add(output * o, char c) {
+  char out = (c == '\r') ? '\n' : c;
+  out_add(o, &out, 1);
+}
+
+static output read_paste(edit_state * e) {
+  static const char end[] = "\x1b[201~";
+  output o = {0};
+  int match = 0;
+  char c;
+  while (input_wait(e, 20000) && input_read(e, &c)) {
+    if (c == end[match]) {
+      if (++match == (int) sizeof(end) - 1) return o;
+      continue;
+    }
+    for (int i = 0; i < match; i++) paste_add(&o, end[i]);
+    match = 0;
+    if (c == end[0]) match = 1;
+    else paste_add(&o, c);
+  }
+  for (int i = 0; i < match; i++) paste_add(&o, end[i]);
+  return o;
+}
+
+static int cmd_paste(edit_state * e) {
+  output o = read_paste(e);
+  int rc = insert_text(e, o.data, o.len);
+  free(o.data);
+  return rc;
+}
+
+static bool fallback_text_byte(char c) {
+  unsigned char uc = (unsigned char) c;
+  return uc >= 32 && uc != 127;
+}
+
+static bool fallback_context(edit_state * e, int key) {
+  return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
+    ! e->search_prompt && ! e->debug_recording && ! e->debug_note_prompt &&
+    active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
+}
+
+static int fast_insert(edit_state * e, int key) {
+  output o = {0};
+  char c = (char) key;
+  paste_add(&o, c);
+  while (o.len < PASTE_FALLBACK_MAX && input_wait(e, 0) && input_read(e, &c)) {
+    if (! fallback_text_byte(c)) {
+      input_unread(e, c);
+      break;
+    }
+    paste_add(&o, c);
+  }
+  int rc = insert_text(e, o.data, o.len);
+  free(o.data);
+  return rc;
+}
+
 static int cmd_tab(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   size_t n = (size_t) e->tab_width;
@@ -2578,11 +2674,11 @@ static int tui(const char * path) {
     buffers_free(&e);
     return 1;
   }
-  write(STDOUT_FILENO, "\x1b[?1049h", 8);
+  write(STDOUT_FILENO, "\x1b[?1049h\x1b[?2004h", 16);
 
   while (! e.quit) {
     render(&e);
-    key_event ev = read_key_event(e.search_len > 0 ? SEARCH_BLINK_MS : -1);
+    key_event ev = read_key_event(&e, e.search_len > 0 ? SEARCH_BLINK_MS : -1);
     const char * action = "ignored";
     int key = ev.key;
     if (e.debug_log != NULL) {
@@ -2613,6 +2709,12 @@ static int tui(const char * path) {
         debug_log_state(&e, "before");
         action = "debug-start";
       } else action = "debug-already-recording";
+    } else if (key == KEY_PASTE_START) {
+      cmd_paste(&e);
+      action = "paste";
+    } else if (fallback_context(&e, key) && input_wait(&e, 0)) {
+      fast_insert(&e, key);
+      action = "fast-insert";
     } else if (key != KEY_ESC && key != -1) {
       dispatch(&e, key);
       if (strcmp(action, "esc-meta") != 0) action = "dispatch";
@@ -2626,8 +2728,9 @@ static int tui(const char * path) {
   }
 
   raw_off(&e);
-  const char * clear = "\x1b[?25h\x1b[0m\x1b[?1049l";
+  const char * clear = "\x1b[?2004l\x1b[?25h\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
+  free(e.input.data);
   if (e.debug_log != NULL) {
     fprintf(e.debug_log, "end_debug aborted\n");
     fclose(e.debug_log);

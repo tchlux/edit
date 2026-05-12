@@ -430,6 +430,26 @@ python3 ./tui_view.py 5:50 'X^_^x^c' "$tmp" > "$out"
 grep -q modified "$out"
 grep -q again "$out"
 
+awk 'BEGIN { for (i = 1; i <= 400; i++) { printf "word%03d", i; if (i < 400) printf " " } }' > "$tmp.expected"
+printf '' > "$tmp"
+python3 ./tui_view.py 5:80 "<paste>$(cat "$tmp.expected")</paste>^x^s" "$tmp" > "$out"
+cmp -s "$tmp.expected" "$tmp"
+
+printf '' > "$tmp"
+python3 ./tui_view.py 5:40 '<paste>a
+b</paste>^x^s' "$tmp" > "$out"
+printf 'a\nb' | cmp -s - "$tmp"
+
+printf '' > "$tmp"
+python3 ./tui_view.py 5:80 "<paste>$(cat "$tmp.expected")</paste>^_^x^s" "$tmp" > "$out"
+printf '' | cmp -s - "$tmp"
+
+printf 'caf\303\251 \342\230\203' > "$tmp.expected"
+printf '' > "$tmp"
+python3 ./tui_view.py 5:40 "<paste>$(cat "$tmp.expected")</paste>^x^s" "$tmp" > "$out" ||
+  grep -q cursor-past-eol "$out"
+cmp -s "$tmp.expected" "$tmp"
+
 printf 'alpha\n' > "$dir/a"
 printf 'beta\n' > "$dir/b"
 printf 'gamma\n' > "$dir/gamma"

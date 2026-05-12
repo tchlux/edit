@@ -36,6 +36,9 @@ Literal tabs display at width 3 by default; set `EDIT_TAB_WIDTH` to another
 positive integer. Pressing `Tab` inserts spaces; press `C-q Tab` for a literal
 tab byte.
 
+Large terminal pastes use bracketed paste when available, so pasted text is
+buffered and inserted as one undoable edit instead of many per-key edits.
+
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
 Use the literal `Esc` prefix for reliable command input.
 
