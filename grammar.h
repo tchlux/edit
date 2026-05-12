@@ -43,6 +43,7 @@ typedef struct {
   int n_styles;
   int is_default;
   char triple_quote;
+  char markdown_fence;
 } grammar;
 
 typedef struct {
@@ -53,8 +54,8 @@ typedef struct {
 
 void grammar_load_default(grammar * g);
 int grammar_load(grammar * g, const char * path);
-int grammar_highlight(grammar * g, const char * line, size_t len,
-                      grammar_span * spans, int max_spans);
+int grammar_highlight(grammar * g, const char * path, const char * line,
+                      size_t len, grammar_span * spans, int max_spans);
 int grammar_match(grammar * g, const char * line, size_t len,
                   int * start, int * end, const char ** sgr);
 

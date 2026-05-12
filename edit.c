@@ -1261,6 +1261,30 @@ static char triple_quote_before(buffer * b, size_t end) {
   return quote;
 }
 
+static int markdown_fence_line(buffer * b, size_t start, size_t end, char * mark) {
+  size_t i = start;
+  while (i < end && i - start < 4 && buffer_at(b, i) == ' ') i++;
+  if (i + 2 >= end) return 0;
+  char c = buffer_at(b, i);
+  if ((c != '`' && c != '~') || buffer_at(b, i + 1) != c || buffer_at(b, i + 2) != c)
+    return 0;
+  *mark = c;
+  return 1;
+}
+
+static char markdown_fence_before(buffer * b, size_t end) {
+  char fence = '\0';
+  for (size_t start = 0; start < end;) {
+    size_t stop = start;
+    while (stop < end && buffer_at(b, stop) != '\n') stop++;
+    char mark = '\0';
+    if (markdown_fence_line(b, start, stop, &mark))
+      fence = (fence == mark) ? '\0' : fence ? fence : mark;
+    start = stop + 1;
+  }
+  return fence;
+}
+
 static void render_buffer_line(edit_state * e, output * o, buffer * b,
                                size_t * pos, size_t limit) {
   char line[LINE_RENDER_MAX];
@@ -1276,10 +1300,12 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
   line[n] = '\0';
 
   grammar_span spans[GRAMMAR_MAX_SPANS];
-  if (e->has_grammar && e->grammar.is_default)
+  if (e->has_grammar && e->grammar.is_default) {
     e->grammar.triple_quote = triple_quote_before(b, start);
+    e->grammar.markdown_fence = markdown_fence_before(b, start);
+  }
   int n_spans = e->has_grammar ?
-    grammar_highlight(&e->grammar, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
+    grammar_highlight(&e->grammar, b->path, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
   int span = 0;
   const char * color = NULL;
 

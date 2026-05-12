@@ -1,0 +1,13 @@
+Plain text should stay calm for words like for, class, and return.
+
+- draft the narrow behavior
+- test the visible colors
+
+> quoted text can still stand out
+
+Reference: https://example.com/edit
+
+TODO: add the smallest useful default.
+FIXME: remove this once the demo changes.
+NOTE: prose files are not source code.
+WARN: keep the palette readable.

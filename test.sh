@@ -124,6 +124,28 @@ if grep -F -q "$(printf 'obj.%s[38;2;255;215;95manswer%s[0m' "$esc" "$esc")" "$o
 if grep -F -q "$(printf '%s[38;2;255;215;95mint%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 if grep -F -q "$(printf '%s[38;2;255;215;95mlimit%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
+md="$dir/sample.md"
+printf '# Title\n- item\n> quote\nSee [guide](https://example.com) and `code`.\n```\nreturn 0;\n```\nTODO: write docs\n' > "$md"
+./edit --render-color 10:80 "$md" > "$out"
+grep -F -q "$(printf '%s[38;2;255;215;95m# Title%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;224;224;224m-%s[0m item' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;166;102m>%s[0m quote' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;80;190;255mhttps://example.com%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;170;255;170m`code`%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;170;255;170mreturn 0;%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;150;170mTODO%s[0m' "$esc" "$esc")" "$out"
+
+txt="$dir/sample.txt"
+printf 'for class return\n- item\n> quote\nTODO: see https://example.com\n' > "$txt"
+./edit --render-color 6:80 "$txt" > "$out"
+grep -F -q "$(printf '%s[38;2;224;224;224m-%s[0m item' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;166;102m>%s[0m quote' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;150;170mTODO%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;80;190;255mhttps://example.com%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;2;120;255;255mfor%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;120;255;255mreturn%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;210;255;90mclass%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+
 printf 'abc\n  def\n\tghi\n' > "$tmp"
 ./edit --render 5:12 "$tmp" > "$out"
 printf '|abc\n..def\n>..ghi\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"

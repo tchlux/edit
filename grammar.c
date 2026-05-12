@@ -118,6 +118,26 @@ static int _boundary(char c) {
   return ! (isalnum((unsigned char) c) || c == '_');
 }
 
+static int _suffix(const char * path, const char * suffix) {
+  if (path == NULL) return 0;
+  size_t n = strlen(path);
+  size_t m = strlen(suffix);
+  if (m > n) return 0;
+  for (size_t i = 0; i < m; i++)
+    if (tolower((unsigned char) path[n - m + i]) !=
+        tolower((unsigned char) suffix[i]))
+      return 0;
+  return 1;
+}
+
+static int _markdown_path(const char * path) {
+  return _suffix(path, ".md") || _suffix(path, ".markdown");
+}
+
+static int _text_path(const char * path) {
+  return _suffix(path, ".txt");
+}
+
 static void _paint(const char ** sgrs, size_t len, size_t start, size_t end,
                    const char * sgr) {
   if (start > len) start = len;
@@ -342,6 +362,146 @@ static void _fstring_exprs(grammar * g, const char * line, size_t len,
   }
 }
 
+static size_t _lead(const char * line, size_t len) {
+  size_t i = 0;
+  while (i < len && isspace((unsigned char) line[i])) i++;
+  return i;
+}
+
+static int _md_fence(const char * line, size_t len) {
+  size_t i = 0;
+  while (i < len && i < 4 && line[i] == ' ') i++;
+  return i + 2 < len && (line[i] == '`' || line[i] == '~') &&
+    line[i+1] == line[i] && line[i+2] == line[i];
+}
+
+static int _md_heading(const char * line, size_t len) {
+  size_t i = 0;
+  while (i < len && i < 4 && line[i] == ' ') i++;
+  size_t j = i;
+  while (j < len && j - i < 6 && line[j] == '#') j++;
+  return j > i && (j == len || isspace((unsigned char) line[j]));
+}
+
+static int _md_rule(const char * line, size_t len) {
+  size_t i = _lead(line, len);
+  if (i >= len || strchr("-*_", line[i]) == NULL) return 0;
+  char c = line[i];
+  int n = 0;
+  for (; i < len; i++) {
+    if (line[i] == c) n++;
+    else if (!isspace((unsigned char) line[i])) return 0;
+  }
+  return n >= 3;
+}
+
+static size_t _url_end(const char * line, size_t len, size_t i) {
+  while (i < len && !isspace((unsigned char) line[i]) &&
+         strchr(")]}\"'", line[i]) == NULL)
+    i++;
+  while (i > 0 && strchr(".,;:", line[i-1]) != NULL) i--;
+  return i;
+}
+
+static void _document_urls(grammar * g, const char * line, size_t len,
+                           const char ** sgrs) {
+  for (size_t i = 0; i + 7 < len; i++) {
+    if (memcmp(line + i, "http://", 7) == 0 ||
+        memcmp(line + i, "https://", 8) == 0) {
+      size_t j = _url_end(line, len, i);
+      _paint(sgrs, len, i, j, _sgr(g, "function"));
+      i = j;
+    }
+  }
+}
+
+static void _document_notes(grammar * g, const char * line, size_t len,
+                            const char ** sgrs) {
+  const char * words = "TODO FIXME NOTE WARN";
+  for (size_t i = 0; i < len;) {
+    if (!_word_start(line[i])) {
+      i++;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < len && _word_char(line[j])) j++;
+    if (_word_in(words, line + i, j - i))
+      _paint(sgrs, len, i, j, _sgr(g, "constant"));
+    i = j;
+  }
+}
+
+static void _markdown_inline(grammar * g, const char * line, size_t len,
+                             const char ** sgrs) {
+  for (size_t i = 0; i < len; i++) {
+    if (line[i] == '`') {
+      size_t j = i + 1;
+      while (j < len && line[j] != '`') j++;
+      if (j < len) {
+        _paint(sgrs, len, i, j + 1, _sgr(g, "string"));
+        i = j;
+      }
+    } else if (line[i] == '[') {
+      size_t j = i + 1;
+      while (j + 1 < len && !(line[j] == ']' && line[j+1] == '(')) j++;
+      if (j + 1 < len) {
+        size_t k = j + 2;
+        while (k < len && line[k] != ')') k++;
+        if (k < len) {
+          _paint(sgrs, len, i, i + 1, _sgr(g, "operator"));
+          _paint(sgrs, len, j, j + 2, _sgr(g, "operator"));
+          _paint(sgrs, len, j + 2, k, _sgr(g, "function"));
+          _paint(sgrs, len, k, k + 1, _sgr(g, "operator"));
+          i = k;
+        }
+      }
+    } else if (line[i] == '*' || line[i] == '_') {
+      char c = line[i];
+      size_t n = (i + 1 < len && line[i+1] == c) ? 2 : 1;
+      size_t j = i + n;
+      while (j + n <= len && memcmp(line + j, line + i, n) != 0) j++;
+      if (j > i + n && j + n <= len) {
+        _paint(sgrs, len, i, i + n, _sgr(g, "decorator"));
+        _paint(sgrs, len, j, j + n, _sgr(g, "decorator"));
+        i = j + n - 1;
+      }
+    }
+  }
+}
+
+static void _document_highlight(grammar * g, const char * path, const char * line,
+                                size_t len, const char ** sgrs) {
+  int markdown = _markdown_path(path);
+  size_t i = _lead(line, len);
+
+  if (markdown && (g->markdown_fence != '\0' || _md_fence(line, len))) {
+    _paint(sgrs, len, 0, len, _sgr(g, "string"));
+    return;
+  }
+  if (markdown && _md_heading(line, len)) {
+    _paint(sgrs, len, 0, len, _sgr(g, "preproc"));
+    return;
+  }
+  if (markdown && _md_rule(line, len)) {
+    _paint(sgrs, len, 0, len, _sgr(g, "operator"));
+    return;
+  }
+  if (i < len && line[i] == '>') _paint(sgrs, len, i, i + 1, _sgr(g, "comment"));
+  if (i + 1 < len && strchr("-+*", line[i]) != NULL &&
+      isspace((unsigned char) line[i+1]))
+    _paint(sgrs, len, i, i + 1, _sgr(g, "operator"));
+  if (i + 2 < len && isdigit((unsigned char) line[i])) {
+    size_t j = i;
+    while (j < len && isdigit((unsigned char) line[j])) j++;
+    if (j + 1 < len && line[j] == '.' && isspace((unsigned char) line[j+1]))
+      _paint(sgrs, len, i, j + 1, _sgr(g, "operator"));
+  }
+
+  _document_urls(g, line, len, sgrs);
+  _document_notes(g, line, len, sgrs);
+  if (markdown) _markdown_inline(g, line, len, sgrs);
+}
+
 static void _default_highlight(grammar * g, const char * line, size_t len,
                                const char ** sgrs) {
   const char * keywords =
@@ -466,8 +626,8 @@ static void _word(const char ** sgrs, const char * line, size_t len,
       _paint(sgrs, len, i, i + n, sgr);
 }
 
-int grammar_highlight(grammar * g, const char * line, size_t len,
-                      grammar_span * spans, int max_spans) {
+int grammar_highlight(grammar * g, const char * path, const char * line,
+                      size_t len, grammar_span * spans, int max_spans) {
   if (len == 0 || max_spans <= 0) return 0;
   char * text = malloc(len + 1);
   const char ** sgrs = calloc(len, sizeof(*sgrs));
@@ -479,7 +639,10 @@ int grammar_highlight(grammar * g, const char * line, size_t len,
   memcpy(text, line, len);
   text[len] = '\0';
 
-  if (g->is_default) _default_highlight(g, line, len, sgrs);
+  if (g->is_default && (_markdown_path(path) || _text_path(path)))
+    _document_highlight(g, path, line, len, sgrs);
+  else if (g->is_default)
+    _default_highlight(g, line, len, sgrs);
   for (int i = 0; !g->is_default && i < g->n_rules; i++) {
     const char * sgr = _sgr(g, g->rules[i].scope);
     if (g->rules[i].word) {
@@ -514,7 +677,7 @@ int grammar_highlight(grammar * g, const char * line, size_t len,
 int grammar_match(grammar * g, const char * line, size_t len,
                   int * start, int * end, const char ** sgr) {
   grammar_span span;
-  int n = grammar_highlight(g, line, len, &span, 1);
+  int n = grammar_highlight(g, NULL, line, len, &span, 1);
   if (n <= 0) return n;
   *start = (int) span.start;
   *end = (int) span.end;
