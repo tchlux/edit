@@ -35,6 +35,9 @@ Completed work:
 - Robust large paste handling: bracketed paste is buffered into one insert and
   one undo group, with newline normalization, UTF-8 preservation, and pty
   regression coverage.
+- Document highlighting: extension-aware Markdown and plain-text default colors
+  for headings, links, URLs, lists, quotes, code spans/fences, emphasis markers,
+  and TODO-style labels, with demo files and render-color coverage.
 
 Outstanding work for `edit`:
 

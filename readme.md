@@ -74,9 +74,9 @@ Highlighting:
 plain text. Code files color comments, strings, numbers, keywords, types,
 builtins, constants, preprocessor lines, decorators, variables, operators, shell
 command substitutions, and Python triple-quoted strings and f-string
-expressions. Document files color headings, links, URLs, lists, blockquotes,
-code spans/fences, emphasis markers, and TODO-style labels. See `color-tests/`
-for sample files.
+expressions. `.md`, `.markdown`, and `.txt` files use document colors for
+headings, links, URLs, lists, blockquotes, code spans/fences, emphasis markers,
+and TODO-style labels. See `color-tests/` for sample files.
 Set `EDIT_GRAMMAR=path` to fully override it with a line based grammar:
 
 ```
