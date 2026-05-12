@@ -479,7 +479,7 @@ static void _document_highlight(grammar * g, const char * path, const char * lin
     return;
   }
   if (markdown && _md_heading(line, len)) {
-    _paint(sgrs, len, 0, len, _sgr(g, "preproc"));
+    _paint(sgrs, len, 0, len, _sgr(g, "function"));
     return;
   }
   if (markdown && _md_rule(line, len)) {

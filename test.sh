@@ -127,7 +127,7 @@ if grep -F -q "$(printf '%s[38;2;255;215;95mlimit%s[0m' "$esc" "$esc")" "$out"; 
 md="$dir/sample.md"
 printf '# Title\n- item\n> quote\nSee [guide](https://example.com) and `code`.\n```\nreturn 0;\n```\nTODO: write docs\n' > "$md"
 ./edit --render-color 10:80 "$md" > "$out"
-grep -F -q "$(printf '%s[38;2;255;215;95m# Title%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;80;190;255m# Title%s[0m' "$esc" "$esc")" "$out"
 grep -F -q "$(printf '%s[38;2;224;224;224m-%s[0m item' "$esc" "$esc")" "$out"
 grep -F -q "$(printf '%s[38;2;255;166;102m>%s[0m quote' "$esc" "$esc")" "$out"
 grep -F -q "$(printf '%s[38;2;80;190;255mhttps://example.com%s[0m' "$esc" "$esc")" "$out"
@@ -168,6 +168,16 @@ printf '...|abc\n\n%s* 1:4\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 EDIT_TAB_WIDTH=2 ./edit --render-keys 4:20 "$(printf '\t')" "$tmp" > "$out"
 printf '..|abc\n\n%s* 1:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
+
+js="$dir/sample.js"
+css="$dir/sample.css"
+printf 'abc\n' > "$js"
+printf 'abc\n' > "$css"
+EDIT_TAB_WIDTH=5 ./edit --render-keys 4:20 "$(printf '\t')" "$js" > "$out"
+printf '..|abc\n\nsample.js* 1:3\n%s\n' "$(foot 20 "")" | cmp -s - "$out"
+
+EDIT_TAB_WIDTH=5 ./edit --render-keys 4:20 "$(printf '\t')" "$css" > "$out"
+printf '..|abc\n\nsample.css* 1:3\n%s\n' "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "$(printf '\t')_" "$tmp" > "$out"
 printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
@@ -241,6 +251,17 @@ printf 'one,.|two_three.9x\n\n%s 1:6\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "
 ./edit --render-keys 4:30 FffB "$tmp" > "$out"
 printf '|one,.two_three.9x\n\n%s 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
+printf 'camelCaseWord other\n' > "$tmp"
+./edit --render-keys 4:40 F "$tmp" > "$out"
+printf 'camel|CaseWord.other\n\n%s 1:6\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:40 FF "$tmp" > "$out"
+printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:40 FFFB "$tmp" > "$out"
+printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+printf 'one, two_three 9x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<opt-f>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:4\n' > "$tmp.expected"
@@ -414,7 +435,7 @@ printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 ./edit --render-keys 4:20 "f${del}" "$tmp" > "$out"
 printf '|bc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
-./edit --render-keys 40:80 h "$tmp" > "$out"
+./edit --render-keys 44:80 h "$tmp" > "$out"
 grep -q '\*help\*' "$out"
 grep -q 'C-x.C-f' "$out"
 grep -q 'C-s' "$out"
@@ -422,7 +443,7 @@ grep -q 'Esc.v' "$out"
 grep -q 'C-x.C-c' "$out"
 
 ./edit --render-keys 4:20 hX "$tmp" > "$out"
-printf '|edit.help\n\n*help* 1:1\n%s\n' "$(foot 20 "read only")" | cmp -s - "$out"
+printf '|edit.help\n\n*help* RO 1:1\n%s\n' "$(foot 20 "read only")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 fhxk "$tmp" > "$out"
 printf 'a|bc\n\n%s 1:2\n%s\n' "$base" "$(foot 20 "killed")" | cmp -s - "$out"
@@ -436,6 +457,63 @@ printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 ./edit --render-keys 4:20 Ac__ "$tmp" > "$out"
 printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
+printf 'abcdefghijklmnopqrstuvwxyz\n' > "$tmp"
+./edit --render-keys 4:12 fffffffffffff "$tmp" > "$out"
+printf 'defghijklm|n\n\n%s 1:14\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:12 fffffffffffffbbbbbbbbbbbbb "$tmp" > "$out"
+printf '|abcdefghijk\n\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
+
+printf '  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$tmp"
+./edit --render-keys 6:90 Q "$tmp" > "$out"
+printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nnext\n%s* 2:8\n%s\n' \
+  "$base" "$(foot 90 "fill paragraph")" | cmp -s - "$out"
+
+md="$dir/plan.md"
+printf '  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$md"
+./edit --render-keys 6:90 Q "$md" > "$out"
+printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nnext\nplan.md* 2:8\n%s\n' \
+  "$(foot 90 "fill paragraph")" | cmp -s - "$out"
+
+printf '# Title\n\n## Summary\n  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$md"
+./edit --render-keys 8:90 nnnQ "$md" > "$out"
+printf '#.Title\n\n##.Summary\n..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nplan.md* 5:8\n%s\n' \
+  "$(foot 90 "fill paragraph")" | cmp -s - "$out"
+
+./edit --render-keys 6:90 Q_ "$tmp" > "$out"
+printf '..alpha...beta.gamma\ndelta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu.nu.xi|\n\nnext\n%s* 2:56\n%s\n' \
+  "$base" "$(foot 90 "undo")" | cmp -s - "$out"
+
+python3 ./tui_view.py 6:80 '<c-c>^r<m-q>' "$tmp" > "$out"
+grep -q 'read.only' "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<c-c>^rX' "$tmp" > "$out"
+grep -q '1:1.RO' "$out"
+grep -q 'read.only' "$out"
+
+python3 ./tui_view.py 4:40 '<c-c>^r<c-c>^rX' "$tmp" > "$out"
+grep -q 'Xabc' "$out"
+
+python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
+grep -F -q "$(printf '\033[38;2;224;224;224;48;2;32;32;32m')" "$out"
+grep -F -q "$(printf '\033[2 q')" "$out"
+grep -F -q "$(printf '\033[?12l')" "$out"
+
+printf 'int x\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
+grep -F -q "$(printf '\033[38;2;224;224;224;48;2;32;32;32;38;2;150;190;255m')" "$out"
+
+printf 'alpha\n' > "$tmp"
+python3 ./tui_view.py 5:40 '<rewrite><right>' "$tmp" > "$out"
+grep -q 'external.reload' "$out"
+
+printf 'alpha\n' > "$tmp"
+python3 ./tui_view.py 5:40 'X<rewrite><right>' "$tmp" > "$out"
+grep -q 'Xalpha' "$out"
+if grep -q 'external.reload' "$out"; then exit 1; fi
+
+printf 'abc\n' > "$tmp"
 python3 ./tui_view.py 5:50 'X^x^s' "$tmp" > "$out"
 grep -q saved "$out"
 printf 'Xabc\n' | cmp -s - "$tmp"

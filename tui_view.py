@@ -65,6 +65,9 @@ def keys(s):
         elif s.startswith("<m-r>", i):
             out += b"\x1br"
             i += 5
+        elif s.startswith("<m-q>", i):
+            out += b"\x1bq"
+            i += 5
         elif s.startswith("<tab>", i):
             out += b"\t"
             i += 5
@@ -122,6 +125,12 @@ def keys(s):
         elif s.startswith("<c-x>", i):
             out += ctrl("x")
             i += 5
+        elif s.startswith("<c-c>", i):
+            out += ctrl("c")
+            i += 5
+        elif s.startswith("<rewrite>", i):
+            out += bytes([254])
+            i += 9
         elif s[i] == "^" and i + 1 < len(s):
             out += ctrl(s[i + 1].lower())
             i += 2
@@ -152,6 +161,10 @@ def read_tui(path, rows, cols, key_text):
     for c in keys(key_text):
         if c == 0:
             time.sleep(0.05)
+        elif c == 254:
+            with open(path, "wb") as f:
+                f.write(b"external reload\n")
+            time.sleep(0.1)
         else:
             os.write(fd, bytes([c]))
 
@@ -262,7 +275,12 @@ def main():
         print("usage: tui_view.py rows:cols keys file", file=sys.stderr)
         return 2
     rows, cols = [int(x) for x in sys.argv[1].split(":")]
-    out = read_tui(sys.argv[3], rows, cols, sys.argv[2])
+    raw = sys.argv[2].startswith("<raw>")
+    key_text = sys.argv[2][5:] if raw else sys.argv[2]
+    out = read_tui(sys.argv[3], rows, cols, key_text)
+    if raw:
+        sys.stdout.buffer.write(out)
+        return 0
     screen, cursor = decode(out, rows, cols)
     for y, line in enumerate(screen):
         marker = ">" if y == cursor[0] else " "

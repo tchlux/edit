@@ -19,13 +19,13 @@ Keys: `C-l` recenter, `C-s` search forward, `C-r` search backward,
 repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `Esc f`/`Esc b` word movement,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
-`Esc <`/`Esc >` file start/end,
+`Esc <`/`Esc >` file start/end, `Esc q` fill paragraph,
 `Tab` insert spaces, `C-q` quote the next key for literal insertion,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
 `C-x b` rotate buffers, `C-x k` kill the current virtual buffer,
 `C-x C-b` show session buffers,
-`C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
+`C-c C-r` toggle read-only, `C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
 plain `Esc`, then prompts for a note.
 
 `C-x C-f` stores recent files in `$HOME/.edit/recent`; set `EDIT_RECENT` to
@@ -33,8 +33,11 @@ override that path. Open files are tracked as virtual session buffers; killing
 the last file switches to an in-memory `*scratch*` buffer.
 
 Literal tabs display at width 3 by default; set `EDIT_TAB_WIDTH` to another
-positive integer. Pressing `Tab` inserts spaces; press `C-q Tab` for a literal
-tab byte.
+positive integer. Pressing `Tab` inserts spaces, using 2 spaces for JavaScript
+and CSS files; press `C-q Tab` for a literal tab byte.
+
+Clean file buffers auto-reload when the file changes on disk. `Esc q` fills the
+current paragraph to column 70.
 
 Large terminal pastes use bracketed paste when available, so pasted text is
 buffered and inserted as one undoable edit instead of many per-key edits.

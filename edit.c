@@ -63,6 +63,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
 #define DEFAULT_TAB_WIDTH 3
+#define FILL_COLUMN 70
+#define BASE_SGR "38;2;224;224;224;48;2;32;32;32"
 #define SEARCH_SGR "48;5;238"
 #define SEARCH_CURRENT_SGR "48;5;241"
 #define SEARCH_BLINK_MS 500
@@ -95,6 +97,7 @@ typedef struct {
   int undo_at;
   unsigned history_group;
   bool dirty;
+  bool read_only;
   int kind;
 } buffer;
 
@@ -103,6 +106,7 @@ typedef struct {
   // Cursor positions are byte offsets between bytes in the logical buffer.
   size_t cursor;
   size_t top;
+  size_t left_col;
   size_t preferred_col;
   int recenter;
 } pane;
@@ -215,6 +219,7 @@ static int buffer_blank_kind(buffer * b, const char * path, int kind) {
   b->disk_size = 0;
   b->disk_mtime = 0;
   b->dirty = false;
+  b->read_only = false;
   b->kind = kind;
   return 0;
 }
@@ -273,6 +278,7 @@ static int buffer_load(buffer * b, const char * path) {
   b->cursor = 0;
   b->top = 0;
   b->dirty = false;
+  b->read_only = false;
   b->kind = BUFFER_FILE;
   return 0;
 }
@@ -747,7 +753,7 @@ static int buffer_set_text(buffer * b, const char * name, int kind, const char *
 }
 
 static bool read_only_buffer(buffer * b) {
-  return b->kind == BUFFER_LIST || b->kind == BUFFER_HELP;
+  return b->read_only || b->kind == BUFFER_LIST || b->kind == BUFFER_HELP;
 }
 
 static void save_pane_state(edit_state * e) {
@@ -817,9 +823,17 @@ static bool buffer_changed(buffer * b) {
 
 static int reload_buffer(buffer * b) {
   char path[DEBUG_PATH_SIZE];
+  size_t cursor = b->cursor;
+  size_t top = b->top;
+  bool read_only = b->read_only;
   snprintf(path, sizeof(path), "%s", b->path);
   buffer_free(b);
-  return buffer_load(b, path);
+  if (buffer_load(b, path) != 0) return -1;
+  size_t len = buffer_len(b);
+  b->cursor = cursor < len ? cursor : len;
+  b->top = top < len ? top : len;
+  b->read_only = read_only;
+  return 0;
 }
 
 static int ensure_scratch(edit_state * e) {
@@ -838,6 +852,7 @@ static int switch_to_buffer(edit_state * e, int i) {
   active_pane(e)->buffer = i;
   active_pane(e)->cursor = e->buffers[i].cursor;
   active_pane(e)->top = e->buffers[i].top;
+  active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
   if (e->buffers[i].kind == BUFFER_FILE) recent_save(e->buffers[i].path);
   refresh_buffer_list(e);
@@ -857,11 +872,36 @@ static int switch_to_path(edit_state * e, const char * path) {
   active_pane(e)->buffer = i;
   active_pane(e)->cursor = 0;
   active_pane(e)->top = 0;
+  active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
   recent_save(path);
   refresh_buffer_list(e);
   set_status(e, "opened %s", file_name(path));
   return 0;
+}
+
+static void clamp_panes(edit_state * e, int bnum) {
+  size_t len = buffer_len(&e->buffers[bnum]);
+  for (int i = 0; i < e->n_panes; i++) {
+    if (e->panes[i].buffer != bnum) continue;
+    if (e->panes[i].cursor > len) e->panes[i].cursor = len;
+    if (e->panes[i].top > len) e->panes[i].top = len;
+    e->panes[i].preferred_col = SIZE_MAX;
+  }
+}
+
+static void auto_reload(edit_state * e) {
+  bool changed = false;
+  save_pane_state(e);
+  for (int i = 0; i < e->n_buffers; i++) {
+    if (! buffer_changed(&e->buffers[i])) continue;
+    if (reload_buffer(&e->buffers[i]) == 0) {
+      clamp_panes(e, i);
+      changed = true;
+      set_status(e, "reloaded %s", file_name(e->buffers[i].path));
+    } else set_status(e, "reload failed");
+  }
+  if (changed) refresh_buffer_list(e);
 }
 
 static void refresh_buffer_list(edit_state * e) {
@@ -1214,6 +1254,12 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
   }
   while (p->top > 0 && file_rows_from(b, p->top) < body_rows)
     p->top = prev_line(b, p->top);
+
+  int cols = pane_cols(e, (int) (p - e->panes));
+  size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
+  size_t col = visual_col(e, b, line_start(b, cursor), cursor);
+  if (col < p->left_col) p->left_col = col;
+  else if (col > p->left_col + limit) p->left_col = col - limit;
 }
 
 static void ensure_visible(edit_state * e) {
@@ -1285,8 +1331,18 @@ static char markdown_fence_before(buffer * b, size_t end) {
   return fence;
 }
 
+static void render_base_sgr(edit_state * e, output * o) {
+  if (e->raw) out_f(o, "\x1b[%sm", BASE_SGR);
+  else out_s(o, "\x1b[0m");
+}
+
+static void render_span_sgr(edit_state * e, output * o, const char * sgr) {
+  if (e->raw) out_f(o, "\x1b[%s;%sm", BASE_SGR, sgr);
+  else out_f(o, "\x1b[%sm", sgr);
+}
+
 static void render_buffer_line(edit_state * e, output * o, buffer * b,
-                               size_t * pos, size_t limit) {
+                               size_t * pos, size_t skip, size_t limit) {
   char line[LINE_RENDER_MAX];
   const char * search_sgrs[LINE_RENDER_MAX];
   size_t n = 0;
@@ -1312,35 +1368,45 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
   for (size_t i = 0; i < n; i++) search_sgrs[i] = NULL;
   paint_search(e, line, n, start, search_sgrs);
 
+  size_t col = 0;
   size_t shown = 0;
   for (size_t i = 0; i < n && shown < limit; i++) {
     while (span < n_spans && i >= spans[span].end)
       span++;
+    char c = line[i];
+    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    if (col + width <= skip) {
+      col += width;
+      continue;
+    }
     const char * sgr = search_sgrs[i] ? search_sgrs[i] :
       (span < n_spans && i >= spans[span].start) ? spans[span].sgr : NULL;
     if (sgr != color) {
-      if (color != NULL)
-        out_s(o, "\x1b[0m");
-      if (sgr != NULL)
-        out_f(o, "\x1b[%sm", sgr);
+      if (e->raw) {
+        if (sgr != NULL) render_span_sgr(e, o, sgr);
+        else render_base_sgr(e, o);
+      } else {
+        if (color != NULL) render_base_sgr(e, o);
+        if (sgr != NULL) render_span_sgr(e, o, sgr);
+      }
       color = sgr;
     }
 
-    char c = line[i];
-    size_t width = (c == '\t') ? tab_stop(e, shown) : 1;
     if ((unsigned char) c < 32) c = ' ';
-    for (size_t j = 0; j < width && shown < limit; j++, shown++) {
+    for (size_t j = (skip > col) ? skip - col : 0;
+         j < width && shown < limit; j++, shown++) {
       char out = (c == '\t') ? ' ' : c;
       out_add(o, &out, 1);
     }
+    col += width;
   }
-  if (color != NULL)
-    out_s(o, "\x1b[0m");
+  if (color != NULL) render_base_sgr(e, o);
 }
 
 static void render_line(edit_state * e, output * o, size_t * pos) {
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
-  render_buffer_line(e, o, active_buffer(e), pos, limit);
+  render_buffer_line(e, o, active_buffer(e), pos,
+                     active_pane(e)->left_col, limit);
 }
 
 static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
@@ -1359,6 +1425,8 @@ static size_t pane_cursor_col(edit_state * e, pane * p) {
   size_t cx = visual_col(e, b, line_start(b, p->cursor), p->cursor);
   int cols = pane_cols(e, (int) (p - e->panes));
   size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
+  if (cx < p->left_col) return 0;
+  cx -= p->left_col;
   return (cx > limit) ? limit : cx;
 }
 
@@ -1408,6 +1476,7 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   out_clip(o, file_name(b->path), &used, status_cols);
   modeline_pos(o, b, p, &used, status_cols);
   if (b->dirty) out_clip(o, " *", &used, status_cols);
+  if (read_only_buffer(b)) out_clip(o, " RO", &used, status_cols);
   if (active && e->n_panes > 1) out_clip(o, " >", &used, status_cols);
   while (used++ < status_cols) out_s(o, " ");
 }
@@ -1415,7 +1484,7 @@ static void render_modeline(edit_state * e, output * o, pane * p,
 static void render(edit_state * e) {
   get_window_size(e);
   output o = {0};
-  out_s(&o, "\x1b[?25l\x1b[H");
+  out_f(&o, "\x1b[?25l\x1b[H\x1b[%sm", BASE_SGR);
 
   if (e->layout == LAYOUT_COLS) {
     size_t pos[8];
@@ -1439,18 +1508,19 @@ static void render(edit_state * e) {
         out_f(&o, "\x1b[%d;%dH", row + 1, pane_col(e, i) + 1);
         int cols = pane_cols(e, i);
         if (pos[i] < buffer_len(b))
-          render_buffer_line(e, &o, b, &pos[i], (cols > 1) ? (size_t) cols - 1 : 1);
+          render_buffer_line(e, &o, b, &pos[i], e->panes[i].left_col,
+                             (cols > 1) ? (size_t) cols - 1 : 1);
       }
     }
     out_f(&o, "\x1b[%d;1H", e->rows - 1);
     for (int i = 0; i < e->n_panes; i++) {
       out_f(&o, "\x1b[%d;%dH\x1b[7m", e->rows - 1, pane_col(e, i) + 1);
       render_modeline(e, &o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
-      out_s(&o, "\x1b[0m");
+      out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
     }
     out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
     render_footer(e, &o, e->cols);
-    out_s(&o, "\x1b[0m");
+    out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
     out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
     debug_log_render(e, &o);
     write(STDOUT_FILENO, o.data, o.len);
@@ -1475,20 +1545,21 @@ static void render(edit_state * e) {
     for (int row = 0; row < body_rows && screen_row < e->rows; row++, screen_row++) {
       out_s(&o, "\x1b[K");
       if (pos < buffer_len(b))
-        render_buffer_line(e, &o, b, &pos, (e->cols > 1) ? (size_t) e->cols - 1 : 1);
+        render_buffer_line(e, &o, b, &pos, p->left_col,
+                           (e->cols > 1) ? (size_t) e->cols - 1 : 1);
       if (screen_row + 1 < e->rows) out_s(&o, "\r\n");
     }
     if (screen_row < e->rows) {
       out_s(&o, "\x1b[7m");
       render_modeline(e, &o, p, i == e->active_pane, e->cols);
-      out_s(&o, "\x1b[0m");
+      out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
       if (++screen_row < e->rows) out_s(&o, "\r\n");
     }
   }
   if (screen_row < e->rows) {
     out_s(&o, "\x1b[90m");
     render_footer(e, &o, e->cols);
-    out_s(&o, "\x1b[0m");
+    out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
   }
   out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
@@ -1498,15 +1569,22 @@ static void render(edit_state * e) {
 }
 
 static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
-                          int cursor_row, size_t cursor_col, int row) {
+                          size_t skip, int cursor_row, size_t cursor_col, int row) {
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
   size_t col = 0;
+  size_t shown = 0;
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') &&
-         col < limit) {
-    if ((row == cursor_row) && (col == cursor_col)) out_s(o, "|");
+         shown < limit) {
     char c = buffer_at(b, *pos);
     size_t width = (c == '\t') ? tab_stop(e, col) : 1;
-    for (size_t i = 0; i < width && col + i < limit; i++) {
+    if (col + width <= skip) {
+      (*pos)++;
+      col += width;
+      continue;
+    }
+    if ((row == cursor_row) && (shown == cursor_col)) out_s(o, "|");
+    for (size_t i = (skip > col) ? skip - col : 0;
+         i < width && shown < limit; i++, shown++) {
       char out = (c == '\t') ? (i == 0 ? '>' : '.') :
         (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
       out_add(o, &out, 1);
@@ -1514,23 +1592,30 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
     (*pos)++;
     col += width;
   }
-  if ((row == cursor_row) && (col == cursor_col)) out_s(o, "|");
+  if ((row == cursor_row) && (shown == cursor_col)) out_s(o, "|");
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
 
 static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
-                          int cursor_row, size_t cursor_col, int row, int cols) {
+                          size_t skip, int cursor_row, size_t cursor_col, int row, int cols) {
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t col = 0;
-  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && col < limit) {
-    if ((row == cursor_row) && (col == cursor_col)) {
-      out_s(o, "|");
-      col++;
-    }
+  size_t shown = 0;
+  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && shown < limit) {
     char c = buffer_at(b, *pos);
     size_t width = (c == '\t') ? tab_stop(e, col) : 1;
-    for (size_t j = 0; j < width && col + j < limit; j++) {
+    if (col + width <= skip) {
+      (*pos)++;
+      col += width;
+      continue;
+    }
+    if ((row == cursor_row) && (shown == cursor_col) && shown < limit) {
+      out_s(o, "|");
+      shown++;
+    }
+    for (size_t j = (skip > col) ? skip - col : 0;
+         j < width && shown < limit; j++, shown++) {
       char out = (c == '\t') ? (j == 0 ? '>' : '.') :
         (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
       out_add(o, &out, 1);
@@ -1538,11 +1623,11 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
     (*pos)++;
     col += width;
   }
-  if ((row == cursor_row) && (col == cursor_col) && col < limit) {
+  if ((row == cursor_row) && (shown == cursor_col) && shown < limit) {
     out_s(o, "|");
-    col++;
+    shown++;
   }
-  while (col++ < limit) out_s(o, " ");
+  while (shown++ < limit) out_s(o, " ");
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
   if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
@@ -1554,6 +1639,7 @@ static void snapshot_modeline(edit_state * e, output * o, pane * p,
   size_t used = 0;
   out_clip(o, file_name(b->path), &used, limit);
   if (b->dirty) out_clip(o, "*", &used, limit);
+  if (read_only_buffer(b)) out_clip(o, " RO", &used, limit);
   modeline_pos(o, b, p, &used, limit);
   if (active && e->n_panes > 1) out_clip(o, ">", &used, limit);
   if (cols > 1) while (used++ < limit) out_s(o, " ");
@@ -1581,7 +1667,7 @@ static void build_snapshot(edit_state * e, output * o) {
     for (int row = 0; row < body_rows; row++) {
       for (int i = 0; i < e->n_panes; i++)
         snapshot_cell(e, o, pane_buffer(e, &e->panes[i]), &pos[i],
-                      cy[i], cx[i], row, pane_cols(e, i));
+                      e->panes[i].left_col, cy[i], cx[i], row, pane_cols(e, i));
       out_s(o, "\n");
     }
     for (int i = 0; i < e->n_panes; i++)
@@ -1600,7 +1686,7 @@ static void build_snapshot(edit_state * e, output * o) {
     size_t pos = p->top;
 
     for (int row = 0; row < body_rows; row++) {
-      if (pos < buffer_len(b)) snapshot_line(e, o, b, &pos, cy, cx, row);
+      if (pos < buffer_len(b)) snapshot_line(e, o, b, &pos, p->left_col, cy, cx, row);
       else if (row == cy && cx == 0) out_s(o, "|");
       out_s(o, "\n");
     }
@@ -1837,6 +1923,7 @@ static int key_name(char c) {
   if (c == 'F') return KEY_META('f');
   if (c == 'N') return KEY_META('n');
   if (c == 'P') return KEY_META('p');
+  if (c == 'Q') return KEY_META('q');
   if (c == 'V') return KEY_META('v');
   if (c == '<') return KEY_META('<');
   if (c == '>') return KEY_META('>');
@@ -1950,6 +2037,7 @@ static int cmd_file_start(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->cursor = 0;
   p->top = 0;
+  p->left_col = 0;
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -1976,11 +2064,20 @@ static bool word_byte(buffer * b, size_t pos) {
   return start == 0 && end == 1;
 }
 
+static bool camel_boundary(buffer * b, size_t pos) {
+  if (pos == 0 || pos >= buffer_len(b)) return false;
+  unsigned char a = (unsigned char) buffer_at(b, pos - 1);
+  unsigned char c = (unsigned char) buffer_at(b, pos);
+  return word_byte(b, pos - 1) && word_byte(b, pos) && islower(a) && isupper(c);
+}
+
 static int cmd_word_forward(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   while (p->cursor < buffer_len(b) && ! word_byte(b, p->cursor)) p->cursor++;
-  while (p->cursor < buffer_len(b) && word_byte(b, p->cursor)) p->cursor++;
+  if (p->cursor < buffer_len(b)) p->cursor++;
+  while (p->cursor < buffer_len(b) && word_byte(b, p->cursor) &&
+         ! camel_boundary(b, p->cursor)) p->cursor++;
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -1989,8 +2086,12 @@ static int cmd_word_forward(edit_state * e, int key) {
 static int cmd_word_back(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
+  size_t original = p->cursor;
   while (p->cursor > 0 && ! word_byte(b, p->cursor - 1)) p->cursor--;
-  while (p->cursor > 0 && word_byte(b, p->cursor - 1)) p->cursor--;
+  while (p->cursor > 0 && word_byte(b, p->cursor - 1)) {
+    if (p->cursor != original && camel_boundary(b, p->cursor)) break;
+    p->cursor--;
+  }
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -2133,12 +2234,26 @@ static int fast_insert(edit_state * e, int key) {
   return rc;
 }
 
+static bool path_suffix(const char * path, const char * suffix) {
+  size_t n = strlen(path);
+  size_t m = strlen(suffix);
+  return n >= m && strcmp(path + n - m, suffix) == 0;
+}
+
+static size_t indent_width(edit_state * e, buffer * b) {
+  const char * path = b->path ? b->path : "";
+  if (path_suffix(path, ".js") || path_suffix(path, ".jsx") ||
+      path_suffix(path, ".mjs") || path_suffix(path, ".cjs") ||
+      path_suffix(path, ".css")) return 2;
+  return (size_t) e->tab_width;
+}
+
 static int cmd_tab(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
-  size_t n = (size_t) e->tab_width;
-  char * spaces = malloc(n);
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
+  size_t n = indent_width(e, b);
+  char * spaces = malloc(n);
   if (spaces == NULL) return 0;
   memset(spaces, ' ', n);
   if (edit_insert(e, p->cursor, spaces, n, ++b->history_group, true) == 0)
@@ -2196,6 +2311,119 @@ static int cmd_undo(edit_state * e, int key) {
   p->preferred_col = SIZE_MAX;
   b->undo_at = start;
   set_status(e, "undo");
+  (void) key;
+  return 0;
+}
+
+static bool blank_line(buffer * b, size_t start, size_t end) {
+  for (size_t i = start; i < end; i++)
+    if (buffer_at(b, i) != ' ' && buffer_at(b, i) != '\t') return false;
+  return true;
+}
+
+static bool markdown_heading(buffer * b, size_t start, size_t end) {
+  const char * path = b->path ? b->path : "";
+  if (! (path_suffix(path, ".md") || path_suffix(path, ".markdown")))
+    return false;
+  size_t i = start;
+  while (i < end && i - start < 4 && buffer_at(b, i) == ' ') i++;
+  if (i >= end || buffer_at(b, i) != '#') return false;
+  while (i < end && buffer_at(b, i) == '#') i++;
+  return i < end && (buffer_at(b, i) == ' ' || buffer_at(b, i) == '\t');
+}
+
+static bool paragraph_break(buffer * b, size_t start, size_t end) {
+  return blank_line(b, start, end) || markdown_heading(b, start, end);
+}
+
+static size_t paragraph_start(buffer * b, size_t pos) {
+  size_t start = line_start(b, pos);
+  while (start > 0) {
+    size_t prev = prev_line(b, start);
+    if (paragraph_break(b, prev, line_end(b, prev))) break;
+    start = prev;
+  }
+  return start;
+}
+
+static size_t paragraph_end(buffer * b, size_t pos) {
+  size_t len = buffer_len(b);
+  size_t start = line_start(b, pos);
+  while (start < len && ! paragraph_break(b, start, line_end(b, start))) {
+    size_t next = next_line(b, start);
+    if (next <= start) break;
+    start = next;
+  }
+  return start > 0 && buffer_at(b, start - 1) == '\n' ? start - 1 : start;
+}
+
+static int fill_indent(edit_state * e, output * o, buffer * b, size_t start) {
+  int cols = 0;
+  for (size_t i = start; i < buffer_len(b); i++) {
+    char c = buffer_at(b, i);
+    if (c != ' ' && c != '\t') break;
+    out_add(o, &c, 1);
+    cols += (int) ((c == '\t') ? tab_stop(e, (size_t) cols) : 1);
+  }
+  return cols;
+}
+
+static int cmd_fill_paragraph(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t start = paragraph_start(b, p->cursor);
+  size_t end = paragraph_end(b, p->cursor);
+  output out = {0};
+  int indent = fill_indent(e, &out, b, start);
+  int col = indent;
+  bool any = false;
+
+  for (size_t i = start; i < end;) {
+    while (i < end && isspace((unsigned char) buffer_at(b, i))) i++;
+    size_t word = i;
+    while (i < end && ! isspace((unsigned char) buffer_at(b, i))) i++;
+    size_t n = i - word;
+    if (n == 0) continue;
+    if (any && col + 1 + (int) n > FILL_COLUMN) {
+      out_s(&out, "\n");
+      col = fill_indent(e, &out, b, start);
+    } else if (any) {
+      out_s(&out, " ");
+      col++;
+    }
+    for (size_t j = 0; j < n; j++) {
+      char c = buffer_at(b, word + j);
+      out_add(&out, &c, 1);
+    }
+    col += (int) n;
+    any = true;
+  }
+
+  if (! any) {
+    free(out.data);
+    (void) key;
+    return set_status(e, "empty paragraph"), 0;
+  }
+
+  unsigned group = ++b->history_group;
+  if (edit_delete(e, start, end, group, true) == 0 &&
+      edit_insert(e, start, out.data, out.len, group, true) == 0) {
+    p->cursor = start + out.len;
+    p->preferred_col = SIZE_MAX;
+    set_status(e, "fill paragraph");
+  }
+  free(out.data);
+  (void) key;
+  return 0;
+}
+
+static int cmd_toggle_read_only(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  if (b->kind == BUFFER_LIST || b->kind == BUFFER_HELP)
+    return set_status(e, "read only"), 0;
+  b->read_only = ! b->read_only;
+  set_status(e, "read only %s", b->read_only ? "on" : "off");
   (void) key;
   return 0;
 }
@@ -2474,6 +2702,7 @@ static const char HELP_TEXT[] =
   "  C-v, Esc v                        page down and up\n"
   "  Esc n, Esc p                      move 10 lines down and up\n"
   "  Esc <, Esc >                      file start and end\n"
+  "  Esc q                             fill paragraph\n"
   "\n"
   "Editing\n"
   "  Text                              insert text\n"
@@ -2481,6 +2710,7 @@ static const char HELP_TEXT[] =
   "  C-d                               delete next character\n"
   "  C-q                               insert next key literally\n"
   "  C-_, C-x u                        undo\n"
+  "  C-c C-r                           toggle read only\n"
   "\n"
   "Search\n"
   "  C-s, C-r                          search forward and reverse\n"
@@ -2558,6 +2788,7 @@ static binding bindings[] = {
   {{KEY_META('f'), 0}, 1, cmd_word_forward},
   {{KEY_META('n'), 0}, 1, cmd_down_10},
   {{KEY_META('p'), 0}, 1, cmd_up_10},
+  {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_META('<'), 0}, 1, cmd_file_start},
   {{KEY_META('>'), 0}, 1, cmd_file_end},
@@ -2573,6 +2804,7 @@ static binding bindings[] = {
   {{KEY_CTRL('r'), 0}, 1, cmd_reverse_search},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
+  {{KEY_CTRL('c'), KEY_CTRL('r')}, 2, cmd_toggle_read_only},
   {{KEY_CTRL('x'), '0'}, 2, cmd_close_pane},
   {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
   {{KEY_CTRL('x'), '2'}, 2, cmd_split},
@@ -2654,9 +2886,9 @@ static int dispatch(edit_state * e, int key) {
     n_keys = 2;
     e->prefix = 0;
     if (keys[0] == KEY_CTRL('q')) return cmd_literal(e, key);
-  } else if (key == KEY_CTRL('x')) {
+  } else if (key == KEY_CTRL('x') || key == KEY_CTRL('c')) {
     e->prefix = key;
-    set_status(e, "C-x");
+    set_status(e, key == KEY_CTRL('x') ? "C-x" : "C-c");
     return 0;
   }
 
@@ -2700,9 +2932,12 @@ static int tui(const char * path) {
     buffers_free(&e);
     return 1;
   }
-  write(STDOUT_FILENO, "\x1b[?1049h\x1b[?2004h", 16);
+  const char * start = "\x1b[?1049h\x1b[?2004h\x1b[38;2;224;224;224m"
+    "\x1b[48;2;32;32;32m\x1b[2 q\x1b[?12l";
+  write(STDOUT_FILENO, start, strlen(start));
 
   while (! e.quit) {
+    auto_reload(&e);
     render(&e);
     key_event ev = read_key_event(&e, e.search_len > 0 ? SEARCH_BLINK_MS : -1);
     const char * action = "ignored";
@@ -2754,7 +2989,7 @@ static int tui(const char * path) {
   }
 
   raw_off(&e);
-  const char * clear = "\x1b[?2004l\x1b[?25h\x1b[0m\x1b[?1049l";
+  const char * clear = "\x1b[?2004l\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
   free(e.input.data);
   if (e.debug_log != NULL) {

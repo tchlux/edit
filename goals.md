@@ -38,6 +38,9 @@ Completed work:
 - Document highlighting: extension-aware Markdown and plain-text default colors
   for headings, links, URLs, lists, quotes, code spans/fences, emphasis markers,
   and TODO-style labels, with demo files and render-color coverage.
+- Customization polish: read-only toggle, dark interactive theme with solid
+  cursor, clean-buffer auto-reload, JavaScript/CSS two-space Tab insertion,
+  camelCase word movement, and `M-q` paragraph filling to column 70.
 
 Outstanding work for `edit`:
 
@@ -49,14 +52,8 @@ Outstanding work for `edit`:
 Preferred customization goals:
 
 - Line display: `C-c C-w` toggles visual line wrapping.
-- Theme: dark palette with foreground `#E0E0E0` and background `#202020`.
-- Cursor: solid and non-blinking.
-- JavaScript: indent width 2.
-- CSS: indent width 2.
-- Files: auto-reload buffers when the file changes on disk.
 - Sessions: save and restore open buffers, cursor state, and window state
   across restarts; remove stale session locks automatically.
-- `C-c C-r`: toggle read-only mode.
 - `C-c C-a`: toggle auto-fill mode.
 - `C-c C-s`: toggle spellcheck.
 - `C-c x`: prompt for a compile command; default to `python3 `; remember the
@@ -71,7 +68,6 @@ Preferred customization goals:
 - Mouse wheel up/down: move the cursor line-by-line.
 - Mouse wheel left/right: move the cursor by characters.
 - Scrolling: gradually recenter once the cursor crosses half the window.
-- Word movement: treat camelCase subwords as separate movement units.
 - `C-c c`: prompt for buffer-local `comment-start` and `comment-end`.
 - `C-c i`: insert an empty language-aware print statement.
 - `C-c e`: insert a language-aware debug/error print with file and line
