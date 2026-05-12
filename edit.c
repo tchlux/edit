@@ -68,6 +68,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define SEARCH_SGR "48;5;238"
 #define SEARCH_CURRENT_SGR "48;5;241"
 #define SEARCH_BLINK_MS 500
+#define META_REPEAT_MS 1000
 #define HELP_HINT "C-h help"
 
 enum { HIST_INSERT, HIST_DELETE };
@@ -160,6 +161,8 @@ struct edit_state {
   bool quit;
   bool quit_confirm;
   bool raw;
+  int meta_repeat_key;
+  long long meta_repeat_ms;
   output input;
   bool debug_recording;
   bool debug_note_prompt;
@@ -1266,6 +1269,23 @@ static void ensure_visible(edit_state * e) {
   ensure_pane_visible(e, active_pane(e), pane_body_rows(e, e->active_pane));
 }
 
+static int pane_cursor_row(edit_state * e, pane * p, int body_rows);
+
+static void scroll_line_move(edit_state * e, int direction) {
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  int body_rows = pane_body_rows(e, e->active_pane);
+  ensure_pane_visible(e, p, body_rows);
+  int row = pane_cursor_row(e, p, body_rows);
+  int mid = body_rows / 2;
+
+  if (direction < 0 && row < mid && p->top > 0) p->top = prev_line(b, p->top);
+  else if (direction > 0 && row > mid) {
+    size_t top = next_line(b, p->top);
+    if (top != p->top && file_rows_from(b, top) >= body_rows) p->top = top;
+  }
+}
+
 static void debug_log_render(edit_state * e, output * o);
 
 static void paint_search(edit_state * e, const char * line, size_t len,
@@ -1830,6 +1850,26 @@ static const char * debug_note_key(edit_state * e, key_event * ev) {
   return "debug-note";
 }
 
+static bool repeatable_meta(int key) {
+  return key == KEY_META('b') || key == KEY_META('f') || key == KEY_META('n') ||
+    key == KEY_META('p') || key == KEY_META('v') || key == KEY_META('<') ||
+    key == KEY_META('>');
+}
+
+static int meta_repeat_key(edit_state * e, key_event * ev, int key) {
+  if (key >= 32 && key < 127 && e->meta_repeat_key == KEY_META(key) &&
+      ev->start_ms - e->meta_repeat_ms <= META_REPEAT_MS)
+    return e->meta_repeat_key;
+  return key;
+}
+
+static void remember_meta_repeat(edit_state * e, int key, long long ms) {
+  if (repeatable_meta(key)) {
+    e->meta_repeat_key = key;
+    e->meta_repeat_ms = ms;
+  } else if (key != -1) e->meta_repeat_key = 0;
+}
+
 static void render_color_snapshot(edit_state * e) {
   ensure_visible(e);
   output o = {0};
@@ -1996,6 +2036,7 @@ static int cmd_up(edit_state * e, int key) {
   if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t prev = prev_line(b, p->cursor);
   p->cursor = visual_column_pos(e, b, prev, p->preferred_col);
+  scroll_line_move(e, -1);
   (void) key;
   return 0;
 }
@@ -2007,6 +2048,7 @@ static int cmd_down(edit_state * e, int key) {
   if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t next = next_line(b, p->cursor);
   p->cursor = visual_column_pos(e, b, next, p->preferred_col);
+  scroll_line_move(e, 1);
   (void) key;
   return 0;
 }
@@ -2955,6 +2997,13 @@ static int tui(const char * path) {
         action = "esc-meta";
       }
     }
+    if (! e.debug_note_prompt && ! e.find_prompt && ! e.search_prompt && e.prefix == 0) {
+      int repeat = meta_repeat_key(&e, &ev, key);
+      if (repeat != key) {
+        key = repeat;
+        action = "meta-repeat";
+      }
+    }
 
     if (e.debug_note_prompt) action = debug_note_key(&e, &ev);
     else if (e.debug_recording && key == KEY_ESC) {
@@ -2978,8 +3027,12 @@ static int tui(const char * path) {
       action = "fast-insert";
     } else if (key != KEY_ESC && key != -1) {
       dispatch(&e, key);
-      if (strcmp(action, "esc-meta") != 0) action = "dispatch";
+      if (strcmp(action, "esc-meta") != 0 && strcmp(action, "meta-repeat") != 0)
+        action = "dispatch";
     }
+    if (e.debug_note_prompt || e.find_prompt || e.search_prompt || e.prefix)
+      e.meta_repeat_key = 0;
+    else remember_meta_repeat(&e, key, ev.end_ms);
 
     if (e.debug_log != NULL) {
       fprintf(e.debug_log, "action=%s\n", action);

@@ -194,7 +194,7 @@ printf 'abcdef\nabc|\n\n%s 2:4\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > "$tmp"
 ./edit --render-keys 5:12 v "$tmp" > "$out"
-printf 'l2\nl3\n|l4\n%s 4:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
+printf 'l3\n|l4\nl5\n%s 4:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-keys 5:12 vV "$tmp" > "$out"
 printf '|l1\nl2\nl3\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
@@ -210,7 +210,7 @@ printf 'l4\nl5\n|l6\n%s 6:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
 ./edit --render-keys 6:20 ffN "$tmp" > "$out"
-printf 'l08xx\nl09xx\nl10xx\nl1|1xx\n%s 11:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
+printf 'l09xx\nl10xx\nl1|1xx\nl12xx\n%s 11:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 ffNP "$tmp" > "$out"
 printf 'l0|1xx\nl02xx\nl03xx\nl04xx\n%s 1:3\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
@@ -277,6 +277,11 @@ tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:4\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
+python3 ./tui_view.py 4:40 '<m-f>ff' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:18\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
 python3 ./tui_view.py 4:40 '<mac-f><mac-f><mac-b>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:6\n' > "$tmp.expected"
@@ -317,7 +322,7 @@ grep -q '^note=mac option' "$tmp.debug3"
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
 python3 ./tui_view.py 6:20 '<right><right><opt-n>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
-printf 'cursor:4:3\n' > "$tmp.expected"
+printf 'cursor:3:3\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 6:20 '<right><right><mac-n><mac-p>' "$tmp" > "$out"
@@ -329,6 +334,12 @@ python3 ./tui_view.py 6:20 '<right><right><opt-n><opt-p>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:3\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
+
+./edit --render-keys 6:20 nnn "$tmp" > "$out"
+printf 'l02xx\nl03xx\n|l04xx\nl05xx\n%s 4:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
+
+./edit --render-keys 6:20 nnnnnp "$tmp" > "$out"
+printf 'l03xx\nl04xx\n|l05xx\nl06xx\n%s 5:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'one\ntwo\nthree\nfour\n' > "$tmp"
 ./edit --render-keys 6:20 x2 "$tmp" > "$out"
