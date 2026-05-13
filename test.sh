@@ -180,13 +180,13 @@ EDIT_TAB_WIDTH=5 ./edit --render-keys 4:20 "$(printf '\t')" "$css" > "$out"
 printf '..|abc\n\nsample.css* 1:3\n%s\n' "$(foot 20 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "$(printf '\t')_" "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "q$(printf '\t')" "$tmp" > "$out"
 printf '>..|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "C-q")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "q$(printf '\t')_" "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 printf 'abcdef\nabc\n' > "$tmp"
 ./edit --render-keys 5:12 fffn "$tmp" > "$out"
@@ -352,7 +352,7 @@ printf 'one\n|two\n%s 2:1\no|ne\n%s 1:2>\n%s\n' "$base" "$base" "$(foot 20 "othe
 printf 'X|one\ntwo\n%s* 1:2\nX|one\n%s* 1:2>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2X_xo "$tmp" > "$out"
-printf '|one\ntwo\n%s* 1:1\n|one\n%s* 1:1>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
+printf '|one\ntwo\n%s 1:1\n|one\n%s 1:1>\n%s\n' "$base" "$base" "$(foot 20 "other pane")" | cmp -s - "$out"
 
 ./edit --render-keys 6:20 x2x0 "$tmp" > "$out"
 printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "close pane")" | cmp -s - "$out"
@@ -435,22 +435,86 @@ printf 'X|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X_ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 X/ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 'X<c-slash>^x^s' "$tmp" > "$out"
+printf 'abc\n' | cmp -s - "$tmp"
 
 ./edit --render-keys 4:20 Xxu "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 "f${del}" "$tmp" > "$out"
 printf '|bc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
+printf 'abcdef\nzz\n' > "$tmp"
+python3 ./tui_view.py 5:30 '<right><right><right>^k^x^s' "$tmp" > "$out"
+printf 'abc\nzz\n' | cmp -s - "$tmp"
+
+printf 'abcdef\nzz\n' > "$tmp"
+python3 ./tui_view.py 5:30 '^e^k^x^s' "$tmp" > "$out"
+printf 'abcdefzz\n' | cmp -s - "$tmp"
+
+printf 'abcdef\nzz\n' > "$tmp"
+python3 ./tui_view.py 5:30 '<right><right><right>^k^y^x^s' "$tmp" > "$out"
+printf 'abcdef\nzz\n' | cmp -s - "$tmp"
+
+printf 'abcdef\nzz\n' > "$tmp"
+python3 ./tui_view.py 5:30 '<right><right><right>^k^y^_^x^s' "$tmp" > "$out"
+printf 'abc\nzz\n' | cmp -s - "$tmp"
+
+printf 'abc\ndef\nzzz\n' > "$tmp"
+python3 ./tui_view.py 5:40 '<right><right><right>^k^k^y^x^s' "$tmp" > "$out"
+printf 'abc\ndef\nzzz\n' | cmp -s - "$tmp"
+
+printf 'abc\ndef\n' > "$tmp"
+python3 ./tui_view.py 5:40 '^k^n^k^y<m-y>^x^s' "$tmp" > "$out"
+printf '\nabc\n' | cmp -s - "$tmp"
+
+printf 'one\ntwo\nthree\n' > "$tmp"
+python3 ./tui_view.py 6:40 '^k^n^k^n^k^y<m-y><m-y>^x^s' "$tmp" > "$out"
+printf '\n\none\n' | cmp -s - "$tmp"
+
+printf 'abc\ndef\n' > "$tmp"
+python3 ./tui_view.py 5:40 '<right><right><right>^k^y<right><m-y>' "$tmp" > "$out"
+grep -q 'no.yank' "$out"
+
+printf 'aaa\nbb\n' > "$tmp"
+python3 ./tui_view.py 5:40 '^k^n<c-space><right><right>^w^y<m-y>^x^s' "$tmp" > "$out"
+printf '\naaa\n' | cmp -s - "$tmp"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<c-space><right><right>^w^x^s' "$tmp" > "$out"
+printf 'c\n' | cmp -s - "$tmp"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<c-space><right><right>^w^y^x^s' "$tmp" > "$out"
+printf 'abc\n' | cmp -s - "$tmp"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<c-space><right><right>^w^_^x^s' "$tmp" > "$out"
+printf 'abc\n' | cmp -s - "$tmp"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<raw><c-space><right>' "$tmp" > "$out"
+grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7m')" "$out"
+grep -F -q "$(printf 'a\033[0;38;2;224;224;224;48;2;32;32;32mbc')" "$out"
+
+printf 'multiline_str: str = """"\n' > "$tmp"
+python3 ./tui_view.py 4:100 '<raw><c-space><right>' "$tmp" > "$out"
+grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7mm\033[0;38;2;224;224;224;48;2;32;32;32;38;2;255;215;95multiline_str')" "$out"
+
+printf 'abc\n' > "$tmp"
 ./edit --render-keys 44:80 h "$tmp" > "$out"
 grep -q '\*help\*' "$out"
 grep -q 'C-x.C-f' "$out"
 grep -q 'C-s' "$out"
 grep -q 'Esc.v' "$out"
+grep -q 'Esc.y' "$out"
+grep -q 'C-/' "$out"
 grep -q 'C-x.C-c' "$out"
 
 ./edit --render-keys 4:20 hX "$tmp" > "$out"
@@ -460,13 +524,13 @@ printf '|edit.help\n\n*help* RO 1:1\n%s\n' "$(foot 20 "read only")" | cmp -s - "
 printf 'a|bc\n\n%s 1:2\n%s\n' "$base" "$(foot 20 "killed")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 d_ "$tmp" > "$out"
-printf 'a|bc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf 'a|bc\n\n%s 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 A_c__ "$tmp" > "$out"
-printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "no undo")" | cmp -s - "$out"
 
 ./edit --render-keys 4:20 Ac__ "$tmp" > "$out"
-printf '|abc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
+printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 printf 'abcdefghijklmnopqrstuvwxyz\n' > "$tmp"
 ./edit --render-keys 4:12 fffffffffffff "$tmp" > "$out"
@@ -492,7 +556,7 @@ printf '#.Title\n\n##.Summary\n..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.i
   "$(foot 90 "fill paragraph")" | cmp -s - "$out"
 
 ./edit --render-keys 6:90 Q_ "$tmp" > "$out"
-printf '..alpha...beta.gamma\ndelta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu.nu.xi|\n\nnext\n%s* 2:56\n%s\n' \
+printf '..alpha...beta.gamma\ndelta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu.nu.xi|\n\nnext\n%s 2:56\n%s\n' \
   "$base" "$(foot 90 "undo")" | cmp -s - "$out"
 
 python3 ./tui_view.py 6:80 '<c-c>^r<m-q>' "$tmp" > "$out"
@@ -513,7 +577,7 @@ grep -F -q "$(printf '\033[?12l')" "$out"
 
 printf 'int x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
-grep -F -q "$(printf '\033[38;2;224;224;224;48;2;32;32;32;38;2;150;190;255m')" "$out"
+grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;38;2;150;190;255m')" "$out"
 
 printf 'alpha\n' > "$tmp"
 python3 ./tui_view.py 5:40 '<rewrite><right>' "$tmp" > "$out"
@@ -538,8 +602,7 @@ grep -q again "$out"
 printf 'abc\n' | cmp -s - "$tmp"
 
 python3 ./tui_view.py 5:50 'X^_^x^c' "$tmp" > "$out"
-grep -q modified "$out"
-grep -q again "$out"
+if grep -q modified "$out"; then exit 1; fi
 
 awk 'BEGIN { for (i = 1; i <= 400; i++) { printf "word%03d", i; if (i < 400) printf " " } }' > "$tmp.expected"
 printf '' > "$tmp"

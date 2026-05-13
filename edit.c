@@ -62,11 +62,13 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define PASTE_FALLBACK_MAX 65536
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
+#define KILL_RING_MAX 16
 #define DEFAULT_TAB_WIDTH 3
 #define FILL_COLUMN 70
 #define BASE_SGR "38;2;224;224;224;48;2;32;32;32"
 #define SEARCH_SGR "48;5;238"
 #define SEARCH_CURRENT_SGR "48;5;241"
+#define REGION_SGR "7"
 #define SEARCH_BLINK_MS 500
 #define META_REPEAT_MS 1000
 #define HELP_HINT "C-h help"
@@ -74,6 +76,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
 enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP };
+enum { ACTION_OTHER, ACTION_KILL, ACTION_YANK };
 
 typedef struct {
   int kind;
@@ -96,6 +99,7 @@ typedef struct {
   history history[HISTORY_MAX];
   int n_history;
   int undo_at;
+  int clean_at;
   unsigned history_group;
   bool dirty;
   bool read_only;
@@ -109,7 +113,9 @@ typedef struct {
   size_t top;
   size_t left_col;
   size_t preferred_col;
+  size_t mark;
   int recenter;
+  bool mark_active;
 } pane;
 
 typedef struct {
@@ -164,6 +170,13 @@ struct edit_state {
   int meta_repeat_key;
   long long meta_repeat_ms;
   output input;
+  output kill_ring[KILL_RING_MAX];
+  int n_kills;
+  int kill_head;
+  int last_action;
+  int yank_index;
+  size_t yank_start;
+  size_t yank_len;
   bool debug_recording;
   bool debug_note_prompt;
   FILE * debug_log;
@@ -188,6 +201,7 @@ static int env_tab_width(void) {
 static void init_state(edit_state * e) {
   memset(e, 0, sizeof(*e));
   e->tab_width = env_tab_width();
+  e->yank_index = -1;
 }
 
 static char * _dup(const char * s) {
@@ -221,6 +235,7 @@ static int buffer_blank_kind(buffer * b, const char * path, int kind) {
   b->top = 0;
   b->disk_size = 0;
   b->disk_mtime = 0;
+  b->clean_at = 0;
   b->dirty = false;
   b->read_only = false;
   b->kind = kind;
@@ -280,6 +295,7 @@ static int buffer_load(buffer * b, const char * path) {
   }
   b->cursor = 0;
   b->top = 0;
+  b->clean_at = 0;
   b->dirty = false;
   b->read_only = false;
   b->kind = BUFFER_FILE;
@@ -290,6 +306,7 @@ static void history_free_buffer(buffer * b) {
   for (int i = 0; i < b->n_history; i++) free(b->history[i].text);
   b->n_history = 0;
   b->undo_at = 0;
+  b->clean_at = 0;
 }
 
 static void buffer_free(buffer * b) {
@@ -347,6 +364,7 @@ static int buffer_save(buffer * b) {
     b->disk_size = st.st_size;
     b->disk_mtime = st.st_mtime;
   }
+  b->clean_at = b->undo_at;
   b->dirty = false;
   return 0;
 }
@@ -625,7 +643,8 @@ static void key_text(int key, char * out, size_t n) {
   else if (key >= KEY_META(0) && key < KEY_META(128)) {
     int c = key - KEY_META(0);
     snprintf(out, n, (c >= 32 && c < 127) ? "M-%c" : "M-%d", c);
-  } else if (key > 0 && key < 32) snprintf(out, n, "C-%c", key + 96);
+  } else if (key == KEY_CTRL('_')) snprintf(out, n, "C-/");
+  else if (key > 0 && key < 32) snprintf(out, n, "C-%c", key + 96);
   else if (key >= 32 && key < 127) snprintf(out, n, "%c", key);
   else snprintf(out, n, "%d", key);
 }
@@ -647,9 +666,62 @@ static buffer * pane_buffer(edit_state * e, pane * p) {
   return &e->buffers[p->buffer];
 }
 
+static void clear_mark(edit_state * e) {
+  active_pane(e)->mark_active = false;
+}
+
+static bool region_range(pane * p, size_t * start, size_t * end) {
+  if (! p->mark_active || p->mark == p->cursor) return false;
+  *start = p->mark < p->cursor ? p->mark : p->cursor;
+  *end = p->mark < p->cursor ? p->cursor : p->mark;
+  return true;
+}
+
+static void action_other(edit_state * e) {
+  e->last_action = ACTION_OTHER;
+  e->yank_index = -1;
+  e->yank_start = 0;
+  e->yank_len = 0;
+}
+
+static void kill_ring_free(edit_state * e) {
+  for (int i = 0; i < KILL_RING_MAX; i++) free(e->kill_ring[i].data);
+}
+
+static int kill_ring_prev(int i) {
+  return (i + KILL_RING_MAX - 1) % KILL_RING_MAX;
+}
+
+static output * kill_entry(edit_state * e, bool append) {
+  if (append && e->n_kills > 0) return &e->kill_ring[e->kill_head];
+  e->kill_head = e->n_kills ? (e->kill_head + 1) % KILL_RING_MAX : 0;
+  if (e->n_kills < KILL_RING_MAX) e->n_kills++;
+  e->kill_ring[e->kill_head].len = 0;
+  return &e->kill_ring[e->kill_head];
+}
+
+static bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
+  if (end <= start) return false;
+  output * k = kill_entry(e, e->last_action == ACTION_KILL);
+  for (size_t i = start; i < end; i++) out_add(k, &(char){buffer_at(b, i)}, 1);
+  e->last_action = ACTION_KILL;
+  return true;
+}
+
 static void history_free_one(history * h) {
   free(h->text);
   memset(h, 0, sizeof(*h));
+}
+
+static void buffer_refresh_dirty(buffer * b) {
+  b->dirty = b->undo_at != b->clean_at;
+}
+
+static void history_truncate(buffer * b) {
+  if (b->undo_at >= b->n_history) return;
+  for (int i = b->undo_at; i < b->n_history; i++) history_free_one(&b->history[i]);
+  if (b->clean_at > b->undo_at) b->clean_at = -1;
+  b->n_history = b->undo_at;
 }
 
 static void history_drop_oldest_group(buffer * b) {
@@ -661,6 +733,8 @@ static void history_drop_oldest_group(buffer * b) {
   memmove(b->history, b->history + n, (size_t) (b->n_history - n) * sizeof(history));
   b->n_history -= n;
   b->undo_at = (b->undo_at > n) ? b->undo_at - n : 0;
+  b->clean_at = (b->clean_at >= n) ? b->clean_at - n : -1;
+  buffer_refresh_dirty(b);
 }
 
 static int history_add(buffer * b, int kind, size_t pos,
@@ -683,15 +757,18 @@ static int edit_insert(edit_state * e, size_t pos, const char * text,
   if (len == 0) return 0;
   int bnum = active_pane(e)->buffer;
   buffer * b = active_buffer(e);
+  if (reset_undo) history_truncate(b);
   if (buffer_insert(b, pos, text, len) != 0) return -1;
   for (int i = 0; i < e->n_panes; i++) {
-    if (i == e->active_pane) continue;
     if (e->panes[i].buffer != bnum) continue;
+    if (e->panes[i].mark_active && e->panes[i].mark >= pos) e->panes[i].mark += len;
+    if (i == e->active_pane) continue;
     if (e->panes[i].cursor >= pos) e->panes[i].cursor += len;
     if (e->panes[i].top > pos) e->panes[i].top += len;
   }
   if (history_add(b, HIST_INSERT, pos, text, len, group) != 0) return -1;
   if (reset_undo) b->undo_at = b->n_history;
+  if (reset_undo) buffer_refresh_dirty(b);
   return 0;
 }
 
@@ -704,6 +781,7 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (end <= start) return 0;
 
   int bnum = active_pane(e)->buffer;
+  if (reset_undo) history_truncate(b);
   size_t n = end - start;
   char * text = malloc(n);
   if (text == NULL) return -1;
@@ -711,8 +789,10 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   buffer_delete(b, start, end);
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
-    if (i == e->active_pane) continue;
     if (p->buffer != bnum) continue;
+    if (p->mark_active && p->mark > start)
+      p->mark = (p->mark >= end) ? p->mark - n : start;
+    if (i == e->active_pane) continue;
     if (p->cursor > start) p->cursor = (p->cursor >= end) ? p->cursor - n : start;
     if (p->top > start) p->top = (p->top >= end) ? p->top - n : start;
   }
@@ -720,6 +800,7 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   free(text);
   if (rc != 0) return -1;
   if (reset_undo) b->undo_at = b->n_history;
+  if (reset_undo) buffer_refresh_dirty(b);
   return 0;
 }
 
@@ -857,6 +938,7 @@ static int switch_to_buffer(edit_state * e, int i) {
   active_pane(e)->top = e->buffers[i].top;
   active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
+  active_pane(e)->mark_active = false;
   if (e->buffers[i].kind == BUFFER_FILE) recent_save(e->buffers[i].path);
   refresh_buffer_list(e);
   set_status(e, "opened %s", file_name(e->buffers[i].path));
@@ -877,6 +959,7 @@ static int switch_to_path(edit_state * e, const char * path) {
   active_pane(e)->top = 0;
   active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
+  active_pane(e)->mark_active = false;
   recent_save(path);
   refresh_buffer_list(e);
   set_status(e, "opened %s", file_name(path));
@@ -889,6 +972,7 @@ static void clamp_panes(edit_state * e, int bnum) {
     if (e->panes[i].buffer != bnum) continue;
     if (e->panes[i].cursor > len) e->panes[i].cursor = len;
     if (e->panes[i].top > len) e->panes[i].top = len;
+    if (e->panes[i].mark > len) e->panes[i].mark = len;
     e->panes[i].preferred_col = SIZE_MAX;
   }
 }
@@ -1314,6 +1398,12 @@ static void paint_search(edit_state * e, const char * line, size_t len,
   }
 }
 
+static bool region_byte(pane * p, size_t pos) {
+  size_t start;
+  size_t end;
+  return region_range(p, &start, &end) && pos >= start && pos < end;
+}
+
 static char triple_quote_before(buffer * b, size_t end) {
   char quote = '\0';
   for (size_t i = 0; i + 2 < end; i++) {
@@ -1352,16 +1442,16 @@ static char markdown_fence_before(buffer * b, size_t end) {
 }
 
 static void render_base_sgr(edit_state * e, output * o) {
-  if (e->raw) out_f(o, "\x1b[%sm", BASE_SGR);
+  if (e->raw) out_f(o, "\x1b[0;%sm", BASE_SGR);
   else out_s(o, "\x1b[0m");
 }
 
 static void render_span_sgr(edit_state * e, output * o, const char * sgr) {
-  if (e->raw) out_f(o, "\x1b[%s;%sm", BASE_SGR, sgr);
+  if (e->raw) out_f(o, "\x1b[0;%s;%sm", BASE_SGR, sgr);
   else out_f(o, "\x1b[%sm", sgr);
 }
 
-static void render_buffer_line(edit_state * e, output * o, buffer * b,
+static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
                                size_t * pos, size_t skip, size_t limit) {
   char line[LINE_RENDER_MAX];
   const char * search_sgrs[LINE_RENDER_MAX];
@@ -1399,7 +1489,7 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
       col += width;
       continue;
     }
-    const char * sgr = search_sgrs[i] ? search_sgrs[i] :
+    const char * sgr = region_byte(p, start + i) ? REGION_SGR : search_sgrs[i] ? search_sgrs[i] :
       (span < n_spans && i >= spans[span].start) ? spans[span].sgr : NULL;
     if (sgr != color) {
       if (e->raw) {
@@ -1425,7 +1515,7 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b,
 
 static void render_line(edit_state * e, output * o, size_t * pos) {
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
-  render_buffer_line(e, o, active_buffer(e), pos,
+  render_buffer_line(e, o, active_buffer(e), active_pane(e), pos,
                      active_pane(e)->left_col, limit);
 }
 
@@ -1528,7 +1618,7 @@ static void render(edit_state * e) {
         out_f(&o, "\x1b[%d;%dH", row + 1, pane_col(e, i) + 1);
         int cols = pane_cols(e, i);
         if (pos[i] < buffer_len(b))
-          render_buffer_line(e, &o, b, &pos[i], e->panes[i].left_col,
+          render_buffer_line(e, &o, b, &e->panes[i], &pos[i], e->panes[i].left_col,
                              (cols > 1) ? (size_t) cols - 1 : 1);
       }
     }
@@ -1565,7 +1655,7 @@ static void render(edit_state * e) {
     for (int row = 0; row < body_rows && screen_row < e->rows; row++, screen_row++) {
       out_s(&o, "\x1b[K");
       if (pos < buffer_len(b))
-        render_buffer_line(e, &o, b, &pos, p->left_col,
+        render_buffer_line(e, &o, b, p, &pos, p->left_col,
                            (e->cols > 1) ? (size_t) e->cols - 1 : 1);
       if (screen_row + 1 < e->rows) out_s(&o, "\r\n");
     }
@@ -1988,6 +2078,7 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_snapshot(&e);
+  kill_ring_free(&e);
   buffers_free(&e);
   return 0;
 }
@@ -2008,6 +2099,7 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
 
   for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
   render_color_snapshot(&e);
+  kill_ring_free(&e);
   buffers_free(&e);
   return 0;
 }
@@ -2174,8 +2266,10 @@ static int cmd_delete_next(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor < buffer_len(b))
+  if (p->cursor < buffer_len(b)) {
     edit_delete(e, p->cursor, p->cursor + 1, ++b->history_group, true);
+    clear_mark(e);
+  }
   (void) key;
   return 0;
 }
@@ -2187,7 +2281,91 @@ static int cmd_backspace(edit_state * e, int key) {
   if (p->cursor > 0) {
     edit_delete(e, p->cursor - 1, p->cursor, ++b->history_group, true);
     p->cursor--;
+    clear_mark(e);
   }
+  (void) key;
+  return 0;
+}
+
+static int cmd_kill_line(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t end = line_end(b, p->cursor);
+  if (end == p->cursor && end < buffer_len(b) && buffer_at(b, end) == '\n') end++;
+  if (! kill_push(e, b, p->cursor, end)) return action_other(e), set_status(e, "no kill"), 0;
+  edit_delete(e, p->cursor, end, ++b->history_group, true);
+  clear_mark(e);
+  set_status(e, "killed");
+  (void) key;
+  return 0;
+}
+
+static int cmd_mark(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  p->mark = p->cursor;
+  p->mark_active = true;
+  set_status(e, "mark");
+  (void) key;
+  return 0;
+}
+
+static int cmd_cut_region(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t start;
+  size_t end;
+  if (! region_range(p, &start, &end)) return action_other(e), set_status(e, "no region"), 0;
+  kill_push(e, b, start, end);
+  edit_delete(e, start, end, ++b->history_group, true);
+  p->cursor = start;
+  p->preferred_col = SIZE_MAX;
+  clear_mark(e);
+  set_status(e, "killed");
+  (void) key;
+  return 0;
+}
+
+static int cmd_yank(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
+  if (e->n_kills == 0) return action_other(e), set_status(e, "no kill"), 0;
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  output * k = &e->kill_ring[e->kill_head];
+  if (edit_insert(e, p->cursor, k->data, k->len, ++b->history_group, true) == 0) {
+    e->yank_start = p->cursor;
+    e->yank_len = k->len;
+    e->yank_index = e->kill_head;
+    p->cursor += k->len;
+  } else return action_other(e), 0;
+  p->preferred_col = SIZE_MAX;
+  clear_mark(e);
+  e->last_action = ACTION_YANK;
+  set_status(e, "yanked");
+  (void) key;
+  return 0;
+}
+
+static int cmd_yank_pop(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
+  if (e->last_action != ACTION_YANK || e->yank_index < 0)
+    return action_other(e), set_status(e, "no yank"), 0;
+  if (e->n_kills < 2) return set_status(e, "no previous kill"), 0;
+
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  int next = kill_ring_prev(e->yank_index);
+  output * k = &e->kill_ring[next];
+  unsigned group = ++b->history_group;
+  edit_delete(e, e->yank_start, e->yank_start + e->yank_len, group, true);
+  edit_insert(e, e->yank_start, k->data, k->len, group, true);
+  p->cursor = e->yank_start + k->len;
+  p->preferred_col = SIZE_MAX;
+  e->yank_index = next;
+  e->yank_len = k->len;
+  e->last_action = ACTION_YANK;
+  set_status(e, "yanked previous");
   (void) key;
   return 0;
 }
@@ -2201,8 +2379,10 @@ static int cmd_insert(edit_state * e, int key) {
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
-  edit_insert(e, p->cursor, &c, 1, ++b->history_group, true);
-  p->cursor++;
+  if (edit_insert(e, p->cursor, &c, 1, ++b->history_group, true) == 0) {
+    p->cursor++;
+    clear_mark(e);
+  }
   p->preferred_col = SIZE_MAX;
   return 0;
 }
@@ -2212,8 +2392,11 @@ static int insert_text(edit_state * e, const char * text, size_t len) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
-  if (edit_insert(e, p->cursor, text, len, ++b->history_group, true) == 0)
+  if (edit_insert(e, p->cursor, text, len, ++b->history_group, true) == 0) {
     p->cursor += len;
+    clear_mark(e);
+    action_other(e);
+  }
   p->preferred_col = SIZE_MAX;
   return 0;
 }
@@ -2298,8 +2481,10 @@ static int cmd_tab(edit_state * e, int key) {
   char * spaces = malloc(n);
   if (spaces == NULL) return 0;
   memset(spaces, ' ', n);
-  if (edit_insert(e, p->cursor, spaces, n, ++b->history_group, true) == 0)
+  if (edit_insert(e, p->cursor, spaces, n, ++b->history_group, true) == 0) {
     p->cursor += n;
+    clear_mark(e);
+  }
   free(spaces);
   p->preferred_col = SIZE_MAX;
   (void) key;
@@ -2318,8 +2503,10 @@ static int cmd_literal(edit_state * e, int key) {
     (key == KEY_CTRL('i')) ? '\t' : (char) key;
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
-  edit_insert(e, p->cursor, &c, 1, ++b->history_group, true);
-  p->cursor++;
+  if (edit_insert(e, p->cursor, &c, 1, ++b->history_group, true) == 0) {
+    p->cursor++;
+    clear_mark(e);
+  }
   p->preferred_col = SIZE_MAX;
   return 0;
 }
@@ -2352,6 +2539,7 @@ static int cmd_undo(edit_state * e, int key) {
   }
   p->preferred_col = SIZE_MAX;
   b->undo_at = start;
+  buffer_refresh_dirty(b);
   set_status(e, "undo");
   (void) key;
   return 0;
@@ -2535,6 +2723,7 @@ static int cmd_kill_buffer(edit_state * e, int key) {
       e->panes[i].cursor = e->buffers[next].cursor;
       e->panes[i].top = e->buffers[next].top;
       e->panes[i].preferred_col = SIZE_MAX;
+      e->panes[i].mark_active = false;
     }
   }
   buffer_free(&e->buffers[dead]);
@@ -2595,6 +2784,7 @@ static int cmd_buffer_list(edit_state * e, int key) {
   e->panes[target].cursor = 0;
   e->panes[target].top = 0;
   e->panes[target].preferred_col = SIZE_MAX;
+  e->panes[target].mark_active = false;
   e->active_pane = target;
   set_status(e, "buffers");
   return 0;
@@ -2664,6 +2854,7 @@ static int cmd_cancel(edit_state * e, int key) {
   e->find_prompt = false;
   e->find_reuse = false;
   e->quit_confirm = false;
+  clear_mark(e);
   set_status(e, "cancel");
   (void) key;
   return 0;
@@ -2750,8 +2941,10 @@ static const char HELP_TEXT[] =
   "  Text                              insert text\n"
   "  Backspace                         delete previous character\n"
   "  C-d                               delete next character\n"
+  "  C-k                               cut to end of line\n"
+  "  C-space, C-w, C-y, Esc y          mark, cut region, paste, cycle paste\n"
   "  C-q                               insert next key literally\n"
-  "  C-_, C-x u                        undo\n"
+  "  C-/, C-_, C-x u                   undo\n"
   "  C-c C-r                           toggle read only\n"
   "\n"
   "Search\n"
@@ -2797,6 +2990,7 @@ static int cmd_help(edit_state * e, int key) {
   active_pane(e)->cursor = 0;
   active_pane(e)->top = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
+  active_pane(e)->mark_active = false;
   set_status(e, "help");
   refresh_buffer_list(e);
   return 0;
@@ -2832,11 +3026,16 @@ static binding bindings[] = {
   {{KEY_META('p'), 0}, 1, cmd_up_10},
   {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
+  {{KEY_META('y'), 0}, 1, cmd_yank_pop},
   {{KEY_META('<'), 0}, 1, cmd_file_start},
   {{KEY_META('>'), 0}, 1, cmd_file_end},
   {{KEY_CTRL('a'), 0}, 1, cmd_line_start},
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
+  {{KEY_CTRL('k'), 0}, 1, cmd_kill_line},
+  {{KEY_CTRL(' '), 0}, 1, cmd_mark},
+  {{KEY_CTRL('w'), 0}, 1, cmd_cut_region},
+  {{KEY_CTRL('y'), 0}, 1, cmd_yank},
   {{KEY_BACKSPACE, 0}, 1, cmd_backspace},
   {{KEY_CTRL('h'), 0}, 1, cmd_help},
   {{KEY_CTRL('i'), 0}, 1, cmd_tab},
@@ -2917,18 +3116,19 @@ static int dispatch(edit_state * e, int key) {
   int keys[2] = {key, 0};
   int n_keys = 1;
 
-  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
-  if (key == KEY_CTRL('h')) return cmd_help(e, key);
-  if (e->find_prompt) return find_dispatch(e, key);
-  if (e->search_prompt) return search_dispatch(e, key);
+  if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
+  if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
+  if (e->find_prompt) return action_other(e), find_dispatch(e, key);
+  if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
   if (e->prefix) {
     keys[0] = e->prefix;
     keys[1] = key;
     n_keys = 2;
     e->prefix = 0;
-    if (keys[0] == KEY_CTRL('q')) return cmd_literal(e, key);
+    if (keys[0] == KEY_CTRL('q')) return action_other(e), cmd_literal(e, key);
   } else if (key == KEY_CTRL('x') || key == KEY_CTRL('c')) {
+    action_other(e);
     e->prefix = key;
     set_status(e, key == KEY_CTRL('x') ? "C-x" : "C-c");
     return 0;
@@ -2937,14 +3137,20 @@ static int dispatch(edit_state * e, int key) {
   for (size_t i = 0; i < sizeof(bindings) / sizeof(bindings[0]); i++)
     if (bindings[i].n_keys == n_keys && bindings[i].keys[0] == keys[0] &&
         bindings[i].keys[1] == keys[1]) {
-      if (bindings[i].fn != cmd_quit) e->quit_confirm = false;
-      if (bindings[i].fn != cmd_recenter) active_pane(e)->recenter = 0;
-      return bindings[i].fn(e, key);
+      command_fn fn = bindings[i].fn;
+      if (fn != cmd_quit) e->quit_confirm = false;
+      if (fn != cmd_recenter) active_pane(e)->recenter = 0;
+      int rc = fn(e, key);
+      if (fn != cmd_kill_line && fn != cmd_cut_region &&
+          fn != cmd_yank && fn != cmd_yank_pop)
+        action_other(e);
+      return rc;
     }
 
   if ((n_keys == 1) && (key >= 32) && (key < 127)) {
     e->quit_confirm = false;
     active_pane(e)->recenter = 0;
+    action_other(e);
     return cmd_insert(e, key);
   }
   return 0;
@@ -3045,6 +3251,7 @@ static int tui(const char * path) {
   const char * clear = "\x1b[?2004l\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
   free(e.input.data);
+  kill_ring_free(&e);
   if (e.debug_log != NULL) {
     fprintf(e.debug_log, "end_debug aborted\n");
     fclose(e.debug_log);

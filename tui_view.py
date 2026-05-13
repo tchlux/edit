@@ -68,12 +68,24 @@ def keys(s):
         elif s.startswith("<m-q>", i):
             out += b"\x1bq"
             i += 5
+        elif s.startswith("<m-y>", i):
+            out += b"\x1by"
+            i += 5
         elif s.startswith("<tab>", i):
             out += b"\t"
             i += 5
         elif s.startswith("<esc>", i):
-            out += b"\x1b\x00"
+            out += b"\x1b\xff"
             i += 5
+        elif s.startswith("<c-space>", i):
+            out += b"\x00"
+            i += 9
+        elif s.startswith("<c-@>", i):
+            out += b"\x00"
+            i += 5
+        elif s.startswith("<c-slash>", i):
+            out += ctrl("_")
+            i += 9
         elif s.startswith("<paste>", i):
             out += b"\x1b[200~"
             i += 7
@@ -159,7 +171,7 @@ def read_tui(path, rows, cols, key_text):
             except OSError:
                 break
     for c in keys(key_text):
-        if c == 0:
+        if c == 255:
             time.sleep(0.05)
         elif c == 254:
             with open(path, "wb") as f:
