@@ -1227,6 +1227,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
     }
     if (ev.n_raw == 2 && ev.raw[0] == 0xc6 && ev.raw[1] == 0x92) ev.key = KEY_META('f');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0xab) ev.key = KEY_META('b');
+    else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x82) ev.key = KEY_META('d');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x9a) ev.key = KEY_META('v');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xae) ev.key = KEY_META('r');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x9c) ev.key = KEY_META('n');
@@ -2055,6 +2056,7 @@ static int key_name(char c) {
   if (c == 'P') return KEY_META('p');
   if (c == 'Q') return KEY_META('q');
   if (c == 'V') return KEY_META('v');
+  if (c == 'D') return KEY_META('d');
   if (c == '<') return KEY_META('<');
   if (c == '>') return KEY_META('>');
   if (c == 'x') return KEY_CTRL('x');
@@ -2205,27 +2207,34 @@ static bool camel_boundary(buffer * b, size_t pos) {
   return word_byte(b, pos - 1) && word_byte(b, pos) && islower(a) && isupper(c);
 }
 
+static size_t word_forward(buffer * b, size_t pos) {
+  while (pos < buffer_len(b) && ! word_byte(b, pos)) pos++;
+  if (pos < buffer_len(b)) pos++;
+  while (pos < buffer_len(b) && word_byte(b, pos) && ! camel_boundary(b, pos)) pos++;
+  return pos;
+}
+
+static size_t word_back(buffer * b, size_t pos) {
+  size_t original = pos;
+  while (pos > 0 && ! word_byte(b, pos - 1)) pos--;
+  while (pos > 0 && word_byte(b, pos - 1)) {
+    if (pos != original && camel_boundary(b, pos)) break;
+    pos--;
+  }
+  return pos;
+}
+
 static int cmd_word_forward(edit_state * e, int key) {
-  buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  while (p->cursor < buffer_len(b) && ! word_byte(b, p->cursor)) p->cursor++;
-  if (p->cursor < buffer_len(b)) p->cursor++;
-  while (p->cursor < buffer_len(b) && word_byte(b, p->cursor) &&
-         ! camel_boundary(b, p->cursor)) p->cursor++;
+  p->cursor = word_forward(active_buffer(e), p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
 }
 
 static int cmd_word_back(edit_state * e, int key) {
-  buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  size_t original = p->cursor;
-  while (p->cursor > 0 && ! word_byte(b, p->cursor - 1)) p->cursor--;
-  while (p->cursor > 0 && word_byte(b, p->cursor - 1)) {
-    if (p->cursor != original && camel_boundary(b, p->cursor)) break;
-    p->cursor--;
-  }
+  p->cursor = word_back(active_buffer(e), p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -2274,6 +2283,19 @@ static int cmd_delete_next(edit_state * e, int key) {
   return 0;
 }
 
+static int cmd_delete_word_forward(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t end = word_forward(b, p->cursor);
+  if (end > p->cursor) {
+    edit_delete(e, p->cursor, end, ++b->history_group, true);
+    clear_mark(e);
+  }
+  (void) key;
+  return 0;
+}
+
 static int cmd_backspace(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
@@ -2281,6 +2303,20 @@ static int cmd_backspace(edit_state * e, int key) {
   if (p->cursor > 0) {
     edit_delete(e, p->cursor - 1, p->cursor, ++b->history_group, true);
     p->cursor--;
+    clear_mark(e);
+  }
+  (void) key;
+  return 0;
+}
+
+static int cmd_delete_word_back(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t start = word_back(b, p->cursor);
+  if (start < p->cursor) {
+    edit_delete(e, start, p->cursor, ++b->history_group, true);
+    p->cursor = start;
     clear_mark(e);
   }
   (void) key;
@@ -2939,8 +2975,8 @@ static const char HELP_TEXT[] =
   "\n"
   "Editing\n"
   "  Text                              insert text\n"
-  "  Backspace                         delete previous character\n"
-  "  C-d                               delete next character\n"
+  "  Backspace, Esc Delete             delete previous character or word\n"
+  "  C-d, Esc d                        delete next character or word\n"
   "  C-k                               cut to end of line\n"
   "  C-space, C-w, C-y, Esc y          mark, cut region, paste, cycle paste\n"
   "  C-q                               insert next key literally\n"
@@ -3022,6 +3058,8 @@ static binding bindings[] = {
   {{KEY_CTRL('v'), 0}, 1, cmd_page_down},
   {{KEY_META('b'), 0}, 1, cmd_word_back},
   {{KEY_META('f'), 0}, 1, cmd_word_forward},
+  {{KEY_META('d'), 0}, 1, cmd_delete_word_forward},
+  {{KEY_META(KEY_BACKSPACE), 0}, 1, cmd_delete_word_back},
   {{KEY_META('n'), 0}, 1, cmd_down_10},
   {{KEY_META('p'), 0}, 1, cmd_up_10},
   {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},

@@ -18,6 +18,7 @@ shows built-in key reminders.
 Keys: `C-l` recenter, `C-s` search forward, `C-r` search backward,
 repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `Esc f`/`Esc b` word movement,
+`Esc d`/`Esc Delete` word deletion,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
 `Esc <`/`Esc >` file start/end, `Esc q` fill paragraph,
 `Tab` insert spaces, `C-q` quote the next key for literal insertion,
@@ -45,7 +46,8 @@ Large terminal pastes use bracketed paste when available, so pasted text is
 buffered and inserted as one undoable edit instead of many per-key edits.
 
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
-Use the literal `Esc` prefix for reliable command input.
+`edit` decodes known Option bytes for `f`, `b`, `d`, `v`, `n`, `p`, `r`, `<`,
+and `>`; use the literal `Esc` prefix for reliable command input.
 
 Batch use:
 

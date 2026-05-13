@@ -62,6 +62,12 @@ def keys(s):
         elif s.startswith("<m-b>", i):
             out += b"\x1bb"
             i += 5
+        elif s.startswith("<m-d>", i):
+            out += b"\x1bd"
+            i += 5
+        elif s.startswith("<m-del>", i):
+            out += b"\x1b\x7f"
+            i += 7
         elif s.startswith("<m-r>", i):
             out += b"\x1br"
             i += 5
@@ -104,6 +110,9 @@ def keys(s):
         elif s.startswith("<opt-b>", i):
             out += bytes([0xE2, 0x88, 0xAB])
             i += 7
+        elif s.startswith("<opt-d>", i):
+            out += bytes([0xE2, 0x88, 0x82])
+            i += 7
         elif s.startswith("<opt-r>", i):
             out += bytes([0xC2, 0xAE])
             i += 7
@@ -124,6 +133,9 @@ def keys(s):
             i += 7
         elif s.startswith("<mac-b>", i):
             out += bytes([0xE2, 0x88, 0xAB])
+            i += 7
+        elif s.startswith("<mac-d>", i):
+            out += bytes([0xE2, 0x88, 0x82])
             i += 7
         elif s.startswith("<mac-r>", i):
             out += bytes([0xC2, 0xAE])

@@ -20,7 +20,7 @@ Completed work:
   coverage.
 - Modeline and movement polish: filename plus cursor `line:column`, separate
   keymap reminder row, `M-n`/`M-p` 10-line movement, and regex-backed
-  `M-f`/`M-b` word movement.
+  `M-f`/`M-b` word movement plus `M-d`/`M-DEL` word deletion.
 - Debug tooling: `Esc r` TUI recording with terminal size, raw key bytes,
   decoded keys, state snapshots, ANSI render bytes, and final user note; plus a
   standalone `keydump.sh` terminal byte inspector for macOS Option diagnosis.

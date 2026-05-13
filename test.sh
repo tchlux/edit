@@ -262,6 +262,23 @@ printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s 
 printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
 
 printf 'one, two_three 9x\n' > "$tmp"
+./edit --render-keys 4:30 D "$tmp" > "$out"
+printf '|,.two_three.9x\n\n%s* 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:30 FD "$tmp" > "$out"
+printf 'one|.9x\n\n%s* 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:30 DDD "$tmp" > "$out"
+printf '|\n\n%s* 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:30 D_ "$tmp" > "$out"
+printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "undo")" | cmp -s - "$out"
+
+printf 'camelCaseWord other\n' > "$tmp"
+./edit --render-keys 4:40 DD "$tmp" > "$out"
+printf '|Word.other\n\n%s* 1:1\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+printf 'one, two_three 9x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<opt-f>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:4\n' > "$tmp.expected"
@@ -287,6 +304,44 @@ tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:6\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
+python3 ./tui_view.py 4:50 '<opt-d>' "$tmp" > "$out"
+grep -q '^>01:,.two_three.9x$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 4:50 '<mac-d><mac-d>' "$tmp" > "$out"
+grep -q '^>01:.9x$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 4:50 '<m-f><m-f><m-del>' "$tmp" > "$out"
+grep -q '^>01:one,..9x$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:6\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 4:50 '<m-f><m-f><m-del><m-del>' "$tmp" > "$out"
+grep -q '^>01:.9x$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 4:50 '<m-f><m-f><m-del><c-slash>' "$tmp" > "$out"
+grep -q '^>01:one,.two_three.9x$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:15\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'camelCaseWord other\n' > "$tmp"
+python3 ./tui_view.py 4:50 '<m-f><m-f><m-f><m-del>' "$tmp" > "$out"
+grep -q '^>01:camelCase.other$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:10\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'one, two_three 9x\n' > "$tmp"
 EDIT_DEBUG_LOG="$tmp.debug" python3 ./tui_view.py 4:40 '<m-r><opt-f><esc>meta failed
 ' "$tmp" > "$out"
 test -s "$tmp.debug"
