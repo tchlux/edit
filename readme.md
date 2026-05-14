@@ -17,12 +17,14 @@ shows built-in key reminders.
 
 Keys: `C-l` recenter, `C-s` search forward, `C-r` search backward,
 repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
+`Esc %` query replace,
 `Esc f`/`Esc b` word movement,
 `Esc d`/`Esc Delete` word deletion,
 `C-v`/`Esc v` page movement, `Esc n`/`Esc p` move 10 lines,
 `Esc <`/`Esc >` file start/end, `Esc q` fill paragraph,
 `Tab` insert spaces, `C-q` quote the next key for literal insertion,
-`C-k` cut to end of line, `C-space` mark, `C-w` cut region, `C-y` paste,
+`C-k` cut to end of line, `C-o` open a new line after point,
+`C-space` mark, `C-w` cut region, `C-y` paste,
 `Esc y` cycle paste,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
@@ -30,6 +32,11 @@ repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `C-x C-b` show session buffers,
 `C-c C-r` toggle read-only, `C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
 plain `Esc`, then prompts for a note.
+
+`Esc %` prompts for a search term and replacement, then reviews matches from
+point to the end of the file. In the replacement loop, `Space` replaces the
+current match, `n` skips it, and `!` replaces the current and remaining
+matches. Replacement highlights clear when the scan finishes.
 
 `C-x C-f` stores recent files in `$HOME/.edit/recent`; set `EDIT_RECENT` to
 override that path. Open files are tracked as virtual session buffers; killing
@@ -47,7 +54,7 @@ buffered and inserted as one undoable edit instead of many per-key edits.
 
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
 `edit` decodes known Option bytes for `f`, `b`, `d`, `v`, `n`, `p`, `r`, `<`,
-and `>`; use the literal `Esc` prefix for reliable command input.
+`>`, and `%`; use the literal `Esc` prefix for reliable command input.
 
 Batch use:
 

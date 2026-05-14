@@ -72,6 +72,9 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define SEARCH_BLINK_MS 500
 #define META_REPEAT_MS 1000
 #define HELP_HINT "C-h help"
+#define REPLACE_SEARCH 1
+#define REPLACE_WITH 2
+#define REPLACE_QUERY 3
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
@@ -158,6 +161,11 @@ struct edit_state {
   bool search_reuse;
   char search[STATUS_SIZE];
   size_t search_len;
+  int replace_phase;
+  char replace[STATUS_SIZE];
+  size_t replace_len;
+  size_t replace_start;
+  size_t replace_end;
   bool find_prompt;
   bool find_reuse;
   char find_path[DEBUG_PATH_SIZE];
@@ -1234,6 +1242,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcf && ev.raw[1] == 0x80) ev.key = KEY_META('p');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xaf) ev.key = KEY_META('<');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x98) ev.key = KEY_META('>');
+    else if (ev.n_raw == 3 && ev.raw[0] == 0xef && ev.raw[1] == 0xac && ev.raw[2] == 0x81) ev.key = KEY_META('%');
     if (ev.key >= KEY_META(0)) {
       snprintf(ev.kind, sizeof(ev.kind), "mac-option");
       ev.end_ms = now_ms();
@@ -2057,6 +2066,7 @@ static int key_name(char c) {
   if (c == 'Q') return KEY_META('q');
   if (c == 'V') return KEY_META('v');
   if (c == 'D') return KEY_META('d');
+  if (c == '%') return KEY_META('%');
   if (c == '<') return KEY_META('<');
   if (c == '>') return KEY_META('>');
   if (c == 'x') return KEY_CTRL('x');
@@ -2423,6 +2433,19 @@ static int cmd_insert(edit_state * e, int key) {
   return 0;
 }
 
+static int cmd_open_line(edit_state * e, int key) {
+  if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  char c = '\n';
+  if (edit_insert(e, p->cursor, &c, 1, ++b->history_group, true) == 0)
+    clear_mark(e);
+  p->preferred_col = SIZE_MAX;
+  (void) key;
+  return 0;
+}
+
 static int insert_text(edit_state * e, const char * text, size_t len) {
   if (active_buffer(e)->kind == BUFFER_LIST) return set_status(e, "read only"), 0;
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
@@ -2475,8 +2498,9 @@ static bool fallback_text_byte(char c) {
 
 static bool fallback_context(edit_state * e, int key) {
   return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
-    ! e->search_prompt && ! e->debug_recording && ! e->debug_note_prompt &&
-    active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
+    ! e->search_prompt && ! e->replace_phase && ! e->debug_recording &&
+    ! e->debug_note_prompt && active_buffer(e)->kind != BUFFER_LIST &&
+    ! read_only_buffer(active_buffer(e));
 }
 
 static int fast_insert(edit_state * e, int key) {
@@ -2881,12 +2905,84 @@ static int cmd_reverse_search(edit_state * e, int key) {
   return cmd_search_dir(e, true);
 }
 
+static void replace_clear(edit_state * e) {
+  bool active = e->replace_phase != 0;
+  e->replace_phase = 0;
+  e->replace_len = 0;
+  e->replace[0] = '\0';
+  if (active) {
+    e->search_len = 0;
+    e->search[0] = '\0';
+  }
+}
+
+static int replace_find(edit_state * e, size_t from) {
+  size_t start = 0;
+  size_t end = 0;
+  int rc = buffer_search(active_buffer(e), from, e->search, &start, &end);
+  if (rc == 1) {
+    active_pane(e)->cursor = start;
+    active_pane(e)->preferred_col = SIZE_MAX;
+    e->replace_start = start;
+    e->replace_end = end;
+    e->replace_phase = REPLACE_QUERY;
+    set_status(e, "replace? Space yes, n no, ! all");
+  } else {
+    replace_clear(e);
+    set_status(e, "%s", (rc == 0) ? "done" : "search failed");
+  }
+  return 0;
+}
+
+static size_t replace_next_from(size_t start, size_t end, size_t len) {
+  size_t from = start + len;
+  return (from == start && end == start) ? from + 1 : from;
+}
+
+static int replace_one(edit_state * e, unsigned group, size_t * next) {
+  size_t start = e->replace_start;
+  size_t end = e->replace_end;
+  edit_delete(e, start, end, group, true);
+  if (edit_insert(e, start, e->replace, e->replace_len, group, true) != 0)
+    return set_status(e, "replace failed"), -1;
+  active_pane(e)->cursor = start + e->replace_len;
+  *next = replace_next_from(start, end, e->replace_len);
+  clear_mark(e);
+  return 0;
+}
+
+static int replace_all(edit_state * e) {
+  buffer * b = active_buffer(e);
+  unsigned group = ++b->history_group;
+  size_t next = e->replace_start;
+  int n = 0;
+  do {
+    if (replace_one(e, group, &next) != 0) return 0;
+    n++;
+  } while (buffer_search(b, next, e->search, &e->replace_start, &e->replace_end) == 1);
+  replace_clear(e);
+  set_status(e, "replaced %d", n);
+  return 0;
+}
+
+static int cmd_replace(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  e->search_len = 0;
+  e->search[0] = '\0';
+  replace_clear(e);
+  e->replace_phase = REPLACE_SEARCH;
+  set_status(e, "replace: ");
+  (void) key;
+  return 0;
+}
+
 static int cmd_cancel(edit_state * e, int key) {
   e->prefix = 0;
   e->search_prompt = false;
   e->search_reuse = false;
   e->search_len = 0;
   e->search[0] = '\0';
+  replace_clear(e);
   e->find_prompt = false;
   e->find_reuse = false;
   e->quit_confirm = false;
@@ -2978,6 +3074,7 @@ static const char HELP_TEXT[] =
   "  Backspace, Esc Delete             delete previous character or word\n"
   "  C-d, Esc d                        delete next character or word\n"
   "  C-k                               cut to end of line\n"
+  "  C-o                               insert newline after point\n"
   "  C-space, C-w, C-y, Esc y          mark, cut region, paste, cycle paste\n"
   "  C-q                               insert next key literally\n"
   "  C-/, C-_, C-x u                   undo\n"
@@ -2986,6 +3083,7 @@ static const char HELP_TEXT[] =
   "Search\n"
   "  C-s, C-r                          search forward and reverse\n"
   "  C-s/C-r again                     repeat search\n"
+  "  Esc %                             query replace\n"
   "  Enter                             accept search\n"
   "  C-g                               cancel\n"
   "\n"
@@ -3014,6 +3112,7 @@ static int cmd_help(edit_state * e, int key) {
   (void) key;
   e->find_prompt = false;
   e->search_prompt = false;
+  replace_clear(e);
   e->footer[0] = '\0';
   if (h < 0) {
     if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
@@ -3064,6 +3163,7 @@ static binding bindings[] = {
   {{KEY_META('p'), 0}, 1, cmd_up_10},
   {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
+  {{KEY_META('%'), 0}, 1, cmd_replace},
   {{KEY_META('y'), 0}, 1, cmd_yank_pop},
   {{KEY_META('<'), 0}, 1, cmd_file_start},
   {{KEY_META('>'), 0}, 1, cmd_file_end},
@@ -3071,6 +3171,7 @@ static binding bindings[] = {
   {{KEY_CTRL('e'), 0}, 1, cmd_line_end},
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
   {{KEY_CTRL('k'), 0}, 1, cmd_kill_line},
+  {{KEY_CTRL('o'), 0}, 1, cmd_open_line},
   {{KEY_CTRL(' '), 0}, 1, cmd_mark},
   {{KEY_CTRL('w'), 0}, 1, cmd_cut_region},
   {{KEY_CTRL('y'), 0}, 1, cmd_yank},
@@ -3150,6 +3251,47 @@ static int search_dispatch(edit_state * e, int key) {
   return 0;
 }
 
+static int replace_dispatch(edit_state * e, int key) {
+  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (e->replace_phase == REPLACE_SEARCH) {
+    if (key == KEY_ENTER) {
+      if (e->search_len == 0) return set_status(e, "no search"), 0;
+      e->replace_phase = REPLACE_WITH;
+      set_status(e, "with: %s", e->replace);
+      return 0;
+    }
+    if (key == KEY_BACKSPACE && e->search_len > 0) e->search[--e->search_len] = '\0';
+    else if (key >= 32 && key < 127 && e->search_len + 1 < sizeof(e->search)) {
+      e->search[e->search_len++] = (char) key;
+      e->search[e->search_len] = '\0';
+    }
+    set_status(e, "replace: %s", e->search);
+    return 0;
+  }
+  if (e->replace_phase == REPLACE_WITH) {
+    if (key == KEY_ENTER) return replace_find(e, active_pane(e)->cursor);
+    if (key == KEY_BACKSPACE && e->replace_len > 0) e->replace[--e->replace_len] = '\0';
+    else if (key >= 32 && key < 127 && e->replace_len + 1 < sizeof(e->replace)) {
+      e->replace[e->replace_len++] = (char) key;
+      e->replace[e->replace_len] = '\0';
+    }
+    set_status(e, "with: %s", e->replace);
+    return 0;
+  }
+  if (key == '!') return replace_all(e);
+  if (key == ' ') {
+    size_t next = 0;
+    if (replace_one(e, ++active_buffer(e)->history_group, &next) != 0) return 0;
+    return replace_find(e, next);
+  }
+  if (key == 'n') {
+    size_t next = e->replace_end > e->replace_start ? e->replace_end : e->replace_start + 1;
+    return replace_find(e, next);
+  }
+  set_status(e, "replace? Space yes, n no, ! all");
+  return 0;
+}
+
 static int dispatch(edit_state * e, int key) {
   int keys[2] = {key, 0};
   int n_keys = 1;
@@ -3157,6 +3299,7 @@ static int dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
   if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
   if (e->find_prompt) return action_other(e), find_dispatch(e, key);
+  if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
   if (e->prefix) {
@@ -3241,7 +3384,8 @@ static int tui(const char * path) {
         action = "esc-meta";
       }
     }
-    if (! e.debug_note_prompt && ! e.find_prompt && ! e.search_prompt && e.prefix == 0) {
+    if (! e.debug_note_prompt && ! e.find_prompt && ! e.search_prompt &&
+        ! e.replace_phase && e.prefix == 0) {
       int repeat = meta_repeat_key(&e, &ev, key);
       if (repeat != key) {
         key = repeat;
@@ -3274,7 +3418,7 @@ static int tui(const char * path) {
       if (strcmp(action, "esc-meta") != 0 && strcmp(action, "meta-repeat") != 0)
         action = "dispatch";
     }
-    if (e.debug_note_prompt || e.find_prompt || e.search_prompt || e.prefix)
+    if (e.debug_note_prompt || e.find_prompt || e.search_prompt || e.replace_phase || e.prefix)
       e.meta_repeat_key = 0;
     else remember_meta_repeat(&e, key, ev.end_ms);
 

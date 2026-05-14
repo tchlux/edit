@@ -477,6 +477,46 @@ printf 'one two one two\n' > "$tmp"
 ./edit --render-keys-color 4:40 "stwo${enter}g" "$tmp" > "$out"
 printf 'one two one two\n\n\n' | cmp -s - "$out"
 
+printf 'two two\n' > "$tmp"
+./edit --render-keys-color 4:40 "%two${enter}TWO${enter}!" "$tmp" > "$out"
+printf 'TWO TWO\n\n\n' | cmp -s - "$out"
+
+printf 'ab\n' > "$tmp"
+python3 ./tui_view.py 4:30 '<right>^o^x^s' "$tmp" > "$out"
+printf 'a\nb\n' | cmp -s - "$tmp"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:2\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'one one one\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<esc>%one
+ONE
+ ^g^x^s' "$tmp" > "$out"
+printf 'ONE one one\n' | cmp -s - "$tmp"
+
+printf 'one one one\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<esc>%one
+ONE
+n ^g^x^s' "$tmp" > "$out"
+printf 'one ONE one\n' | cmp -s - "$tmp"
+
+printf 'one one one\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<esc>%one
+ONE
+!^x^s' "$tmp" > "$out"
+printf 'ONE ONE ONE\n' | cmp -s - "$tmp"
+
+printf 'one one\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<opt-%>one
+ONE
+!^x^s' "$tmp" > "$out"
+printf 'ONE ONE\n' | cmp -s - "$tmp"
+
+printf 'one one\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<c-c>^r<esc>%' "$tmp" > "$out"
+grep -q 'read.only' "$out"
+
+printf 'one two one two\n' > "$tmp"
 ./edit --render-keys 4:40 "stwogA" "$tmp" > "$out"
 printf 'A|one.two.one.two\n\n%s* 1:2\n%s\n' "$base" "$(foot 40 "cancel")" | cmp -s - "$out"
 
@@ -563,7 +603,7 @@ python3 ./tui_view.py 4:100 '<raw><c-space><right>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7mm\033[0;38;2;224;224;224;48;2;32;32;32;38;2;255;215;95multiline_str')" "$out"
 
 printf 'abc\n' > "$tmp"
-./edit --render-keys 44:80 h "$tmp" > "$out"
+./edit --render-keys 46:80 h "$tmp" > "$out"
 grep -q '\*help\*' "$out"
 grep -q 'C-x.C-f' "$out"
 grep -q 'C-s' "$out"

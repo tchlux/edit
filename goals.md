@@ -32,6 +32,9 @@ Completed work:
   `C-q Tab` inserts a literal tab.
 - Search highlighting: visible forward/reverse search matches are highlighted
   in the current view, with the current match emphasized.
+- Query replace and open-line: `M-%` prompts for search/replacement text,
+  supports per-match approve/skip/replace-all from point to EOF, clears
+  highlights when done, and `C-o` opens a line without moving point.
 - Robust large paste handling: bracketed paste is buffered into one insert and
   one undo group, with newline normalization, UTF-8 preservation, and pty
   regression coverage.
