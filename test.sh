@@ -9,7 +9,23 @@ out=$(mktemp)
 recent=$(mktemp)
 dir=$(mktemp -d)
 export EDIT_RECENT="$recent"
-trap 'rm -rf "$dir"; rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"' EXIT
+clip_has=0
+clip_saved=
+if command -v pbcopy >/dev/null 2>&1 && command -v pbpaste >/dev/null 2>&1; then
+  clip_saved=$(pbpaste 2>/dev/null || true)
+  if printf __edit_clip_probe | pbcopy 2>/dev/null &&
+     [ "$(pbpaste 2>/dev/null || true)" = "__edit_clip_probe" ]; then
+    clip_has=1
+  else
+    printf '%s' "$clip_saved" | pbcopy 2>/dev/null || true
+  fi
+fi
+cleanup() {
+  if [ "$clip_has" = 1 ]; then printf '%s' "$clip_saved" | pbcopy; fi
+  rm -rf "$dir"
+  rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"
+}
+trap cleanup EXIT
 
 foot() {
   width=$1
@@ -46,6 +62,23 @@ printf '3:5..3:6\n' | cmp -s - "$out"
 
 if ./edit --search 1:1 zzz "$tmp" > "$out" 2>&1; then exit 1; fi
 
+printf '* item\naXXb\na.*b\n' > "$tmp"
+./edit --search 1:1 '*' "$tmp" > "$out"
+printf '1:1..1:2\n' | cmp -s - "$out"
+
+./edit --search 1:1 '[*]' "$tmp" > "$out"
+printf '1:1..1:2\n' | cmp -s - "$out"
+
+./edit --search 1:2 '[*]' "$tmp" > "$out"
+printf '3:3..3:4\n' | cmp -s - "$out"
+
+./edit --search 1:1 'a.*b' "$tmp" > "$out"
+printf '2:1..2:5\n' | cmp -s - "$out"
+
+printf 'abc\n' > "$tmp"
+if ./edit --search 1:1 '*' "$tmp" > "$out" 2>&1; then exit 1; fi
+
+printf 'one\ntwo\nthree\n' > "$tmp"
 ./edit --insert 2:1 'X' "$tmp" > "$out"
 printf 'one\nXtwo\nthree\n' | cmp -s - "$tmp"
 
@@ -512,6 +545,30 @@ ONE
 !^x^s' "$tmp" > "$out"
 printf 'ONE ONE\n' | cmp -s - "$tmp"
 
+printf '* one *\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<esc>%*
+X
+!^x^s' "$tmp" > "$out"
+printf 'X one X\n' | cmp -s - "$tmp"
+
+printf '* one * two *\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<esc>%[*]
+-
+!^x^s' "$tmp" > "$out"
+printf -- '- one - two -\n' | cmp -s - "$tmp"
+
+i=0
+: > "$tmp"
+while [ "$i" -lt 1130 ]; do
+  printf '* item\n' >> "$tmp"
+  i=$((i + 1))
+done
+python3 ./tui_view.py 5:40 '<esc>%*
+-
+!<c-slash>^x^s' "$tmp" > "$out"
+test "$(grep -c '^\* item$' "$tmp")" = 1130
+if grep -q '^- item$' "$tmp"; then exit 1; fi
+
 printf 'one one\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<c-c>^r<esc>%' "$tmp" > "$out"
 grep -q 'read.only' "$out"
@@ -593,6 +650,47 @@ printf 'abc\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<c-space><right><right>^w^_^x^s' "$tmp" > "$out"
 printf 'abc\n' | cmp -s - "$tmp"
 
+if [ "$clip_has" = 1 ]; then
+  printf 'abc\n' > "$tmp"
+  python3 ./tui_view.py 4:40 '^k^x^s' "$tmp" > "$out"
+  [ "$(pbpaste)" = "abc" ]
+
+  printf 'abc\n' > "$tmp"
+  python3 ./tui_view.py 4:40 '<c-space><right><right><m-w>^x^c' "$tmp" > "$out"
+  printf 'abc\n' | cmp -s - "$tmp"
+  [ "$(pbpaste)" = "ab" ]
+
+  printf 'word next\n' > "$tmp"
+  python3 ./tui_view.py 4:40 '<c-space><m-f><opt-w>^g^x^c' "$tmp" > "$out"
+  printf 'word next\n' | cmp -s - "$tmp"
+  [ "$(pbpaste)" = "word" ]
+
+  printf 'abc\n' > "$tmp"
+  printf 'CLIP' | pbcopy
+  python3 ./tui_view.py 4:40 '^y^x^s' "$tmp" > "$out"
+  printf 'CLIPabc\n' | cmp -s - "$tmp"
+
+  printf 'abc\n' > "$tmp"
+  printf 'CLIP' | pbcopy
+  python3 ./tui_view.py 4:40 '^y^_^x^s' "$tmp" > "$out"
+  printf 'abc\n' | cmp -s - "$tmp"
+
+  printf 'abc\nCLIP\n' > "$tmp"
+  printf 'CLIP' | pbcopy
+  python3 ./tui_view.py 4:40 '^s^y
+' "$tmp" > "$out"
+  tail -n 1 "$out" > "$tmp.head"
+  printf 'cursor:2:1\n' > "$tmp.expected"
+  cmp -s "$tmp.expected" "$tmp.head"
+fi
+
+printf 'abc\nPASTE\n' > "$tmp"
+python3 ./tui_view.py 4:40 '^s<paste>PASTE</paste>
+' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:2:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
 printf 'abc\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<raw><c-space><right>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7m')" "$out"
@@ -603,11 +701,12 @@ python3 ./tui_view.py 4:100 '<raw><c-space><right>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7mm\033[0;38;2;224;224;224;48;2;32;32;32;38;2;255;215;95multiline_str')" "$out"
 
 printf 'abc\n' > "$tmp"
-./edit --render-keys 46:80 h "$tmp" > "$out"
+./edit --render-keys 50:80 h "$tmp" > "$out"
 grep -q '\*help\*' "$out"
 grep -q 'C-x.C-f' "$out"
 grep -q 'C-s' "$out"
 grep -q 'Esc.v' "$out"
+grep -q 'Esc.w' "$out"
 grep -q 'Esc.y' "$out"
 grep -q 'C-/' "$out"
 grep -q 'C-x.C-c' "$out"

@@ -24,7 +24,7 @@ repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `Esc <`/`Esc >` file start/end, `Esc q` fill paragraph,
 `Tab` insert spaces, `C-q` quote the next key for literal insertion,
 `C-k` cut to end of line, `C-o` open a new line after point,
-`C-space` mark, `C-w` cut region, `C-y` paste,
+`C-space` mark, `C-w` cut region, `Esc w` copy region, `C-y` paste clipboard/kill,
 `Esc y` cycle paste,
 `C-/` / `C-_` / `C-x u` undo, `C-x 2` split below, `C-x 3` split right,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
@@ -33,7 +33,8 @@ repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `C-c C-r` toggle read-only, `C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
 plain `Esc`, then prompts for a note.
 
-`Esc %` prompts for a search term and replacement, then reviews matches from
+Search and query replace use regexes, with invalid regex input searched as
+literal text, so `*` finds literal asterisks. `Esc %` prompts for a search term and replacement, then reviews matches from
 point to the end of the file. In the replacement loop, `Space` replaces the
 current match, `n` skips it, and `!` replaces the current and remaining
 matches. Replacement highlights clear when the scan finishes.
@@ -53,7 +54,7 @@ Large terminal pastes use bracketed paste when available, so pasted text is
 buffered and inserted as one undoable edit instead of many per-key edits.
 
 On macOS, Option may enter Unicode or dead-key accents instead of Meta commands.
-`edit` decodes known Option bytes for `f`, `b`, `d`, `v`, `n`, `p`, `r`, `<`,
+`edit` decodes known Option bytes for `f`, `b`, `d`, `w`, `v`, `n`, `p`, `r`, `<`,
 `>`, and `%`; use the literal `Esc` prefix for reliable command input.
 
 Batch use:

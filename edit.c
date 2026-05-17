@@ -58,7 +58,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
 #define LINE_RENDER_MAX 8192
-#define HISTORY_MAX 1024
+#define HISTORY_INITIAL 128
 #define PASTE_FALLBACK_MAX 65536
 #define DEBUG_PATH_SIZE 512
 #define RECENT_MAX 16
@@ -99,8 +99,9 @@ typedef struct {
   size_t top;
   off_t disk_size;
   time_t disk_mtime;
-  history history[HISTORY_MAX];
+  history * history;
   int n_history;
+  int history_cap;
   int undo_at;
   int clean_at;
   unsigned history_group;
@@ -312,7 +313,10 @@ static int buffer_load(buffer * b, const char * path) {
 
 static void history_free_buffer(buffer * b) {
   for (int i = 0; i < b->n_history; i++) free(b->history[i].text);
+  free(b->history);
+  b->history = NULL;
   b->n_history = 0;
+  b->history_cap = 0;
   b->undo_at = 0;
   b->clean_at = 0;
 }
@@ -431,6 +435,24 @@ static void buffer_delete(buffer * b, size_t start, size_t end) {
   b->dirty = true;
 }
 
+static int smart_match(const char * regex, const char * text, size_t len,
+                       int * start, int * end) {
+  size_t n = strlen(regex);
+  match(regex, text, start, end);
+  if (*start >= 0) return 1;
+  if (*end >= 0) return 0;
+
+  if (n == 0 || n > len) return 0;
+  for (size_t i = 0; i + n <= len; i++) {
+    if (memcmp(text + i, regex, n) == 0) {
+      *start = (int) i;
+      *end = (int) (i + n);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int buffer_search(buffer * b, size_t from, const char * regex,
                          size_t * start, size_t * end) {
   size_t len = buffer_len(b);
@@ -442,9 +464,9 @@ static int buffer_search(buffer * b, size_t from, const char * regex,
 
   int a = -1;
   int z = -1;
-  match(regex, text, &a, &z);
+  int rc = smart_match(regex, text, len - from, &a, &z);
   free(text);
-  if (a < 0) return 0;
+  if (rc != 1) return rc;
   *start = from + (size_t) a;
   *end = from + (size_t) z;
   return 1;
@@ -662,6 +684,23 @@ static void out_clip(output * o, const char * s, size_t * used, size_t limit) {
     out_add(o, &s[i], 1);
 }
 
+static void clipboard_write(const char * data, size_t len) {
+  FILE * f = popen("pbcopy 2>/dev/null", "w");
+  if (f == NULL) return;
+  fwrite(data, 1, len, f);
+  pclose(f);
+}
+
+static bool clipboard_read(output * o) {
+  FILE * f = popen("pbpaste 2>/dev/null", "r");
+  if (f == NULL) return false;
+  char buf[1024];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out_add(o, buf, n);
+  pclose(f);
+  return o->len > 0;
+}
+
 static buffer * active_buffer(edit_state * e) {
   return &e->buffers[e->panes[e->active_pane].buffer];
 }
@@ -712,6 +751,7 @@ static bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
   if (end <= start) return false;
   output * k = kill_entry(e, e->last_action == ACTION_KILL);
   for (size_t i = start; i < end; i++) out_add(k, &(char){buffer_at(b, i)}, 1);
+  clipboard_write(k->data, k->len);
   e->last_action = ACTION_KILL;
   return true;
 }
@@ -732,22 +772,19 @@ static void history_truncate(buffer * b) {
   b->n_history = b->undo_at;
 }
 
-static void history_drop_oldest_group(buffer * b) {
-  if (b->n_history == 0) return;
-  unsigned group = b->history[0].group;
-  int n = 0;
-  while (n < b->n_history && b->history[n].group == group) n++;
-  for (int i = 0; i < n; i++) history_free_one(&b->history[i]);
-  memmove(b->history, b->history + n, (size_t) (b->n_history - n) * sizeof(history));
-  b->n_history -= n;
-  b->undo_at = (b->undo_at > n) ? b->undo_at - n : 0;
-  b->clean_at = (b->clean_at >= n) ? b->clean_at - n : -1;
-  buffer_refresh_dirty(b);
+static int history_grow(buffer * b) {
+  if (b->n_history < b->history_cap) return 0;
+  int cap = b->history_cap ? b->history_cap * 2 : HISTORY_INITIAL;
+  history * h = realloc(b->history, (size_t) cap * sizeof(history));
+  if (h == NULL) return -1;
+  b->history = h;
+  b->history_cap = cap;
+  return 0;
 }
 
 static int history_add(buffer * b, int kind, size_t pos,
                        const char * text, size_t len, unsigned group) {
-  while (b->n_history >= HISTORY_MAX) history_drop_oldest_group(b);
+  if (history_grow(b) != 0) return -1;
   history * h = &b->history[b->n_history];
   h->text = malloc(len ? len : 1);
   if (h->text == NULL) return -1;
@@ -1236,6 +1273,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
     if (ev.n_raw == 2 && ev.raw[0] == 0xc6 && ev.raw[1] == 0x92) ev.key = KEY_META('f');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0xab) ev.key = KEY_META('b');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x82) ev.key = KEY_META('d');
+    else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x91) ev.key = KEY_META('w');
     else if (ev.n_raw == 3 && ev.raw[0] == 0xe2 && ev.raw[1] == 0x88 && ev.raw[2] == 0x9a) ev.key = KEY_META('v');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xc2 && ev.raw[1] == 0xae) ev.key = KEY_META('r');
     else if (ev.n_raw == 2 && ev.raw[0] == 0xcb && ev.raw[1] == 0x9c) ev.key = KEY_META('n');
@@ -1389,8 +1427,7 @@ static void paint_search(edit_state * e, const char * line, size_t len,
   for (size_t from = 0; from < len;) {
     int a = -1;
     int z = -1;
-    match(e->search, line + from, &a, &z);
-    if (a < 0) return;
+    if (smart_match(e->search, line + from, len - from, &a, &z) != 1) return;
 
     size_t s = from + (size_t) a;
     size_t t = from + (size_t) z;
@@ -2373,18 +2410,42 @@ static int cmd_cut_region(edit_state * e, int key) {
   return 0;
 }
 
+static int cmd_copy_region(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  size_t start;
+  size_t end;
+  if (! region_range(p, &start, &end)) return action_other(e), set_status(e, "no region"), 0;
+  kill_push(e, b, start, end);
+  clear_mark(e);
+  set_status(e, "copied");
+  (void) key;
+  return 0;
+}
+
 static int cmd_yank(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
-  if (e->n_kills == 0) return action_other(e), set_status(e, "no kill"), 0;
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
-  output * k = &e->kill_ring[e->kill_head];
-  if (edit_insert(e, p->cursor, k->data, k->len, ++b->history_group, true) == 0) {
+  output clip = {0};
+  output * k = e->n_kills > 0 ? &e->kill_ring[e->kill_head] : NULL;
+  bool from_clip = clipboard_read(&clip) &&
+    (k == NULL || clip.len != k->len || memcmp(clip.data, k->data, k->len) != 0);
+  if (! from_clip && k == NULL) {
+    free(clip.data);
+    return action_other(e), set_status(e, "no kill"), 0;
+  }
+  output * y = from_clip ? &clip : k;
+  if (edit_insert(e, p->cursor, y->data, y->len, ++b->history_group, true) == 0) {
     e->yank_start = p->cursor;
-    e->yank_len = k->len;
-    e->yank_index = e->kill_head;
-    p->cursor += k->len;
-  } else return action_other(e), 0;
+    e->yank_len = y->len;
+    e->yank_index = from_clip ? -1 : e->kill_head;
+    p->cursor += y->len;
+  } else {
+    free(clip.data);
+    return action_other(e), 0;
+  }
+  free(clip.data);
   p->preferred_col = SIZE_MAX;
   clear_mark(e);
   e->last_action = ACTION_YANK;
@@ -2489,6 +2550,30 @@ static int cmd_paste(edit_state * e) {
   int rc = insert_text(e, o.data, o.len);
   free(o.data);
   return rc;
+}
+
+static void prompt_add(char * prompt, size_t * len, const char * data, size_t n) {
+  for (size_t i = 0; i < n && *len + 1 < STATUS_SIZE; i++) {
+    if (data[i] == '\0') continue;
+    prompt[(*len)++] = data[i];
+  }
+  prompt[*len] = '\0';
+}
+
+static bool prompt_yank(char * prompt, size_t * len) {
+  output o = {0};
+  bool ok = clipboard_read(&o);
+  if (ok) prompt_add(prompt, len, o.data, o.len);
+  free(o.data);
+  return ok;
+}
+
+static bool prompt_paste(char * prompt, size_t * len, edit_state * e) {
+  output o = read_paste(e);
+  bool ok = o.len > 0;
+  prompt_add(prompt, len, o.data, o.len);
+  free(o.data);
+  return ok;
 }
 
 static bool fallback_text_byte(char c) {
@@ -3075,13 +3160,15 @@ static const char HELP_TEXT[] =
   "  C-d, Esc d                        delete next character or word\n"
   "  C-k                               cut to end of line\n"
   "  C-o                               insert newline after point\n"
-  "  C-space, C-w, C-y, Esc y          mark, cut region, paste, cycle paste\n"
+  "  C-space, C-w, Esc w               mark, cut region, copy region\n"
+  "  C-y, Esc y                        paste clipboard/kill, cycle paste\n"
   "  C-q                               insert next key literally\n"
   "  C-/, C-_, C-x u                   undo\n"
   "  C-c C-r                           toggle read only\n"
   "\n"
   "Search\n"
   "  C-s, C-r                          search forward and reverse\n"
+  "  invalid regex                     search as literal text\n"
   "  C-s/C-r again                     repeat search\n"
   "  Esc %                             query replace\n"
   "  Enter                             accept search\n"
@@ -3164,6 +3251,7 @@ static binding bindings[] = {
   {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_META('%'), 0}, 1, cmd_replace},
+  {{KEY_META('w'), 0}, 1, cmd_copy_region},
   {{KEY_META('y'), 0}, 1, cmd_yank_pop},
   {{KEY_META('<'), 0}, 1, cmd_file_start},
   {{KEY_META('>'), 0}, 1, cmd_file_end},
@@ -3235,13 +3323,20 @@ static int search_dispatch(edit_state * e, int key) {
     e->search_reuse = false;
     return 0;
   }
-  if (e->search_reuse && key >= 32 && key < 127) {
+  if (e->search_reuse &&
+      (key == KEY_CTRL('y') || key == KEY_PASTE_START || (key >= 32 && key < 127))) {
     e->search_len = 0;
     e->search[0] = '\0';
     e->search_reuse = false;
   }
   if (key == KEY_BACKSPACE && e->search_len > 0) {
     e->search[--e->search_len] = '\0';
+    e->search_reuse = false;
+  } else if (key == KEY_CTRL('y')) {
+    prompt_yank(e->search, &e->search_len);
+    e->search_reuse = false;
+  } else if (key == KEY_PASTE_START) {
+    prompt_paste(e->search, &e->search_len, e);
     e->search_reuse = false;
   } else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
     e->search[e->search_len++] = (char) key;
@@ -3261,6 +3356,8 @@ static int replace_dispatch(edit_state * e, int key) {
       return 0;
     }
     if (key == KEY_BACKSPACE && e->search_len > 0) e->search[--e->search_len] = '\0';
+    else if (key == KEY_CTRL('y')) prompt_yank(e->search, &e->search_len);
+    else if (key == KEY_PASTE_START) prompt_paste(e->search, &e->search_len, e);
     else if (key >= 32 && key < 127 && e->search_len + 1 < sizeof(e->search)) {
       e->search[e->search_len++] = (char) key;
       e->search[e->search_len] = '\0';
@@ -3271,6 +3368,8 @@ static int replace_dispatch(edit_state * e, int key) {
   if (e->replace_phase == REPLACE_WITH) {
     if (key == KEY_ENTER) return replace_find(e, active_pane(e)->cursor);
     if (key == KEY_BACKSPACE && e->replace_len > 0) e->replace[--e->replace_len] = '\0';
+    else if (key == KEY_CTRL('y')) prompt_yank(e->replace, &e->replace_len);
+    else if (key == KEY_PASTE_START) prompt_paste(e->replace, &e->replace_len, e);
     else if (key >= 32 && key < 127 && e->replace_len + 1 < sizeof(e->replace)) {
       e->replace[e->replace_len++] = (char) key;
       e->replace[e->replace_len] = '\0';
@@ -3407,6 +3506,9 @@ static int tui(const char * path) {
         debug_log_state(&e, "before");
         action = "debug-start";
       } else action = "debug-already-recording";
+    } else if (key == KEY_PASTE_START && (e.search_prompt || e.replace_phase)) {
+      dispatch(&e, key);
+      action = "prompt-paste";
     } else if (key == KEY_PASTE_START) {
       cmd_paste(&e);
       action = "paste";
@@ -3443,7 +3545,7 @@ static int tui(const char * path) {
 }
 
 static int cli_print(const char * range, const char * path) {
-  buffer b;
+  buffer b = {0};
   if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
   size_t start;
   size_t end;
@@ -3460,7 +3562,7 @@ static int cli_print(const char * range, const char * path) {
 }
 
 static int cli_search(const char * point, const char * regex, const char * path) {
-  buffer b;
+  buffer b = {0};
   if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
   size_t from;
   size_t start = 0;
@@ -3490,7 +3592,7 @@ static int cli_search(const char * point, const char * regex, const char * path)
 
 static int cli_change(const char * op, const char * point_or_range,
                       const char * text, const char * path) {
-  buffer b;
+  buffer b = {0};
   if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
 
   size_t n = 0;
