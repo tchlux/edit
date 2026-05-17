@@ -39,9 +39,10 @@ point to the end of the file. In the replacement loop, `Space` replaces the
 current match, `n` skips it, and `!` replaces the current and remaining
 matches. Replacement highlights clear when the scan finishes.
 
-`C-x C-f` stores recent files in `$HOME/.edit/recent`; set `EDIT_RECENT` to
-override that path. Open files are tracked as virtual session buffers; killing
-the last file switches to an in-memory `*scratch*` buffer.
+`C-x C-f` starts at the current file's parent directory and stores opened files
+in `$HOME/.edit/recent`; set `EDIT_RECENT` to override that path. Open files
+are tracked as virtual session buffers; killing the last file switches to an
+in-memory `*scratch*` buffer.
 
 Literal tabs display at width 3 by default; set `EDIT_TAB_WIDTH` to another
 positive integer. Pressing `Tab` inserts spaces, using 2 spaces for JavaScript

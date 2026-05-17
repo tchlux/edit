@@ -24,9 +24,9 @@ Completed work:
 - Debug tooling: `Esc r` TUI recording with terminal size, raw key bytes,
   decoded keys, state snapshots, ANSI render bytes, and final user note; plus a
   standalone `keydump.sh` terminal byte inspector for macOS Option diagnosis.
-- Recent files: `C-x C-f` find-file prompt, fast reopen of the most recent
-  different file, and global `$HOME/.edit/recent` history with `EDIT_RECENT`
-  override for tests/debugging.
+- Find files: `C-x C-f` starts at the current file's parent directory and
+  stores global `$HOME/.edit/recent` history with `EDIT_RECENT` override for
+  tests/debugging.
 - Configurable tab display and insertion: literal tabs render at
   `EDIT_TAB_WIDTH` columns with a default of 3, `Tab` inserts spaces, and
   `C-q Tab` inserts a literal tab.

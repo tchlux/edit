@@ -832,14 +832,18 @@ printf 'gamma\n' > "$dir/gamma"
 mkdir "$dir/sub"
 printf 'child\n' > "$dir/sub/child"
 
+python3 ./tui_view.py 5:200 '^x^f' "$dir/a" > "$out"
+grep -Fq "find.file:.$dir/" "$out"
+
 ./edit --render-keys 5:30 xk "$dir/a" > "$out"
 grep -q '\*scratch\*' "$out"
 
 printf '%s\n' "$dir/b" > "$recent"
 ./edit --render-keys 5:50 "xf
-xk" "$dir/a" > "$out"
+" "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+grep -q 'open failed' "$out"
 
 printf 'alpha\n' > "$dir/a"
 ./edit --render-keys 5:30 Xxk "$dir/a" > "$out"
@@ -873,8 +877,8 @@ python3 ./tui_view.py 5:80 '^x^f
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
 
-python3 ./tui_view.py 5:100 "^x^f$dir/b
-^x^f$dir/gamma
+python3 ./tui_view.py 5:100 "^x^fb
+^x^fgamma
 <c-x>b<c-x>3<c-x>o<c-x>b<c-x>b<c-x>o<c-x>b" "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *beta*gamma*) ;; *) exit 1;; esac
@@ -892,31 +896,32 @@ test ! -e '*scratch*'
 grep -q 'scratch not saved' "$out"
 test ! -e '*scratch*'
 
+printf 'alpha\n' > "$dir/a"
 printf '%s\n' "$dir/b" > "$recent"
 python3 ./tui_view.py 5:50 '^x^f
 ' "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
 grep -q "^$dir/a$" "$recent"
 grep -q "^$dir/b$" "$recent"
 
 printf '' > "$recent"
-python3 ./tui_view.py 5:50 "^x^f$dir/b
+python3 ./tui_view.py 5:50 "^x^fb
 " "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
 
-python3 ./tui_view.py 5:50 "^x^f$dir/ga<tab>
+python3 ./tui_view.py 5:50 "^x^fga<tab>
 " "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *gamma*) ;; *) exit 1;; esac
 
-python3 ./tui_view.py 5:50 "^x^f$dir/su<tab>child
+python3 ./tui_view.py 5:50 "^x^fsu<tab>child
 " "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *child*) ;; *) exit 1;; esac
 
-python3 ./tui_view.py 5:70 "^x^f$dir/<tab>" "$dir/a" > "$out"
+python3 ./tui_view.py 5:70 "^x^f<tab>" "$dir/a" > "$out"
 grep -q 'gamma' "$out"
 grep -q 'sub/' "$out"
 
@@ -925,8 +930,8 @@ printf 'alpha\n' > "$dir/a"
 python3 ./tui_view.py 5:50 'X^x^f
 ' "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"
-case "$(cat "$tmp.head")" in *beta*) ;; *) exit 1;; esac
-printf 'Xalpha\n' | cmp -s - "$dir/a"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+printf 'alpha\n' | cmp -s - "$dir/a"
 
 home="$dir/home"
 mkdir "$home"

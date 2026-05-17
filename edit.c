@@ -168,7 +168,6 @@ struct edit_state {
   size_t replace_start;
   size_t replace_end;
   bool find_prompt;
-  bool find_reuse;
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
   char status[STATUS_SIZE];
@@ -1059,24 +1058,6 @@ static int recent_path(char * out, size_t n, bool create) {
   return snprintf(out, n, "%s/.edit/recent", home) < (int) n ? 0 : -1;
 }
 
-static int recent_other(const char * current, char * out, size_t n) {
-  char path[DEBUG_PATH_SIZE];
-  char line[DEBUG_PATH_SIZE];
-  if (recent_path(path, sizeof(path), false) != 0) return -1;
-  FILE * f = fopen(path, "r");
-  if (f == NULL) return -1;
-  while (fgets(line, sizeof(line), f) != NULL) {
-    chomp(line);
-    if (line[0] != '\0' && strcmp(line, current) != 0) {
-      int rc = snprintf(out, n, "%s", line) < (int) n ? 0 : -1;
-      fclose(f);
-      return rc;
-    }
-  }
-  fclose(f);
-  return -1;
-}
-
 static int recent_save(const char * path) {
   char recent[DEBUG_PATH_SIZE];
   char lines[RECENT_MAX][DEBUG_PATH_SIZE];
@@ -1135,7 +1116,6 @@ static bool directory_path(const char * path) {
 static void find_set(edit_state * e, const char * path) {
   snprintf(e->find_path, sizeof(e->find_path), "%s", path);
   e->find_len = strlen(e->find_path);
-  e->find_reuse = false;
 }
 
 static int find_complete(edit_state * e) {
@@ -2850,24 +2830,28 @@ static int open_find_path(edit_state * e) {
     e->find_prompt = false;
     return set_status(e, "bad path"), 0;
   }
+  if (directory_path(path)) {
+    e->find_prompt = false;
+    return set_status(e, "open failed"), 0;
+  }
 
   e->find_prompt = false;
-  e->find_reuse = false;
   return switch_to_path(e, path);
 }
 
 static int cmd_find_file(edit_state * e, int key) {
   char current[DEBUG_PATH_SIZE];
   (void) key;
+  e->find_path[0] = '\0';
   if (active_buffer(e)->kind == BUFFER_FILE &&
-      path_absolute(active_buffer(e)->path, current, sizeof(current)) == 0 &&
-      recent_other(current, e->find_path, sizeof(e->find_path)) == 0) {
-  } else {
-    e->find_path[0] = '\0';
+      path_absolute(active_buffer(e)->path, current, sizeof(current)) == 0) {
+    char * slash = strrchr(current, '/');
+    if (slash != NULL)
+      snprintf(e->find_path, sizeof(e->find_path), "%.*s",
+               (int) (slash - current + 1), current);
   }
   e->find_len = strlen(e->find_path);
   e->find_prompt = true;
-  e->find_reuse = e->find_len > 0;
   set_status(e, "find file: %s", e->find_path);
   return 0;
 }
@@ -3097,7 +3081,6 @@ static int cmd_cancel(edit_state * e, int key) {
   e->search[0] = '\0';
   replace_clear(e);
   e->find_prompt = false;
-  e->find_reuse = false;
   e->quit_confirm = false;
   clear_mark(e);
   set_status(e, "cancel");
@@ -3319,14 +3302,8 @@ static int find_dispatch(edit_state * e, int key) {
   e->footer[0] = '\0';
   if (key == KEY_ENTER) return open_find_path(e);
   if (key == KEY_CTRL('i')) return find_complete(e);
-  if (e->find_reuse && key >= 32 && key < 127) {
-    e->find_len = 0;
-    e->find_path[0] = '\0';
-    e->find_reuse = false;
-  }
   if (key == KEY_BACKSPACE && e->find_len > 0) {
     e->find_path[--e->find_len] = '\0';
-    e->find_reuse = false;
   } else if (key >= 32 && key < 127 && e->find_len + 1 < sizeof(e->find_path)) {
     e->find_path[e->find_len++] = (char) key;
     e->find_path[e->find_len] = '\0';
