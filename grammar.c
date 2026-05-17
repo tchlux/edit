@@ -159,6 +159,12 @@ static void _clear(const char ** sgrs, size_t len, size_t start, size_t end) {
   for (size_t i = start; i < end; i++) sgrs[i] = NULL;
 }
 
+static void _attr(int * attrs, size_t len, size_t start, size_t end, int attr) {
+  if (start > len) start = len;
+  if (end > len) end = len;
+  for (size_t i = start; i < end; i++) attrs[i] |= attr;
+}
+
 static int _word_start(char c) {
   return isalpha((unsigned char) c) || c == '_';
 }
@@ -432,7 +438,7 @@ static void _document_notes(grammar * g, const char * line, size_t len,
 }
 
 static void _markdown_inline(grammar * g, const char * line, size_t len,
-                             const char ** sgrs) {
+                             const char ** sgrs, int * attrs) {
   for (size_t i = 0; i < len; i++) {
     if (line[i] == '`') {
       size_t j = i + 1;
@@ -457,11 +463,15 @@ static void _markdown_inline(grammar * g, const char * line, size_t len,
       }
     } else if (line[i] == '*' || line[i] == '_') {
       char c = line[i];
-      size_t n = (i + 1 < len && line[i+1] == c) ? 2 : 1;
+      size_t n = (i + 2 < len && line[i+1] == c && line[i+2] == c) ? 3 :
+        (i + 1 < len && line[i+1] == c) ? 2 : 1;
       size_t j = i + n;
       while (j + n <= len && memcmp(line + j, line + i, n) != 0) j++;
       if (j > i + n && j + n <= len) {
+        int attr = (n & 1 ? GRAMMAR_ATTR_ITALIC : 0) |
+          (n >= 2 ? GRAMMAR_ATTR_BOLD : 0);
         _paint(sgrs, len, i, i + n, _sgr(g, "decorator"));
+        _attr(attrs, len, i + n, j, attr);
         _paint(sgrs, len, j, j + n, _sgr(g, "decorator"));
         i = j + n - 1;
       }
@@ -470,7 +480,7 @@ static void _markdown_inline(grammar * g, const char * line, size_t len,
 }
 
 static void _document_highlight(grammar * g, const char * path, const char * line,
-                                size_t len, const char ** sgrs) {
+                                size_t len, const char ** sgrs, int * attrs) {
   int markdown = _markdown_path(path);
   size_t i = _lead(line, len);
 
@@ -499,7 +509,7 @@ static void _document_highlight(grammar * g, const char * path, const char * lin
 
   _document_urls(g, line, len, sgrs);
   _document_notes(g, line, len, sgrs);
-  if (markdown) _markdown_inline(g, line, len, sgrs);
+  if (markdown) _markdown_inline(g, line, len, sgrs, attrs);
 }
 
 static void _default_highlight(grammar * g, const char * line, size_t len,
@@ -631,16 +641,18 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
   if (len == 0 || max_spans <= 0) return 0;
   char * text = malloc(len + 1);
   const char ** sgrs = calloc(len, sizeof(*sgrs));
-  if (text == NULL || sgrs == NULL) {
+  int * attrs = calloc(len, sizeof(*attrs));
+  if (text == NULL || sgrs == NULL || attrs == NULL) {
     free(text);
     free(sgrs);
+    free(attrs);
     return -1;
   }
   memcpy(text, line, len);
   text[len] = '\0';
 
   if (g->is_default && (_markdown_path(path) || _text_path(path)))
-    _document_highlight(g, path, line, len, sgrs);
+    _document_highlight(g, path, line, len, sgrs, attrs);
   else if (g->is_default)
     _default_highlight(g, line, len, sgrs);
   for (int i = 0; !g->is_default && i < g->n_rules; i++) {
@@ -661,16 +673,19 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
 
   int n_spans = 0;
   for (size_t i = 0; i < len && n_spans < max_spans; i++) {
-    if (sgrs[i] == NULL) continue;
+    if (sgrs[i] == NULL && attrs[i] == 0) continue;
     spans[n_spans].start = i;
     spans[n_spans].sgr = sgrs[i];
-    while (i < len && sgrs[i] == spans[n_spans].sgr) i++;
+    spans[n_spans].attr = attrs[i];
+    while (i < len && sgrs[i] == spans[n_spans].sgr &&
+           attrs[i] == spans[n_spans].attr) i++;
     spans[n_spans].end = i--;
     n_spans++;
   }
 
   free(text);
   free(sgrs);
+  free(attrs);
   return n_spans;
 }
 

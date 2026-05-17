@@ -168,6 +168,14 @@ grep -F -q "$(printf '%s[38;2;170;255;170m`code`%s[0m' "$esc" "$esc")" "$out"
 grep -F -q "$(printf '%s[38;2;170;255;170mreturn 0;%s[0m' "$esc" "$esc")" "$out"
 grep -F -q "$(printf '%s[38;2;255;150;170mTODO%s[0m' "$esc" "$esc")" "$out"
 
+printf '*word*\n**word**\n***word***\n*TODO*\n*open\n' > "$md"
+./edit --render-color 7:80 "$md" > "$out"
+grep -F -q "$(printf '%s[38;2;255;140;255m*%s[0m%s[3mword%s[0m%s[38;2;255;140;255m*' "$esc" "$esc" "$esc" "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;140;255m**%s[0m%s[1mword%s[0m%s[38;2;255;140;255m**' "$esc" "$esc" "$esc" "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;140;255m***%s[0m%s[1;3mword%s[0m%s[38;2;255;140;255m***' "$esc" "$esc" "$esc" "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[3;38;2;255;150;170mTODO%s[0m' "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[3mopen' "$esc")" "$out"; then exit 1; fi
+
 txt="$dir/sample.txt"
 printf 'for class return\n- item\n> quote\nTODO: see https://example.com\n' > "$txt"
 ./edit --render-color 6:80 "$txt" > "$out"

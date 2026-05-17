@@ -24,6 +24,8 @@
 #define GRAMMAR_SGR_SIZE 32
 #define GRAMMAR_REGEX_SIZE 256
 #define GRAMMAR_MAX_SPANS 256
+#define GRAMMAR_ATTR_BOLD 1
+#define GRAMMAR_ATTR_ITALIC 2
 
 typedef struct {
   char scope[GRAMMAR_SCOPE_SIZE];
@@ -50,6 +52,7 @@ typedef struct {
   size_t start;
   size_t end;
   const char * sgr;
+  int attr;
 } grammar_span;
 
 void grammar_load_default(grammar * g);

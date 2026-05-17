@@ -1493,9 +1493,29 @@ static void render_base_sgr(edit_state * e, output * o) {
   else out_s(o, "\x1b[0m");
 }
 
-static void render_span_sgr(edit_state * e, output * o, const char * sgr) {
-  if (e->raw) out_f(o, "\x1b[0;%s;%sm", BASE_SGR, sgr);
-  else out_f(o, "\x1b[%sm", sgr);
+static void render_span_sgr(edit_state * e, output * o, const char * sgr,
+                            int attr) {
+  if (e->raw) {
+    out_f(o, "\x1b[0;%s", BASE_SGR);
+    if (attr & GRAMMAR_ATTR_BOLD) out_s(o, ";1");
+    if (attr & GRAMMAR_ATTR_ITALIC) out_s(o, ";3");
+    if (sgr != NULL) out_f(o, ";%s", sgr);
+    out_s(o, "m");
+    return;
+  }
+
+  const char * sep = "";
+  out_s(o, "\x1b[");
+  if (attr & GRAMMAR_ATTR_BOLD) {
+    out_s(o, "1");
+    sep = ";";
+  }
+  if (attr & GRAMMAR_ATTR_ITALIC) {
+    out_f(o, "%s3", sep);
+    sep = ";";
+  }
+  if (sgr != NULL) out_f(o, "%s%s", sep, sgr);
+  out_s(o, "m");
 }
 
 static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
@@ -1521,6 +1541,7 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
     grammar_highlight(&e->grammar, b->path, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
   int span = 0;
   const char * color = NULL;
+  int attr = 0;
 
   for (size_t i = 0; i < n; i++) search_sgrs[i] = NULL;
   paint_search(e, line, n, start, search_sgrs);
@@ -1536,17 +1557,24 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
       col += width;
       continue;
     }
-    const char * sgr = region_byte(p, start + i) ? REGION_SGR : search_sgrs[i] ? search_sgrs[i] :
-      (span < n_spans && i >= spans[span].start) ? spans[span].sgr : NULL;
-    if (sgr != color) {
+    const char * sgr = NULL;
+    int new_attr = 0;
+    if (region_byte(p, start + i)) sgr = REGION_SGR;
+    else if (search_sgrs[i] != NULL) sgr = search_sgrs[i];
+    else if (span < n_spans && i >= spans[span].start) {
+      sgr = spans[span].sgr;
+      new_attr = spans[span].attr;
+    }
+    if (sgr != color || new_attr != attr) {
       if (e->raw) {
-        if (sgr != NULL) render_span_sgr(e, o, sgr);
+        if (sgr != NULL || new_attr != 0) render_span_sgr(e, o, sgr, new_attr);
         else render_base_sgr(e, o);
       } else {
-        if (color != NULL) render_base_sgr(e, o);
-        if (sgr != NULL) render_span_sgr(e, o, sgr);
+        if (color != NULL || attr != 0) render_base_sgr(e, o);
+        if (sgr != NULL || new_attr != 0) render_span_sgr(e, o, sgr, new_attr);
       }
       color = sgr;
+      attr = new_attr;
     }
 
     if ((unsigned char) c < 32) c = ' ';
@@ -1557,7 +1585,7 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
     }
     col += width;
   }
-  if (color != NULL) render_base_sgr(e, o);
+  if (color != NULL || attr != 0) render_base_sgr(e, o);
 }
 
 static void render_line(edit_state * e, output * o, size_t * pos) {
