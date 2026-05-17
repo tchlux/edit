@@ -920,6 +920,35 @@ python3 ./tui_view.py 5:50 "^x^fga<tab>
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *gamma*) ;; *) exit 1;; esac
 
+printf 'source\n' > "$dir/alpha.c"
+printf 'header\n' > "$dir/beta.c"
+python3 ./tui_view.py 5:80 "^x^f.*[.]c<tab>" "$dir/a" > "$out"
+grep -q 'alpha.c' "$out"
+grep -q 'beta.c' "$out"
+
+python3 ./tui_view.py 5:50 "^x^fg.*a
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *gamma*) ;; *) exit 1;; esac
+
+printf 'gamut\n' > "$dir/gamut"
+python3 ./tui_view.py 5:80 "^x^fg.*
+" "$dir/a" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *alpha*) ;; *) exit 1;; esac
+grep -q 'gamma' "$out"
+grep -q 'gamut' "$out"
+rm -f "$dir/gamut"
+
+special_dir="$dir/a[bc]*"
+mkdir "$special_dir"
+printf 'start\n' > "$special_dir/start"
+printf 'matched\n' > "$special_dir/only.c"
+python3 ./tui_view.py 5:100 "^x^f.*[.]c
+" "$special_dir/start" > "$out"
+sed -n '1p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *matched*) ;; *) exit 1;; esac
+
 python3 ./tui_view.py 5:50 "^x^fsu<tab>child
 " "$dir/a" > "$out"
 sed -n '1p' "$out" > "$tmp.head"

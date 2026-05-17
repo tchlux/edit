@@ -1107,6 +1107,10 @@ static bool starts_with(const char * s, const char * prefix) {
   return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+static bool regex_path(const char * s) {
+  return strpbrk(s, ".*?|()[]{}") != NULL;
+}
+
 static void common_prefix(char * s, const char * t) {
   size_t i = 0;
   while (s[i] != '\0' && t[i] != '\0' && s[i] == t[i]) i++;
@@ -1139,6 +1143,14 @@ static void find_set(edit_state * e, const char * path) {
   e->find_len = strlen(e->find_path);
 }
 
+static bool find_name_matches(const char * name, const char * base, bool regex) {
+  int start = -1;
+  int end = -1;
+  if (base[0] == '\0') return true;
+  return regex ? smart_match(base, name, strlen(name), &start, &end) == 1 :
+    starts_with(name, base);
+}
+
 static int find_complete(edit_state * e) {
   char dir[DEBUG_PATH_SIZE];
   char prefix[DEBUG_PATH_SIZE];
@@ -1148,14 +1160,15 @@ static int find_complete(edit_state * e) {
   int n = 0;
 
   path_parts(e->find_path, dir, prefix, base);
+  bool regex = regex_path(base);
   DIR * d = opendir(dir);
   if (d == NULL) return set_status(e, "no such directory"), 0;
 
   for (struct dirent * ent = readdir(d); ent != NULL; ent = readdir(d)) {
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-    if (! starts_with(ent->d_name, base)) continue;
+    if (! find_name_matches(ent->d_name, base, regex)) continue;
     if (n == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
-    else common_prefix(match, ent->d_name);
+    else if (! regex) common_prefix(match, ent->d_name);
     char path[DEBUG_PATH_SIZE];
     size_t used = strlen(list);
     snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
@@ -1167,6 +1180,7 @@ static int find_complete(edit_state * e) {
 
   if (n == 0) return set_footer(e, "no match"), 0;
   if (base[0] == '\0') return set_footer(e, "%s", list[0] ? list : "empty directory"), 0;
+  if (regex && n > 1) return set_footer(e, "%s", list), 0;
 
   char path[DEBUG_PATH_SIZE];
   snprintf(path, sizeof(path), "%s%s", prefix, match);
@@ -2851,11 +2865,48 @@ static int open_find_path(edit_state * e) {
     e->find_prompt = false;
     return set_status(e, "bad path"), 0;
   }
-  if (directory_path(path)) {
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    if (! S_ISDIR(st.st_mode)) {
+      e->find_prompt = false;
+      return switch_to_path(e, path);
+    }
     e->find_prompt = false;
     return set_status(e, "open failed"), 0;
   }
+  char dir[DEBUG_PATH_SIZE];
+  char prefix[DEBUG_PATH_SIZE];
+  char base[DEBUG_PATH_SIZE];
+  path_parts(path, dir, prefix, base);
+  if (! regex_path(base)) {
+    e->find_prompt = false;
+    return switch_to_path(e, path);
+  }
 
+  char match[DEBUG_PATH_SIZE] = "";
+  char list[STATUS_SIZE] = "";
+  int n = 0;
+  DIR * d = opendir(dir);
+  if (d == NULL) return set_status(e, "no such directory"), 0;
+  for (struct dirent * ent = readdir(d); ent != NULL; ent = readdir(d)) {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+    if (! find_name_matches(ent->d_name, base, true)) continue;
+    if (n++ == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
+    size_t used = strlen(list);
+    snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
+    snprintf(list + used, sizeof(list) - used, "%s%s%s",
+             used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
+  }
+  closedir(d);
+  if (n == 0) return set_footer(e, "no match"), 0;
+  if (n > 1) return set_footer(e, "%s", list), 0;
+
+  snprintf(path, sizeof(path), "%s%s", prefix, match);
+  if (directory_path(path)) {
+    if (strlen(path) + 1 < sizeof(path)) strcat(path, "/");
+    find_set(e, path);
+    return set_status(e, "find file: %s", e->find_path), 0;
+  }
   e->find_prompt = false;
   return switch_to_path(e, path);
 }
