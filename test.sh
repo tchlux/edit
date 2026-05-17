@@ -589,6 +589,10 @@ printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:40 xgA "$tmp" > "$out"
 printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 40 "cancel")" | cmp -s - "$out"
 
+python3 ./tui_view.py 4:40 '^g<wait-status>' "$tmp" > "$out"
+grep -q 'C-s/C-r.search,.C-g.cancel,.EscC-h.help' "$out"
+if grep -q 'cancel\.\{10,\}C-h.help' "$out"; then exit 1; fi
+
 printf 'abc\n' > "$tmp"
 ./edit --render-keys 4:20 X "$tmp" > "$out"
 printf 'X|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"

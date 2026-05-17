@@ -170,6 +170,9 @@ def keys(s):
         elif s.startswith("<rewrite>", i):
             out += bytes([254])
             i += 9
+        elif s.startswith("<wait-status>", i):
+            out += bytes([253])
+            i += 13
         elif s[i] == "^" and i + 1 < len(s):
             out += ctrl(s[i + 1].lower())
             i += 2
@@ -204,6 +207,8 @@ def read_tui(path, rows, cols, key_text):
             with open(path, "wb") as f:
                 f.write(b"external reload\n")
             time.sleep(0.1)
+        elif c == 253:
+            time.sleep(3.2)
         else:
             os.write(fd, bytes([c]))
 

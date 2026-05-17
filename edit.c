@@ -70,8 +70,10 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define SEARCH_CURRENT_SGR "48;5;241"
 #define REGION_SGR "7"
 #define SEARCH_BLINK_MS 500
+#define STATUS_TIMEOUT_MS 3000
 #define META_REPEAT_MS 1000
 #define HELP_HINT "C-h help"
+#define DEFAULT_STATUS "C-s/C-r search, C-g cancel, Esc r debug"
 #define REPLACE_SEARCH 1
 #define REPLACE_WITH 2
 #define REPLACE_QUERY 3
@@ -171,6 +173,7 @@ struct edit_state {
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
   char status[STATUS_SIZE];
+  long long status_ms;
   char footer[STATUS_SIZE];
   bool quit;
   bool quit_confirm;
@@ -635,11 +638,29 @@ static void out_f(output * o, const char * fmt, ...) {
   if (n > 0) out_add(o, buf, (size_t) n);
 }
 
+static long long now_ms(void);
+
 static void set_status(edit_state * e, const char * fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(e->status, sizeof(e->status), fmt, ap);
   va_end(ap);
+  e->status_ms = now_ms();
+}
+
+static bool status_busy(edit_state * e) {
+  return e->footer[0] || e->debug_note_prompt || e->find_prompt ||
+    e->search_prompt || e->replace_phase || e->prefix;
+}
+
+static int status_timeout(edit_state * e) {
+  if (status_busy(e) || strcmp(e->status, DEFAULT_STATUS) == 0) return -1;
+  long long left = e->status_ms + STATUS_TIMEOUT_MS - now_ms();
+  return (left > 0) ? (int) left : 0;
+}
+
+static void status_expire(edit_state * e) {
+  if (status_timeout(e) == 0) set_status(e, "%s", DEFAULT_STATUS);
 }
 
 static void set_footer(edit_state * e, const char * fmt, ...) {
@@ -3450,7 +3471,7 @@ static int tui(const char * path) {
   e.panes[0].buffer = 0;
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
-  snprintf(e.status, sizeof(e.status), "C-s/C-r search, C-g cancel, Esc r debug");
+  set_status(&e, "%s", DEFAULT_STATUS);
   if (path_absolute(path, open_path, sizeof(open_path)) != 0)
     snprintf(open_path, sizeof(open_path), "%s", path);
 
@@ -3472,7 +3493,11 @@ static int tui(const char * path) {
   while (! e.quit) {
     auto_reload(&e);
     render(&e);
-    key_event ev = read_key_event(&e, e.search_len > 0 ? SEARCH_BLINK_MS : -1);
+    int timeout = status_timeout(&e);
+    if (e.search_len > 0 && (timeout < 0 || SEARCH_BLINK_MS < timeout))
+      timeout = SEARCH_BLINK_MS;
+    key_event ev = read_key_event(&e, timeout);
+    status_expire(&e);
     const char * action = "ignored";
     int key = ev.key;
     if (e.debug_log != NULL) {
