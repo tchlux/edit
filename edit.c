@@ -105,6 +105,7 @@ typedef struct {
   int n_history;
   int history_cap;
   int undo_at;
+  int redo_end;
   int clean_at;
   unsigned history_group;
   bool dirty;
@@ -246,6 +247,7 @@ static int buffer_blank_kind(buffer * b, const char * path, int kind) {
   b->top = 0;
   b->disk_size = 0;
   b->disk_mtime = 0;
+  b->redo_end = 0;
   b->clean_at = 0;
   b->dirty = false;
   b->read_only = false;
@@ -306,6 +308,7 @@ static int buffer_load(buffer * b, const char * path) {
   }
   b->cursor = 0;
   b->top = 0;
+  b->redo_end = 0;
   b->clean_at = 0;
   b->dirty = false;
   b->read_only = false;
@@ -320,6 +323,7 @@ static void history_free_buffer(buffer * b) {
   b->n_history = 0;
   b->history_cap = 0;
   b->undo_at = 0;
+  b->redo_end = 0;
   b->clean_at = 0;
 }
 
@@ -790,6 +794,7 @@ static void history_truncate(buffer * b) {
   for (int i = b->undo_at; i < b->n_history; i++) history_free_one(&b->history[i]);
   if (b->clean_at > b->undo_at) b->clean_at = -1;
   b->n_history = b->undo_at;
+  b->redo_end = b->undo_at;
 }
 
 static int history_grow(buffer * b) {
@@ -817,12 +822,10 @@ static int history_add(buffer * b, int kind, size_t pos,
   return 0;
 }
 
-static int edit_insert(edit_state * e, size_t pos, const char * text,
-                       size_t len, unsigned group, bool reset_undo) {
+static int edit_insert_raw(edit_state * e, size_t pos, const char * text, size_t len) {
   if (len == 0) return 0;
   int bnum = active_pane(e)->buffer;
   buffer * b = active_buffer(e);
-  if (reset_undo) history_truncate(b);
   if (buffer_insert(b, pos, text, len) != 0) return -1;
   for (int i = 0; i < e->n_panes; i++) {
     if (e->panes[i].buffer != bnum) continue;
@@ -831,9 +834,41 @@ static int edit_insert(edit_state * e, size_t pos, const char * text,
     if (e->panes[i].cursor >= pos) e->panes[i].cursor += len;
     if (e->panes[i].top > pos) e->panes[i].top += len;
   }
+  return 0;
+}
+
+static int edit_insert(edit_state * e, size_t pos, const char * text,
+                       size_t len, unsigned group, bool reset_undo) {
+  if (len == 0) return 0;
+  buffer * b = active_buffer(e);
+  if (reset_undo) history_truncate(b);
+  if (edit_insert_raw(e, pos, text, len) != 0) return -1;
   if (history_add(b, HIST_INSERT, pos, text, len, group) != 0) return -1;
   if (reset_undo) b->undo_at = b->n_history;
+  if (reset_undo) b->redo_end = b->undo_at;
   if (reset_undo) buffer_refresh_dirty(b);
+  return 0;
+}
+
+static int edit_delete_raw(edit_state * e, size_t start, size_t end) {
+  buffer * b = active_buffer(e);
+  size_t len = buffer_len(b);
+  if (start > len) start = len;
+  if (end > len) end = len;
+  if (end <= start) return 0;
+
+  int bnum = active_pane(e)->buffer;
+  size_t n = end - start;
+  buffer_delete(b, start, end);
+  for (int i = 0; i < e->n_panes; i++) {
+    pane * p = &e->panes[i];
+    if (p->buffer != bnum) continue;
+    if (p->mark_active && p->mark > start)
+      p->mark = (p->mark >= end) ? p->mark - n : start;
+    if (i == e->active_pane) continue;
+    if (p->cursor > start) p->cursor = (p->cursor >= end) ? p->cursor - n : start;
+    if (p->top > start) p->top = (p->top >= end) ? p->top - n : start;
+  }
   return 0;
 }
 
@@ -845,26 +880,20 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (end > len) end = len;
   if (end <= start) return 0;
 
-  int bnum = active_pane(e)->buffer;
   if (reset_undo) history_truncate(b);
   size_t n = end - start;
   char * text = malloc(n);
   if (text == NULL) return -1;
   for (size_t i = 0; i < n; i++) text[i] = buffer_at(b, start + i);
-  buffer_delete(b, start, end);
-  for (int i = 0; i < e->n_panes; i++) {
-    pane * p = &e->panes[i];
-    if (p->buffer != bnum) continue;
-    if (p->mark_active && p->mark > start)
-      p->mark = (p->mark >= end) ? p->mark - n : start;
-    if (i == e->active_pane) continue;
-    if (p->cursor > start) p->cursor = (p->cursor >= end) ? p->cursor - n : start;
-    if (p->top > start) p->top = (p->top >= end) ? p->top - n : start;
+  if (edit_delete_raw(e, start, end) != 0) {
+    free(text);
+    return -1;
   }
   int rc = history_add(b, HIST_DELETE, start, text, n, group);
   free(text);
   if (rc != 0) return -1;
   if (reset_undo) b->undo_at = b->n_history;
+  if (reset_undo) b->redo_end = b->undo_at;
   if (reset_undo) buffer_refresh_dirty(b);
   return 0;
 }
@@ -2726,9 +2755,43 @@ static int cmd_undo(edit_state * e, int key) {
     }
   }
   p->preferred_col = SIZE_MAX;
+  if (b->redo_end < end) b->redo_end = end;
   b->undo_at = start;
   buffer_refresh_dirty(b);
   set_status(e, "undo");
+  (void) key;
+  return 0;
+}
+
+static int cmd_redo(edit_state * e, int key) {
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  buffer * b = active_buffer(e);
+  if (b->redo_end <= b->undo_at) {
+    set_status(e, "no redo");
+    (void) key;
+    return 0;
+  }
+
+  int start = b->undo_at;
+  unsigned group = b->history[start].group;
+  int end = start + 1;
+  while (end < b->redo_end && b->history[end].group == group) end++;
+
+  pane * p = active_pane(e);
+  for (int i = start; i < end; i++) {
+    history * h = &b->history[i];
+    if (h->kind == HIST_INSERT) {
+      edit_insert_raw(e, h->pos, h->text, h->len);
+      p->cursor = h->pos + h->len;
+    } else {
+      edit_delete_raw(e, h->pos, h->pos + h->len);
+      p->cursor = h->pos;
+    }
+  }
+  p->preferred_col = SIZE_MAX;
+  b->undo_at = end;
+  buffer_refresh_dirty(b);
+  set_status(e, "redo");
   (void) key;
   return 0;
 }
@@ -3247,6 +3310,7 @@ static const char HELP_TEXT[] =
   "  C-y, Esc y                        paste clipboard/kill, cycle paste\n"
   "  C-q                               insert next key literally\n"
   "  C-/, C-_, C-x u                   undo\n"
+  "  C-x r                             redo\n"
   "  C-c C-r                           toggle read only\n"
   "\n"
   "Search\n"
@@ -3365,6 +3429,7 @@ static binding bindings[] = {
   {{KEY_CTRL('x'), KEY_CTRL('f')}, 2, cmd_find_file},
   {{KEY_CTRL('x'), 'k'}, 2, cmd_kill_buffer},
   {{KEY_CTRL('x'), 'o'}, 2, cmd_other_pane},
+  {{KEY_CTRL('x'), 'r'}, 2, cmd_redo},
   {{KEY_CTRL('x'), KEY_CTRL('s')}, 2, cmd_save},
   {{KEY_CTRL('x'), 'u'}, 2, cmd_undo},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit},

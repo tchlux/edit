@@ -611,6 +611,29 @@ printf 'abc\n' | cmp -s - "$tmp"
 ./edit --render-keys 4:20 Xxu "$tmp" > "$out"
 printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 'X^_^xr^x^s' "$tmp" > "$out"
+printf 'Xabc\n' | cmp -s - "$tmp"
+grep -q 'cursor:1:2' "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 'XY^_^_^xr^xr^x^s' "$tmp" > "$out"
+printf 'XYabc\n' | cmp -s - "$tmp"
+grep -q 'cursor:1:3' "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 '^xr' "$tmp" > "$out"
+grep -q 'no.redo' "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 'X^_Y^xr' "$tmp" > "$out"
+grep -q 'Yabc' "$out"
+grep -q 'no.redo' "$out"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:40 'X^_<c-c>^r^xr' "$tmp" > "$out"
+grep -q 'read.only' "$out"
+
 ./edit --render-keys 4:20 "f${del}" "$tmp" > "$out"
 printf '|bc\n\n%s* 1:1\n%s\n' "$base" "$(foot 20 "")" | cmp -s - "$out"
 
@@ -721,6 +744,7 @@ grep -q 'Esc.v' "$out"
 grep -q 'Esc.w' "$out"
 grep -q 'Esc.y' "$out"
 grep -q 'C-/' "$out"
+grep -q 'C-x.r' "$out"
 grep -q 'C-x.C-c' "$out"
 
 ./edit --render-keys 4:20 hX "$tmp" > "$out"
