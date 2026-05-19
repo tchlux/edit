@@ -850,8 +850,26 @@ printf '' | cmp -s - "$tmp"
 
 printf 'caf\303\251 \342\230\203' > "$tmp.expected"
 printf '' > "$tmp"
-python3 ./tui_view.py 5:40 "<paste>$(cat "$tmp.expected")</paste>^x^s" "$tmp" > "$out" ||
-  grep -q cursor-past-eol "$out"
+python3 ./tui_view.py 5:40 "<paste>$(cat "$tmp.expected")</paste>^x^s" "$tmp" > "$out"
+cmp -s "$tmp.expected" "$tmp"
+
+printf 'ab\342\200\234\342\200\235' > "$tmp"
+python3 ./tui_view.py 5:40 '<opt-gt>' "$tmp" > "$out"
+grep -q 'cursor:1:5' "$out"
+
+printf 'ab\342\200\234\342\200\235X' > "$tmp.expected"
+printf 'ab\342\200\234\342\200\235' > "$tmp"
+python3 ./tui_view.py 5:40 '<opt-gt>X^x^s' "$tmp" > "$out"
+cmp -s "$tmp.expected" "$tmp"
+
+printf 'ab\342\200\234X\342\200\235' > "$tmp.expected"
+printf 'ab\342\200\234\342\200\235' > "$tmp"
+python3 ./tui_view.py 5:40 '<right><right><right>X^x^s' "$tmp" > "$out"
+cmp -s "$tmp.expected" "$tmp"
+
+printf 'ab\342\200\234X\342\200\235' > "$tmp.expected"
+printf 'ab\342\200\234\342\200\235' > "$tmp"
+python3 ./tui_view.py 5:40 '<opt-gt><left>X^x^s' "$tmp" > "$out"
 cmp -s "$tmp.expected" "$tmp"
 
 printf 'alpha\n' > "$dir/a"

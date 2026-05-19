@@ -523,11 +523,58 @@ static size_t tab_stop(edit_state * e, size_t col) {
   return (size_t) e->tab_width - (col % (size_t) e->tab_width);
 }
 
+static bool utf8_cont(buffer * b, size_t pos) {
+  return ((unsigned char) buffer_at(b, pos) & 0xc0) == 0x80;
+}
+
+static size_t utf8_len_at(buffer * b, size_t pos, size_t end) {
+  unsigned char c = (unsigned char) buffer_at(b, pos);
+  if (c < 0x80 || pos >= end) return 1;
+  if (c >= 0xc2 && c <= 0xdf && pos + 1 < end && utf8_cont(b, pos + 1)) return 2;
+  if (pos + 2 < end && c == 0xe0 && (unsigned char) buffer_at(b, pos + 1) >= 0xa0 &&
+      (unsigned char) buffer_at(b, pos + 1) <= 0xbf && utf8_cont(b, pos + 2)) return 3;
+  if (pos + 2 < end && c >= 0xe1 && c <= 0xec && utf8_cont(b, pos + 1) &&
+      utf8_cont(b, pos + 2)) return 3;
+  if (pos + 2 < end && c == 0xed && (unsigned char) buffer_at(b, pos + 1) >= 0x80 &&
+      (unsigned char) buffer_at(b, pos + 1) <= 0x9f && utf8_cont(b, pos + 2)) return 3;
+  if (pos + 2 < end && c >= 0xee && c <= 0xef && utf8_cont(b, pos + 1) &&
+      utf8_cont(b, pos + 2)) return 3;
+  if (pos + 3 < end && c == 0xf0 && (unsigned char) buffer_at(b, pos + 1) >= 0x90 &&
+      (unsigned char) buffer_at(b, pos + 1) <= 0xbf && utf8_cont(b, pos + 2) &&
+      utf8_cont(b, pos + 3)) return 4;
+  if (pos + 3 < end && c >= 0xf1 && c <= 0xf3 && utf8_cont(b, pos + 1) &&
+      utf8_cont(b, pos + 2) && utf8_cont(b, pos + 3)) return 4;
+  if (pos + 3 < end && c == 0xf4 && (unsigned char) buffer_at(b, pos + 1) >= 0x80 &&
+      (unsigned char) buffer_at(b, pos + 1) <= 0x8f && utf8_cont(b, pos + 2) &&
+      utf8_cont(b, pos + 3)) return 4;
+  return 1;
+}
+
+static size_t utf8_next_pos(buffer * b, size_t pos) {
+  size_t len = buffer_len(b);
+  if (pos >= len) return len;
+  return pos + utf8_len_at(b, pos, len);
+}
+
+static size_t utf8_prev_pos(buffer * b, size_t pos) {
+  size_t len = buffer_len(b);
+  if (pos == 0) return 0;
+  if (pos > len) pos = len;
+  size_t start = pos - 1;
+  while (start > 0 && utf8_cont(b, start) && pos - start < 4) start--;
+  if (utf8_len_at(b, start, len) == pos - start) return start;
+  return pos - 1;
+}
+
+static size_t char_width(edit_state * e, buffer * b, size_t pos, size_t col) {
+  return (buffer_at(b, pos) == '\t') ? tab_stop(e, col) : 1;
+}
+
 static size_t visual_col(edit_state * e, buffer * b, size_t start, size_t pos) {
   size_t col = 0;
   while (start < pos && start < buffer_len(b) && buffer_at(b, start) != '\n') {
-    col += (buffer_at(b, start) == '\t') ? tab_stop(e, col) : 1;
-    start++;
+    col += char_width(e, b, start, col);
+    start = utf8_next_pos(b, start);
   }
   return col;
 }
@@ -536,8 +583,8 @@ static size_t visual_column_pos(edit_state * e, buffer * b,
                                 size_t start, size_t preferred) {
   size_t end = line_end(b, start);
   size_t col = 0;
-  for (size_t pos = start; pos < end; pos++) {
-    size_t next = col + ((buffer_at(b, pos) == '\t') ? tab_stop(e, col) : 1);
+  for (size_t pos = start; pos < end; pos = utf8_next_pos(b, pos)) {
+    size_t next = col + char_width(e, b, pos, col);
     if (preferred < next) return pos;
     col = next;
   }
@@ -1592,13 +1639,15 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
 
   size_t col = 0;
   size_t shown = 0;
-  for (size_t i = 0; i < n && shown < limit; i++) {
+  for (size_t i = 0; i < n && shown < limit;) {
     while (span < n_spans && i >= spans[span].end)
       span++;
     char c = line[i];
-    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    size_t bytes = utf8_len_at(b, start + i, start + n);
+    size_t width = char_width(e, b, start + i, col);
     if (col + width <= skip) {
       col += width;
+      i += bytes;
       continue;
     }
     const char * sgr = NULL;
@@ -1621,13 +1670,16 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
       attr = new_attr;
     }
 
-    if ((unsigned char) c < 32) c = ' ';
-    for (size_t j = (skip > col) ? skip - col : 0;
-         j < width && shown < limit; j++, shown++) {
-      char out = (c == '\t') ? ' ' : c;
-      out_add(o, &out, 1);
+    size_t j = (skip > col) ? skip - col : 0;
+    if (c == '\t')
+      for (; j < width && shown < limit; j++, shown++) out_s(o, " ");
+    else if (shown < limit) {
+      if ((unsigned char) c < 32) out_s(o, " ");
+      else out_add(o, line + i, bytes);
+      shown++;
     }
     col += width;
+    i += bytes;
   }
   if (color != NULL || attr != 0) render_base_sgr(e, o);
 }
@@ -1805,20 +1857,24 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, size_t * pos,
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') &&
          shown < limit) {
     char c = buffer_at(b, *pos);
-    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    size_t bytes = utf8_len_at(b, *pos, buffer_len(b));
+    size_t width = char_width(e, b, *pos, col);
     if (col + width <= skip) {
-      (*pos)++;
+      *pos += bytes;
       col += width;
       continue;
     }
     if ((row == cursor_row) && (shown == cursor_col)) out_s(o, "|");
-    for (size_t i = (skip > col) ? skip - col : 0;
-         i < width && shown < limit; i++, shown++) {
-      char out = (c == '\t') ? (i == 0 ? '>' : '.') :
-        (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
-      out_add(o, &out, 1);
+    size_t i = (skip > col) ? skip - col : 0;
+    if (c == '\t')
+      for (; i < width && shown < limit; i++, shown++) out_s(o, i == 0 ? ">" : ".");
+    else if (shown < limit) {
+      if (c == ' ') out_s(o, ".");
+      else if ((unsigned char) c < 32) out_s(o, "?");
+      else for (size_t k = 0; k < bytes; k++) out_add(o, &(char){buffer_at(b, *pos + k)}, 1);
+      shown++;
     }
-    (*pos)++;
+    *pos += bytes;
     col += width;
   }
   if ((row == cursor_row) && (shown == cursor_col)) out_s(o, "|");
@@ -1833,9 +1889,10 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
   size_t shown = 0;
   while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && shown < limit) {
     char c = buffer_at(b, *pos);
-    size_t width = (c == '\t') ? tab_stop(e, col) : 1;
+    size_t bytes = utf8_len_at(b, *pos, buffer_len(b));
+    size_t width = char_width(e, b, *pos, col);
     if (col + width <= skip) {
-      (*pos)++;
+      *pos += bytes;
       col += width;
       continue;
     }
@@ -1843,13 +1900,16 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
       out_s(o, "|");
       shown++;
     }
-    for (size_t j = (skip > col) ? skip - col : 0;
-         j < width && shown < limit; j++, shown++) {
-      char out = (c == '\t') ? (j == 0 ? '>' : '.') :
-        (c == ' ') ? '.' : ((unsigned char) c < 32) ? '?' : c;
-      out_add(o, &out, 1);
+    size_t j = (skip > col) ? skip - col : 0;
+    if (c == '\t')
+      for (; j < width && shown < limit; j++, shown++) out_s(o, j == 0 ? ">" : ".");
+    else if (shown < limit) {
+      if (c == ' ') out_s(o, ".");
+      else if ((unsigned char) c < 32) out_s(o, "?");
+      else for (size_t k = 0; k < bytes; k++) out_add(o, &(char){buffer_at(b, *pos + k)}, 1);
+      shown++;
     }
-    (*pos)++;
+    *pos += bytes;
     col += width;
   }
   if ((row == cursor_row) && (shown == cursor_col) && shown < limit) {
@@ -2226,8 +2286,9 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
 }
 
 static int cmd_left(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor > 0) p->cursor--;
+  if (p->cursor > 0) p->cursor = utf8_prev_pos(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -2236,7 +2297,7 @@ static int cmd_left(edit_state * e, int key) {
 static int cmd_right(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor < buffer_len(b)) p->cursor++;
+  if (p->cursor < buffer_len(b)) p->cursor = utf8_next_pos(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -2395,7 +2456,7 @@ static int cmd_delete_next(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor < buffer_len(b)) {
-    edit_delete(e, p->cursor, p->cursor + 1, ++b->history_group, true);
+    edit_delete(e, p->cursor, utf8_next_pos(b, p->cursor), ++b->history_group, true);
     clear_mark(e);
   }
   (void) key;
@@ -2420,8 +2481,9 @@ static int cmd_backspace(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->cursor > 0) {
-    edit_delete(e, p->cursor - 1, p->cursor, ++b->history_group, true);
-    p->cursor--;
+    size_t start = utf8_prev_pos(b, p->cursor);
+    edit_delete(e, start, p->cursor, ++b->history_group, true);
+    p->cursor = start;
     clear_mark(e);
   }
   (void) key;
