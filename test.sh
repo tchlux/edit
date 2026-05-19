@@ -284,7 +284,7 @@ printf 'one, two_three 9x\n' > "$tmp"
 printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FF "$tmp" > "$out"
-printf 'one,.two_three|.9x\n\n%s 1:15\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+printf 'one,.two|_three.9x\n\n%s 1:9\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FFB "$tmp" > "$out"
 printf 'one,.|two_three.9x\n\n%s 1:6\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
@@ -302,15 +302,28 @@ printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s 
 ./edit --render-keys 4:40 FFFB "$tmp" > "$out"
 printf 'camelCase|Word.other\n\n%s 1:10\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
 
+printf 'snake_case other\n' > "$tmp"
+./edit --render-keys 4:40 F "$tmp" > "$out"
+printf 'snake|_case.other\n\n%s 1:6\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:40 FF "$tmp" > "$out"
+printf 'snake_case|.other\n\n%s 1:11\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:40 FFB "$tmp" > "$out"
+printf 'snake_|case.other\n\n%s 1:7\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+./edit --render-keys 4:40 FFBB "$tmp" > "$out"
+printf '|snake_case.other\n\n%s 1:1\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
 printf 'one, two_three 9x\n' > "$tmp"
 ./edit --render-keys 4:30 D "$tmp" > "$out"
 printf '|,.two_three.9x\n\n%s* 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 FD "$tmp" > "$out"
-printf 'one|.9x\n\n%s* 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+printf 'one|_three.9x\n\n%s* 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 DDD "$tmp" > "$out"
-printf '|\n\n%s* 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
+printf '|.9x\n\n%s* 1:1\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:30 D_ "$tmp" > "$out"
 printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "undo")" | cmp -s - "$out"
@@ -318,6 +331,10 @@ printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "undo")" | cmp -s
 printf 'camelCaseWord other\n' > "$tmp"
 ./edit --render-keys 4:40 DD "$tmp" > "$out"
 printf '|Word.other\n\n%s* 1:1\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
+
+printf 'snake_case other\n' > "$tmp"
+./edit --render-keys 4:40 DD "$tmp" > "$out"
+printf '|.other\n\n%s* 1:1\n%s\n' "$base" "$(foot 40 "")" | cmp -s - "$out"
 
 printf 'one, two_three 9x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<opt-f>' "$tmp" > "$out"
@@ -337,7 +354,7 @@ cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 4:40 '<m-f>ff' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
-printf 'cursor:1:18\n' > "$tmp.expected"
+printf 'cursor:1:15\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 4:40 '<mac-f><mac-f><mac-b>' "$tmp" > "$out"
@@ -352,19 +369,19 @@ printf 'cursor:1:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 4:50 '<mac-d><mac-d>' "$tmp" > "$out"
-grep -q '^>01:.9x$' "$out"
+grep -q '^>01:_three.9x$' "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 4:50 '<m-f><m-f><m-del>' "$tmp" > "$out"
-grep -q '^>01:one,..9x$' "$out"
+grep -q '^>01:one,._three.9x$' "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:6\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 4:50 '<m-f><m-f><m-del><m-del>' "$tmp" > "$out"
-grep -q '^>01:.9x$' "$out"
+grep -q '^>01:_three.9x$' "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
@@ -372,7 +389,7 @@ cmp -s "$tmp.expected" "$tmp.head"
 python3 ./tui_view.py 4:50 '<m-f><m-f><m-del><c-slash>' "$tmp" > "$out"
 grep -q '^>01:one,.two_three.9x$' "$out"
 tail -n 1 "$out" > "$tmp.head"
-printf 'cursor:1:15\n' > "$tmp.expected"
+printf 'cursor:1:9\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 printf 'camelCaseWord other\n' > "$tmp"
@@ -380,6 +397,18 @@ python3 ./tui_view.py 4:50 '<m-f><m-f><m-f><m-del>' "$tmp" > "$out"
 grep -q '^>01:camelCase.other$' "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:1:10\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'snake_case other\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<m-f><m-f><m-b>' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:7\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 4:50 '<m-f><m-f><m-del>' "$tmp" > "$out"
+grep -q '^>01:snake_.other$' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:7\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 printf 'one, two_three 9x\n' > "$tmp"

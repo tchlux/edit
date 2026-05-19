@@ -2375,7 +2375,7 @@ static bool word_byte(buffer * b, size_t pos) {
   int end = -1;
   if (pos >= buffer_len(b)) return false;
   s[0] = buffer_at(b, pos);
-  match("{.}[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]",
+  match("{.}[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]",
         s, &start, &end);
   return start == 0 && end == 1;
 }
