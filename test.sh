@@ -798,6 +798,21 @@ printf 'defghijklm|n\n\n%s 1:14\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 ./edit --render-keys 4:12 fffffffffffffbbbbbbbbbbbbb "$tmp" > "$out"
 printf '|abcdefghijk\n\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
+wrap="$dir/w"
+printf 'abcdefghijklmnopqrstuvwxyz\n' > "$wrap"
+python3 ./tui_view.py 5:12 '<c-c>^w' "$wrap" > "$out"
+grep -q '02:lmnopqrstuv' "$out"
+grep -q '04:w.1:1.Wrap' "$out"
+
+python3 ./tui_view.py 5:12 '<c-c>^w<c-c>^w' "$wrap" > "$out"
+grep -q '01:abcdefghijk' "$out"
+if grep -q 'Wrap' "$out"; then exit 1; fi
+
+rights='<right><right><right><right><right><right><right><right><right><right><right><right><right>'
+python3 ./tui_view.py 5:12 "<c-c>^w$rights" "$wrap" > "$out"
+grep -q 'cursor:2:3' "$out"
+grep -q '04:w.1:14.Wrap' "$out"
+
 printf '  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$tmp"
 ./edit --render-keys 6:90 Q "$tmp" > "$out"
 printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nnext\n%s* 2:8\n%s\n' \

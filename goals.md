@@ -44,6 +44,7 @@ Completed work:
 - Customization polish: read-only toggle, dark interactive theme with solid
   cursor, clean-buffer auto-reload, JavaScript/CSS two-space Tab insertion,
   camelCase word movement, and `M-q` paragraph filling to column 70.
+- Line display: `C-c C-w` toggles pane-local visual line wrapping.
 
 Outstanding work for `edit`:
 
@@ -54,7 +55,6 @@ Outstanding work for `edit`:
 
 Preferred customization goals:
 
-- Line display: `C-c C-w` toggles visual line wrapping.
 - Sessions: save and restore open buffers, cursor state, and window state
   across restarts; remove stale session locks automatically.
 - `C-c C-a`: toggle auto-fill mode.

@@ -30,7 +30,8 @@ repeated `C-s`/`C-r` next/previous match, `C-g` cancel,
 `C-x o` other pane, `C-x 0` close pane, `C-x 1` one pane, `C-x C-f` find file,
 `C-x b` rotate buffers, `C-x k` kill the current virtual buffer,
 `C-x C-b` show session buffers,
-`C-c C-r` toggle read-only, `C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
+`C-c C-r` toggle read-only, `C-c C-w` toggle visual wrap,
+`C-x C-s` save, `C-x C-c` quit. `Esc r` records a debug log until the next
 plain `Esc`, then prompts for a note.
 
 Search and query replace use regexes, with invalid regex input searched as
