@@ -12,6 +12,19 @@ Interactive use:
 ./edit file.txt
 ```
 
+macOS app:
+
+```
+sh ./build.sh
+open Edit.app
+```
+
+`Edit.app` is a native AppKit shell with its own Dock icon and menu bar. It
+runs the bundled terminal editor in an embedded pseudo-terminal instead of
+Terminal.app. Opening the app without a document edits `~/.edit/scratch.txt`;
+drag files onto the app or use `File > Open...` to open documents in app-owned
+windows.
+
 The modeline shows the file name and current `line:column`; the row below it
 shows built-in key reminders.
 

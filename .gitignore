@@ -1,5 +1,6 @@
 .source-control
 edit
+Edit.app
 keydump
 *.o
 logs/debug-*.log
