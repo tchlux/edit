@@ -74,6 +74,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define META_REPEAT_MS 1000
 #define HELP_HINT "C-h help"
 #define DEFAULT_STATUS "C-s/C-r search, C-g cancel, Esc r debug"
+#define PANE_DIVIDER "│"
 #define REPLACE_SEARCH 1
 #define REPLACE_WITH 2
 #define REPLACE_QUERY 3
@@ -1922,7 +1923,7 @@ static void render_layout_dividers(edit_state * e, output * o, int node, pane_re
   split_rect(n, r, &a, &b);
   if (n->split == LAYOUT_COLS)
     for (int row = r.row; row < r.row + r.rows; row++)
-      out_f(o, "\x1b[%d;%dH|", row + 1, a.col + a.cols);
+      out_f(o, "\x1b[%d;%dH%s", row + 1, a.col + a.cols, PANE_DIVIDER);
   render_layout_dividers(e, o, n->first, a);
   render_layout_dividers(e, o, n->second, b);
 }
@@ -2165,7 +2166,7 @@ static void build_snapshot(edit_state * e, output * o) {
 
       int sep_col = rects[i].col + rects[i].cols - 1;
       if (! full && layout_divider_at(e, e->layout_root, root, row, sep_col))
-        out_s(o, "|");
+        out_s(o, PANE_DIVIDER);
       col = rects[i].col + rects[i].cols;
     }
     out_s(o, "\n");

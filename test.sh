@@ -487,10 +487,10 @@ printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "one pane")" | 
 
 ./edit --render-keys 5:24 x3 "$tmp" > "$out"
 head=$(printf '%s' "$base" | cut -c 1-11)
-printf '|one       ||one       \ntwo        |two        \nthree      |three      \n%s|%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
+printf '|one       │|one       \ntwo        │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
-printf 'one        |o|ne       \n|two       |two        \nthree      |three      \n%s|%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
+printf 'one        │o|ne       \n|two       │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
 
 cell15() {
   printf '%-15.15s' "$1"
@@ -500,7 +500,7 @@ pane=$(cell15 "$base 1:1")
 pane_active=$(cell15 "$base 1:1>")
 blank=$(cell15 "")
 ./edit --render-keys 8:32 x3x2 "$tmp" > "$out"
-printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
   "$(cell15 "three")" "$(cell15 "three")" \
@@ -511,7 +511,7 @@ printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
   "$(foot 32 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 8:32 x3xox2 "$tmp" > "$out"
-printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
   "$(cell15 "three")" "$(cell15 "three")" \
@@ -522,7 +522,7 @@ printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
   "$(foot 32 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 8:32 x3x2x0 "$tmp" > "$out"
-printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
   "$(cell15 "three")" "$(cell15 "three")" \
