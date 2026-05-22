@@ -1863,6 +1863,11 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   while (used++ < status_cols) out_s(o, " ");
 }
 
+static void render_col_dividers(edit_state * e, output * o, int row) {
+  for (int i = 0; i + 1 < e->n_panes; i++)
+    out_f(o, "\x1b[%d;%dH|", row, pane_col(e, i) + pane_cols(e, i));
+}
+
 static void render(edit_state * e) {
   get_window_size(e);
   output o = {0};
@@ -1893,6 +1898,7 @@ static void render(edit_state * e) {
           render_buffer_line(e, &o, b, &e->panes[i], &pos[i], e->panes[i].left_col,
                              (cols > 1) ? (size_t) cols - 1 : 1);
       }
+      render_col_dividers(e, &o, row + 1);
     }
     out_f(&o, "\x1b[%d;1H", e->rows - 1);
     for (int i = 0; i < e->n_panes; i++) {
@@ -1900,6 +1906,7 @@ static void render(edit_state * e) {
       render_modeline(e, &o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
       out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
     }
+    render_col_dividers(e, &o, e->rows - 1);
     out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
     render_footer(e, &o, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
@@ -2061,13 +2068,17 @@ static void build_snapshot(edit_state * e, output * o) {
       cx[i] = pane_cursor_col(e, p);
     }
     for (int row = 0; row < body_rows; row++) {
-      for (int i = 0; i < e->n_panes; i++)
+      for (int i = 0; i < e->n_panes; i++) {
         snapshot_cell(e, o, pane_buffer(e, &e->panes[i]), &pos[i],
                       &e->panes[i], e->panes[i].left_col, cy[i], cx[i], row, pane_cols(e, i));
+        if (i + 1 < e->n_panes) out_s(o, "|");
+      }
       out_s(o, "\n");
     }
-    for (int i = 0; i < e->n_panes; i++)
+    for (int i = 0; i < e->n_panes; i++) {
       snapshot_modeline(e, o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
+      if (i + 1 < e->n_panes) out_s(o, "|");
+    }
     out_s(o, "\n");
     snapshot_keymap(e, o);
     return;

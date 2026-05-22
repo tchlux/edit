@@ -487,10 +487,10 @@ printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "one pane")" | 
 
 ./edit --render-keys 5:24 x3 "$tmp" > "$out"
 head=$(printf '%s' "$base" | cut -c 1-11)
-printf '|one       |one       \ntwo        two        \nthree      three      \n%s%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
+printf '|one       ||one       \ntwo        |two        \nthree      |three      \n%s|%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
 
 ./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
-printf 'one        o|ne       \n|two       two        \nthree      three      \n%s%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
+printf 'one        |o|ne       \n|two       |two        \nthree      |three      \n%s|%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
 
 python3 ./tui_view.py 6:30 '<c-x>2<c-x>o' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
