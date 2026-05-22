@@ -492,6 +492,49 @@ printf '|one       ||one       \ntwo        |two        \nthree      |three     
 ./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
 printf 'one        |o|ne       \n|two       |two        \nthree      |three      \n%s|%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
 
+cell15() {
+  printf '%-15.15s' "$1"
+}
+
+pane=$(cell15 "$base 1:1")
+pane_active=$(cell15 "$base 1:1>")
+blank=$(cell15 "")
+./edit --render-keys 8:32 x3x2 "$tmp" > "$out"
+printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+  "$(cell15 "|one")" "$(cell15 "|one")" \
+  "$(cell15 "two")" "$(cell15 "two")" \
+  "$(cell15 "three")" "$(cell15 "three")" \
+  "$pane_active" "$(cell15 "four")" \
+  "$(cell15 "|one")" "$blank" \
+  "$(cell15 "two")" "$blank" \
+  "$pane" "$pane" \
+  "$(foot 32 "split")" | cmp -s - "$out"
+
+./edit --render-keys 8:32 x3xox2 "$tmp" > "$out"
+printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+  "$(cell15 "|one")" "$(cell15 "|one")" \
+  "$(cell15 "two")" "$(cell15 "two")" \
+  "$(cell15 "three")" "$(cell15 "three")" \
+  "$(cell15 "four")" "$pane_active" \
+  "$blank" "$(cell15 "|one")" \
+  "$blank" "$(cell15 "two")" \
+  "$pane" "$pane" \
+  "$(foot 32 "split")" | cmp -s - "$out"
+
+./edit --render-keys 8:32 x3x2x0 "$tmp" > "$out"
+printf '%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s|%s\n%s\n' \
+  "$(cell15 "|one")" "$(cell15 "|one")" \
+  "$(cell15 "two")" "$(cell15 "two")" \
+  "$(cell15 "three")" "$(cell15 "three")" \
+  "$(cell15 "four")" "$(cell15 "four")" \
+  "$blank" "$blank" \
+  "$blank" "$blank" \
+  "$pane_active" "$pane" \
+  "$(foot 32 "close pane")" | cmp -s - "$out"
+
+./edit --render-keys 8:32 x3x2x1 "$tmp" > "$out"
+printf '|one\ntwo\nthree\nfour\n\n\n%s 1:1\n%s\n' "$base" "$(foot 32 "one pane")" | cmp -s - "$out"
+
 python3 ./tui_view.py 6:30 '<c-x>2<c-x>o' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:4:1\n' > "$tmp.expected"

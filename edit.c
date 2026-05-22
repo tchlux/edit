@@ -77,9 +77,12 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define REPLACE_SEARCH 1
 #define REPLACE_WITH 2
 #define REPLACE_QUERY 3
+#define PANE_MAX 8
+#define LAYOUT_MAX (PANE_MAX * 2 - 1)
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
+enum { LAYOUT_LEAF = -1 };
 enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP };
 enum { ACTION_OTHER, ACTION_KILL, ACTION_YANK };
 
@@ -142,6 +145,20 @@ typedef struct {
 } binding;
 
 typedef struct {
+  int split;
+  int pane;
+  int first;
+  int second;
+} layout_node;
+
+typedef struct {
+  int row;
+  int col;
+  int rows;
+  int cols;
+} pane_rect;
+
+typedef struct {
   int key;
   unsigned char raw[32];
   int n_raw;
@@ -152,9 +169,12 @@ typedef struct {
 
 struct edit_state {
   buffer buffers[8];
-  pane panes[8];
+  pane panes[PANE_MAX];
+  layout_node layout_nodes[LAYOUT_MAX];
   int n_buffers;
   int n_panes;
+  int n_layout_nodes;
+  int layout_root;
   int active_pane;
   int layout;
   int rows;
@@ -213,6 +233,9 @@ static int env_tab_width(void) {
 
 static void init_state(edit_state * e) {
   memset(e, 0, sizeof(*e));
+  e->layout_nodes[0] = (layout_node){LAYOUT_LEAF, 0, -1, -1};
+  e->n_layout_nodes = 1;
+  e->layout_root = 0;
   e->tab_width = env_tab_width();
   e->yank_index = -1;
 }
@@ -1432,24 +1455,52 @@ static void raw_off(edit_state * e) {
   e->raw = false;
 }
 
+static void split_rect(layout_node * n, pane_rect r, pane_rect * a, pane_rect * b) {
+  *a = r;
+  *b = r;
+  if (n->split == LAYOUT_COLS) {
+    a->cols = r.cols / 2 + r.cols % 2;
+    b->col = r.col + a->cols;
+    b->cols = r.cols - a->cols;
+  } else {
+    a->rows = r.rows / 2 + r.rows % 2;
+    b->row = r.row + a->rows;
+    b->rows = r.rows - a->rows;
+  }
+}
+
+static void layout_rects_rec(edit_state * e, int node, pane_rect r, pane_rect rects[PANE_MAX]) {
+  layout_node * n = &e->layout_nodes[node];
+  if (n->split == LAYOUT_LEAF) {
+    if (n->pane >= 0 && n->pane < PANE_MAX) rects[n->pane] = r;
+    return;
+  }
+  pane_rect a;
+  pane_rect b;
+  split_rect(n, r, &a, &b);
+  layout_rects_rec(e, n->first, a, rects);
+  layout_rects_rec(e, n->second, b, rects);
+}
+
+static void pane_rects(edit_state * e, pane_rect rects[PANE_MAX]) {
+  memset(rects, 0, sizeof(pane_rect) * PANE_MAX);
+  pane_rect root = {0, 0, (e->rows > 1) ? e->rows - 1 : 1, e->cols};
+  layout_rects_rec(e, e->layout_root, root, rects);
+}
+
+static pane_rect pane_area(edit_state * e, int i) {
+  pane_rect rects[PANE_MAX];
+  pane_rects(e, rects);
+  return rects[i];
+}
+
 static int pane_body_rows(edit_state * e, int i) {
-  if (e->layout == LAYOUT_COLS) return (e->rows > 2) ? e->rows - 2 : 1;
-  int total = e->rows - e->n_panes - 1;
-  if (total < e->n_panes) return 1;
-  return total / e->n_panes + (i < total % e->n_panes);
+  pane_rect r = pane_area(e, i);
+  return (r.rows > 1) ? r.rows - 1 : 1;
 }
 
 static int pane_cols(edit_state * e, int i) {
-  if (e->layout == LAYOUT_ROWS) return e->cols;
-  int width = e->cols / e->n_panes;
-  return width + (i < e->cols % e->n_panes);
-}
-
-static int pane_col(edit_state * e, int i) {
-  if (e->layout == LAYOUT_ROWS) return 0;
-  int x = 0;
-  for (int n = 0; n < i; n++) x += pane_cols(e, n);
-  return x;
+  return pane_area(e, i).cols;
 }
 
 static size_t pane_wrap_width(edit_state * e, pane * p) {
@@ -1863,51 +1914,49 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   while (used++ < status_cols) out_s(o, " ");
 }
 
-static void render_col_dividers(edit_state * e, output * o, int row) {
-  for (int i = 0; i + 1 < e->n_panes; i++)
-    out_f(o, "\x1b[%d;%dH|", row, pane_col(e, i) + pane_cols(e, i));
+static void render_layout_dividers(edit_state * e, output * o, int node, pane_rect r) {
+  layout_node * n = &e->layout_nodes[node];
+  if (n->split == LAYOUT_LEAF) return;
+  pane_rect a;
+  pane_rect b;
+  split_rect(n, r, &a, &b);
+  if (n->split == LAYOUT_COLS)
+    for (int row = r.row; row < r.row + r.rows; row++)
+      out_f(o, "\x1b[%d;%dH|", row + 1, a.col + a.cols);
+  render_layout_dividers(e, o, n->first, a);
+  render_layout_dividers(e, o, n->second, b);
 }
 
 static void render(edit_state * e) {
   get_window_size(e);
   output o = {0};
+  pane_rect rects[PANE_MAX];
+  size_t pos[PANE_MAX];
+  int cursor_row = 0;
+  size_t cursor_col = 0;
+
+  pane_rects(e, rects);
   out_f(&o, "\x1b[?25l\x1b[H\x1b[%sm", BASE_SGR);
 
-  if (e->layout == LAYOUT_COLS) {
-    size_t pos[8];
-    int cursor_row = 0;
-    size_t cursor_col = 0;
+  if (e->n_panes == 1) {
+    pane * p = active_pane(e);
+    buffer * b = active_buffer(e);
     int body_rows = pane_body_rows(e, 0);
+    ensure_pane_visible(e, p, body_rows);
+    int cursor_row = pane_cursor_row(e, p, body_rows);
+    size_t cursor_col = pane_cursor_col(e, p);
+    size_t pos = p->top;
 
-    for (int i = 0; i < e->n_panes; i++) {
-      pane * p = &e->panes[i];
-      ensure_pane_visible(e, p, body_rows);
-      pos[i] = p->top;
-      if (i == e->active_pane) {
-        cursor_row = pane_cursor_row(e, p, body_rows);
-        cursor_col = (size_t) pane_col(e, i) + pane_cursor_col(e, p);
-      }
-    }
     for (int row = 0; row < body_rows; row++) {
-      out_f(&o, "\x1b[%d;1H\x1b[K", row + 1);
-      for (int i = 0; i < e->n_panes; i++) {
-        buffer * b = pane_buffer(e, &e->panes[i]);
-        out_f(&o, "\x1b[%d;%dH", row + 1, pane_col(e, i) + 1);
-        int cols = pane_cols(e, i);
-        if (pos[i] < buffer_len(b))
-          render_buffer_line(e, &o, b, &e->panes[i], &pos[i], e->panes[i].left_col,
-                             (cols > 1) ? (size_t) cols - 1 : 1);
-      }
-      render_col_dividers(e, &o, row + 1);
+      out_s(&o, "\x1b[K");
+      if (pos < buffer_len(b))
+        render_buffer_line(e, &o, b, p, &pos, p->left_col,
+                           (e->cols > 1) ? (size_t) e->cols - 1 : 1);
+      out_s(&o, "\r\n");
     }
-    out_f(&o, "\x1b[%d;1H", e->rows - 1);
-    for (int i = 0; i < e->n_panes; i++) {
-      out_f(&o, "\x1b[%d;%dH\x1b[7m", e->rows - 1, pane_col(e, i) + 1);
-      render_modeline(e, &o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
-      out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-    }
-    render_col_dividers(e, &o, e->rows - 1);
-    out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
+    out_s(&o, "\x1b[7m");
+    render_modeline(e, &o, p, false, e->cols);
+    out_f(&o, "\x1b[0m\x1b[%sm\r\n\x1b[90m", BASE_SGR);
     render_footer(e, &o, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
     out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
@@ -1917,39 +1966,39 @@ static void render(edit_state * e) {
     return;
   }
 
-  int cursor_row = 0;
-  size_t cursor_col = 0;
-  int screen_row = 0;
-  for (int i = 0; i < e->n_panes && screen_row < e->rows; i++) {
+  for (int row = 0; row < e->rows; row++) out_f(&o, "\x1b[%d;1H\x1b[K", row + 1);
+
+  for (int i = 0; i < e->n_panes; i++) {
+    pane * p = &e->panes[i];
+    int body_rows = pane_body_rows(e, i);
+    ensure_pane_visible(e, p, body_rows);
+    pos[i] = p->top;
+    if (i == e->active_pane) {
+      cursor_row = rects[i].row + pane_cursor_row(e, p, body_rows);
+      cursor_col = (size_t) rects[i].col + pane_cursor_col(e, p);
+    }
+  }
+
+  for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
     buffer * b = pane_buffer(e, p);
     int body_rows = pane_body_rows(e, i);
-    ensure_pane_visible(e, p, body_rows);
-    if (i == e->active_pane) {
-      cursor_row = screen_row + pane_cursor_row(e, p, body_rows);
-      cursor_col = pane_cursor_col(e, p);
+    size_t limit = (rects[i].cols > 1) ? (size_t) rects[i].cols - 1 : 1;
+    for (int row = 0; row < body_rows; row++) {
+      out_f(&o, "\x1b[%d;%dH", rects[i].row + row + 1, rects[i].col + 1);
+      if (pos[i] < buffer_len(b))
+        render_buffer_line(e, &o, b, p, &pos[i], p->left_col, limit);
     }
-
-    size_t pos = p->top;
-    for (int row = 0; row < body_rows && screen_row < e->rows; row++, screen_row++) {
-      out_s(&o, "\x1b[K");
-      if (pos < buffer_len(b))
-        render_buffer_line(e, &o, b, p, &pos, p->left_col,
-                           (e->cols > 1) ? (size_t) e->cols - 1 : 1);
-      if (screen_row + 1 < e->rows) out_s(&o, "\r\n");
-    }
-    if (screen_row < e->rows) {
-      out_s(&o, "\x1b[7m");
-      render_modeline(e, &o, p, i == e->active_pane, e->cols);
-      out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-      if (++screen_row < e->rows) out_s(&o, "\r\n");
-    }
-  }
-  if (screen_row < e->rows) {
-    out_s(&o, "\x1b[90m");
-    render_footer(e, &o, e->cols);
+    out_f(&o, "\x1b[%d;%dH\x1b[7m", rects[i].row + body_rows + 1, rects[i].col + 1);
+    render_modeline(e, &o, p, i == e->active_pane, rects[i].cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
   }
+
+  pane_rect root = {0, 0, (e->rows > 1) ? e->rows - 1 : 1, e->cols};
+  render_layout_dividers(e, &o, e->layout_root, root);
+  out_f(&o, "\x1b[%d;1H\x1b[90m", e->rows);
+  render_footer(e, &o, e->cols);
+  out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
   out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
   debug_log_render(e, &o);
@@ -2053,57 +2102,72 @@ static void snapshot_keymap(edit_state * e, output * o) {
   out_s(o, "\n");
 }
 
-static void build_snapshot(edit_state * e, output * o) {
-  if (e->layout == LAYOUT_COLS) {
-    size_t pos[8];
-    int cy[8];
-    size_t cx[8];
-    int body_rows = pane_body_rows(e, 0);
+static bool layout_divider_at(edit_state * e, int node, pane_rect r, int row, int col) {
+  layout_node * n = &e->layout_nodes[node];
+  if (n->split == LAYOUT_LEAF) return false;
+  pane_rect a;
+  pane_rect b;
+  split_rect(n, r, &a, &b);
+  if (n->split == LAYOUT_COLS && row >= r.row && row < r.row + r.rows &&
+      col == a.col + a.cols - 1)
+    return true;
+  return layout_divider_at(e, n->first, a, row, col) ||
+    layout_divider_at(e, n->second, b, row, col);
+}
 
-    for (int i = 0; i < e->n_panes; i++) {
-      pane * p = &e->panes[i];
-      ensure_pane_visible(e, p, body_rows);
-      pos[i] = p->top;
-      cy[i] = pane_cursor_row(e, p, body_rows);
-      cx[i] = pane_cursor_col(e, p);
-    }
-    for (int row = 0; row < body_rows; row++) {
-      for (int i = 0; i < e->n_panes; i++) {
-        snapshot_cell(e, o, pane_buffer(e, &e->panes[i]), &pos[i],
-                      &e->panes[i], e->panes[i].left_col, cy[i], cx[i], row, pane_cols(e, i));
-        if (i + 1 < e->n_panes) out_s(o, "|");
-      }
-      out_s(o, "\n");
-    }
-    for (int i = 0; i < e->n_panes; i++) {
-      snapshot_modeline(e, o, &e->panes[i], i == e->active_pane, pane_cols(e, i));
-      if (i + 1 < e->n_panes) out_s(o, "|");
-    }
-    out_s(o, "\n");
-    snapshot_keymap(e, o);
-    return;
-  }
+static int snapshot_pane_at(pane_rect rects[PANE_MAX], int n, int row, int min_col) {
+  int best = -1;
+  for (int i = 0; i < n; i++)
+    if (row >= rects[i].row && row < rects[i].row + rects[i].rows &&
+        rects[i].col >= min_col && (best < 0 || rects[i].col < rects[best].col))
+      best = i;
+  return best;
+}
+
+static void build_snapshot(edit_state * e, output * o) {
+  pane_rect rects[PANE_MAX];
+  size_t pos[PANE_MAX];
+  int cy[PANE_MAX];
+  size_t cx[PANE_MAX];
+  int area_rows = (e->rows > 1) ? e->rows - 1 : 1;
+  pane_rect root = {0, 0, area_rows, e->cols};
+
+  pane_rects(e, rects);
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
-    buffer * b = pane_buffer(e, p);
     int body_rows = pane_body_rows(e, i);
     ensure_pane_visible(e, p, body_rows);
-    int cy = pane_cursor_row(e, p, body_rows);
-    size_t cx = pane_cursor_col(e, p);
-    size_t pos = p->top;
-
-    for (int row = 0; row < body_rows; row++) {
-      if (pos < buffer_len(b)) snapshot_line(e, o, b, p, &pos, p->left_col, cy, cx, row);
-      else if (row == cy && cx == 0) out_s(o, "|");
-      out_s(o, "\n");
-    }
-    if (e->n_panes > 1) {
-      snapshot_modeline(e, o, p, i == e->active_pane, 0);
-      out_s(o, "\n");
-    }
+    pos[i] = p->top;
+    cy[i] = pane_cursor_row(e, p, body_rows);
+    cx[i] = pane_cursor_col(e, p);
   }
-  if (e->n_panes == 1) {
-    snapshot_modeline(e, o, active_pane(e), false, 0);
+
+  for (int row = 0; row < area_rows; row++) {
+    int col = 0;
+    while (true) {
+      int i = snapshot_pane_at(rects, e->n_panes, row, col);
+      if (i < 0) break;
+      pane * p = &e->panes[i];
+      buffer * b = pane_buffer(e, p);
+      int local_row = row - rects[i].row;
+      int body_rows = pane_body_rows(e, i);
+      bool full = rects[i].col == 0 && rects[i].cols == e->cols;
+
+      if (local_row < body_rows) {
+        if (full) {
+          if (pos[i] < buffer_len(b))
+            snapshot_line(e, o, b, p, &pos[i], p->left_col, cy[i], cx[i], local_row);
+          else if (local_row == cy[i] && cx[i] == 0) out_s(o, "|");
+        } else snapshot_cell(e, o, b, &pos[i], p, p->left_col,
+                             cy[i], cx[i], local_row, rects[i].cols);
+      } else snapshot_modeline(e, o, p, e->n_panes > 1 && i == e->active_pane,
+                               full ? 0 : rects[i].cols);
+
+      int sep_col = rects[i].col + rects[i].cols - 1;
+      if (! full && layout_divider_at(e, e->layout_root, root, row, sep_col))
+        out_s(o, "|");
+      col = rects[i].col + rects[i].cols;
+    }
     out_s(o, "\n");
   }
   snapshot_keymap(e, o);
@@ -3242,7 +3306,6 @@ static int cmd_buffer_list(edit_state * e, int key) {
     if (e->n_panes == old) return 0;
     target = e->active_pane + 1;
   } else {
-    e->layout = LAYOUT_COLS;
     int list = list_buffer(e);
     for (int i = 0; i < e->n_panes; i++)
       if (e->panes[i].buffer == list) target = i;
@@ -3412,17 +3475,78 @@ static int cmd_cancel(edit_state * e, int key) {
   return 0;
 }
 
+static int layout_find_pane(edit_state * e, int node, int pane_i) {
+  layout_node * n = &e->layout_nodes[node];
+  if (n->split == LAYOUT_LEAF) return n->pane == pane_i ? node : -1;
+  int found = layout_find_pane(e, n->first, pane_i);
+  return found >= 0 ? found : layout_find_pane(e, n->second, pane_i);
+}
+
+static bool layout_find_parent(edit_state * e, int node, int child, int * parent) {
+  layout_node * n = &e->layout_nodes[node];
+  if (n->split == LAYOUT_LEAF) return false;
+  if (n->first == child || n->second == child) {
+    *parent = node;
+    return true;
+  }
+  return layout_find_parent(e, n->first, child, parent) ||
+    layout_find_parent(e, n->second, child, parent);
+}
+
+static int layout_copy(edit_state * e, layout_node out[LAYOUT_MAX], int * n, int node) {
+  int at = (*n)++;
+  out[at] = e->layout_nodes[node];
+  if (out[at].split != LAYOUT_LEAF) {
+    out[at].first = layout_copy(e, out, n, out[at].first);
+    out[at].second = layout_copy(e, out, n, out[at].second);
+  }
+  return at;
+}
+
+static void layout_compact(edit_state * e) {
+  layout_node nodes[LAYOUT_MAX];
+  int n = 0;
+  int root = layout_copy(e, nodes, &n, e->layout_root);
+  memcpy(e->layout_nodes, nodes, sizeof(nodes));
+  e->layout_root = root;
+  e->n_layout_nodes = n;
+}
+
+static void layout_shift_panes(edit_state * e, int from, int delta) {
+  for (int i = 0; i < e->n_layout_nodes; i++)
+    if (e->layout_nodes[i].split == LAYOUT_LEAF && e->layout_nodes[i].pane >= from)
+      e->layout_nodes[i].pane += delta;
+}
+
+static void layout_one_pane(edit_state * e) {
+  e->layout_nodes[0] = (layout_node){LAYOUT_LEAF, 0, -1, -1};
+  e->n_layout_nodes = 1;
+  e->layout_root = 0;
+  e->layout = LAYOUT_ROWS;
+}
+
 static int split_pane(edit_state * e, int layout) {
-  if (e->n_panes >= 8 ||
-      (layout == LAYOUT_ROWS && e->rows && e->rows < (e->n_panes + 1) * 2) ||
-      (layout == LAYOUT_COLS && e->cols && e->cols < (e->n_panes + 1) * 4)) {
+  pane_rect r = pane_area(e, e->active_pane);
+  if (e->n_panes >= PANE_MAX ||
+      (layout == LAYOUT_ROWS && r.rows < 4) ||
+      (layout == LAYOUT_COLS && r.cols < 8)) {
     set_status(e, "cannot split");
     return 0;
   }
   int at = e->active_pane + 1;
+  layout_compact(e);
+  int leaf = layout_find_pane(e, e->layout_root, e->active_pane);
+  if (leaf < 0 || e->n_layout_nodes + 2 > LAYOUT_MAX)
+    return set_status(e, "cannot split"), 0;
+  int first = e->n_layout_nodes++;
+  int second = e->n_layout_nodes++;
   memmove(e->panes + at + 1, e->panes + at,
           (size_t) (e->n_panes - at) * sizeof(pane));
   e->panes[at] = e->panes[e->active_pane];
+  layout_shift_panes(e, at, 1);
+  e->layout_nodes[first] = (layout_node){LAYOUT_LEAF, e->active_pane, -1, -1};
+  e->layout_nodes[second] = (layout_node){LAYOUT_LEAF, at, -1, -1};
+  e->layout_nodes[leaf] = (layout_node){layout, -1, first, second};
   e->n_panes++;
   e->layout = layout;
   set_status(e, "split");
@@ -3457,10 +3581,24 @@ static int cmd_close_pane(edit_state * e, int key) {
     (void) key;
     return 0;
   }
+  int leaf = layout_find_pane(e, e->layout_root, e->active_pane);
+  int parent = -1;
+  int grand = -1;
+  if (leaf < 0 || ! layout_find_parent(e, e->layout_root, leaf, &parent))
+    return set_status(e, "one pane"), 0;
+  int sibling = e->layout_nodes[parent].first == leaf ?
+    e->layout_nodes[parent].second : e->layout_nodes[parent].first;
+  if (parent == e->layout_root) e->layout_root = sibling;
+  else if (layout_find_parent(e, e->layout_root, parent, &grand)) {
+    if (e->layout_nodes[grand].first == parent) e->layout_nodes[grand].first = sibling;
+    else e->layout_nodes[grand].second = sibling;
+  }
   memmove(e->panes + e->active_pane, e->panes + e->active_pane + 1,
           (size_t) (e->n_panes - e->active_pane - 1) * sizeof(pane));
   e->n_panes--;
+  layout_shift_panes(e, e->active_pane + 1, -1);
   if (e->active_pane >= e->n_panes) e->active_pane = e->n_panes - 1;
+  layout_compact(e);
   set_status(e, "close pane");
   (void) key;
   return 0;
@@ -3471,7 +3609,7 @@ static int cmd_one_pane(edit_state * e, int key) {
   e->panes[0] = *active_pane(e);
   e->n_panes = 1;
   e->active_pane = 0;
-  e->layout = LAYOUT_ROWS;
+  layout_one_pane(e);
   set_status(e, "one pane");
   (void) key;
   return 0;
