@@ -57,6 +57,8 @@ typedef struct {
 @property NSMutableString *csi;
 @property NSFileHandle *handle;
 @property int ansiState;
+@property CGFloat scrollX;
+@property CGFloat scrollY;
 - (instancetype)initWithPath:(NSString *)path;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
@@ -385,6 +387,30 @@ static cell blank_cell(attr a) {
   }
   NSData *data = [event.characters dataUsingEncoding:NSUTF8StringEncoding];
   [self sendBytes:data.bytes length:data.length];
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+  NSSize cell = [self cellSize];
+  CGFloat dx = event.scrollingDeltaX;
+  CGFloat dy = event.scrollingDeltaY;
+  CGFloat ax = fabs(dx), ay = fabs(dy);
+  if (ax == 0 && ay == 0) return;
+
+  if (ay >= ax) {
+    _scrollY += dy;
+    CGFloat step = event.hasPreciseScrollingDeltas ? cell.height : 1;
+    while (fabs(_scrollY) >= step) {
+      [self sendKey:_scrollY < 0 ? "\x1b[B" : "\x1b[A"];
+      _scrollY += (_scrollY < 0) ? step : -step;
+    }
+  } else {
+    _scrollX += dx;
+    CGFloat step = event.hasPreciseScrollingDeltas ? cell.width : 1;
+    while (fabs(_scrollX) >= step) {
+      [self sendKey:_scrollX < 0 ? "\x1b[C" : "\x1b[D"];
+      _scrollX += (_scrollX < 0) ? step : -step;
+    }
+  }
 }
 
 - (void)paste:(id)sender {
