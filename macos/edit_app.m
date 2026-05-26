@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -22,6 +23,8 @@
 
 #define TERM_ROWS 30
 #define TERM_COLS 100
+
+enum { AnsiNormal, AnsiEsc, AnsiCsi };
 
 typedef struct {
   unichar ch;
@@ -51,8 +54,13 @@ typedef struct {
 @property attr current;
 @property cell *cells;
 @property NSMutableData *utf8;
+@property NSMutableString *csi;
 @property NSFileHandle *handle;
+@property int ansiState;
 - (instancetype)initWithPath:(NSString *)path;
+- (instancetype)initForAnsiSelfTest;
+- (NSString *)lineText:(int)width;
+- (void)readBytes:(NSData *)data;
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
 - (void)sendKey:(const char *)bytes;
 - (void)sendCommand:(id)sender;
@@ -88,10 +96,27 @@ static cell blank_cell(attr a) {
   self.cols = TERM_COLS;
   self.cursorVisible = true;
   self.utf8 = [NSMutableData data];
+  self.csi = [NSMutableString string];
+  self.ansiState = AnsiNormal;
   attr_default(&_current);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
   [self clearScreen];
   [self startEdit:path];
+  return self;
+}
+
+- (instancetype)initForAnsiSelfTest {
+  self = [super initWithFrame:NSMakeRect(0, 0, 900, 520)];
+  if (!self) return nil;
+  self.rows = TERM_ROWS;
+  self.cols = TERM_COLS;
+  self.cursorVisible = true;
+  self.utf8 = [NSMutableData data];
+  self.csi = [NSMutableString string];
+  self.ansiState = AnsiNormal;
+  attr_default(&_current);
+  _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
+  [self clearScreen];
   return self;
 }
 
@@ -257,28 +282,27 @@ static cell blank_cell(attr a) {
 
 - (void)readBytes:(NSData *)data {
   const unsigned char *bytes = data.bytes;
-  NSMutableString *csi = nil;
-  enum { Normal, Esc, Csi } state = Normal;
 
   for (NSUInteger i = 0; i < data.length; i++) {
     unsigned char b = bytes[i];
-    if (state == Esc) {
+    if (_ansiState == AnsiEsc) {
       if (b == '[') {
-        state = Csi;
-        csi = [NSMutableString string];
-      } else state = Normal;
+        _ansiState = AnsiCsi;
+        [_csi setString:@""];
+      } else _ansiState = AnsiNormal;
       continue;
     }
-    if (state == Csi) {
-      [csi appendFormat:@"%c", b];
+    if (_ansiState == AnsiCsi) {
+      [_csi appendFormat:@"%c", b];
       if (b >= 0x40 && b <= 0x7e) {
-        [self handleCsi:csi];
-        state = Normal;
+        [self handleCsi:_csi];
+        [_csi setString:@""];
+        _ansiState = AnsiNormal;
       }
       continue;
     }
     if (b == 0x1b) {
-      state = Esc;
+      _ansiState = AnsiEsc;
     } else if (b == '\r') {
       _col = 0;
     } else if (b == '\n') {
@@ -298,6 +322,13 @@ static cell blank_cell(attr a) {
     }
   }
   [self setNeedsDisplay:YES];
+}
+
+- (NSString *)lineText:(int)width {
+  NSMutableString *s = [NSMutableString string];
+  for (int c = 0; c < width && c < _cols; c++)
+    [s appendFormat:@"%C", _cells[c].ch];
+  return s;
 }
 
 - (NSColor *)color:(int *)rgb {
@@ -509,8 +540,34 @@ static cell blank_cell(attr a) {
 
 @end
 
+static void ansi_feed(EditTerminalView *view, const char *s) {
+  [view readBytes:[NSData dataWithBytes:s length:strlen(s)]];
+}
+
+static int ansi_self_test(void) {
+  EditTerminalView *view = [[EditTerminalView alloc] initForAnsiSelfTest];
+  ansi_feed(view, "\033[38;2;232");
+  ansi_feed(view, ";232;232mfunc");
+  ansi_feed(view, "\033");
+  ansi_feed(view, "[0m");
+  ansi_feed(view, "\033[");
+  ansi_feed(view, "38;2;255;215;95marg");
+
+  NSString *text = [view lineText:30];
+  if (![[view lineText:7] isEqualToString:@"funcarg"] ||
+      [text containsString:@"38;2"] ||
+      [text containsString:@"["] ||
+      [text containsString:@"m"]) {
+    fprintf(stderr, "ansi self-test failed: %s\n", text.UTF8String);
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, const char **argv) {
   @autoreleasepool {
+    if (argc == 2 && strcmp(argv[1], "--ansi-self-test") == 0)
+      return ansi_self_test();
     NSApplication *app = [NSApplication sharedApplication];
     EditAppDelegate *delegate = [[EditAppDelegate alloc] init];
     app.delegate = delegate;

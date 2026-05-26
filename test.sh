@@ -2,6 +2,7 @@
 set -eu
 
 sh ./build.sh
+Edit.app/Contents/MacOS/Edit --ansi-self-test
 
 tmp=$(mktemp)
 base=${tmp##*/}
@@ -1103,7 +1104,7 @@ test -s "$home/.edit/recent"
 grep -q "^$dir/a$" "$home/.edit/recent"
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
-printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:\n 06:tmp=$(mktemp)\n 07:base=${tmp##*/}\n' > "$tmp.expected"
+printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:Edit.app/Contents/MacOS/Edit.--ansi-sel\n 06:\n 07:tmp=$(mktemp)\n' > "$tmp.expected"
 head -n 7 "$out" > "$tmp.head"
 cmp -s "$tmp.expected" "$tmp.head"
 tail -n 1 "$out" > "$tmp.head"
