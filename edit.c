@@ -27,13 +27,16 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
@@ -57,6 +60,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define KEY_PASTE_END 1005
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
+#define COMMAND_SIZE 1024
 #define LINE_RENDER_MAX 8192
 #define HISTORY_INITIAL 128
 #define PASTE_FALLBACK_MAX 65536
@@ -64,6 +68,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define RECENT_MAX 16
 #define KILL_RING_MAX 16
 #define DEFAULT_TAB_WIDTH 3
+#define RUN_OUTPUT_MAX (1024 * 1024)
 #define FILL_COLUMN 70
 #define BASE_SGR "38;2;224;224;224;48;2;32;32;32"
 #define SEARCH_SGR "48;5;238"
@@ -84,7 +89,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
 enum { LAYOUT_LEAF = -1 };
-enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP };
+enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN };
 enum { ACTION_OTHER, ACTION_KILL, ACTION_YANK };
 
 typedef struct {
@@ -195,6 +200,9 @@ struct edit_state {
   bool find_prompt;
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
+  bool run_prompt;
+  char run_cmd[COMMAND_SIZE];
+  size_t run_len;
   char status[STATUS_SIZE];
   long long status_ms;
   char footer[STATUS_SIZE];
@@ -230,6 +238,14 @@ static int env_tab_width(void) {
   long n = s ? strtol(s, &end, 10) : 0;
   return (s != NULL && end > s && *end == '\0' && n > 0 && n < 1000) ?
     (int) n : DEFAULT_TAB_WIDTH;
+}
+
+static size_t env_run_output_max(void) {
+  const char * s = getenv("EDIT_RUN_OUTPUT_MAX");
+  char * end = NULL;
+  unsigned long n = s ? strtoul(s, &end, 10) : 0;
+  return (s != NULL && end > s && *end == '\0' && n > 0) ?
+    (size_t) n : RUN_OUTPUT_MAX;
 }
 
 static void init_state(edit_state * e) {
@@ -726,7 +742,7 @@ static void set_status(edit_state * e, const char * fmt, ...) {
 
 static bool status_busy(edit_state * e) {
   return e->footer[0] || e->debug_note_prompt || e->find_prompt ||
-    e->search_prompt || e->replace_phase || e->prefix;
+    e->run_prompt || e->search_prompt || e->replace_phase || e->prefix;
 }
 
 static int status_timeout(edit_state * e) {
@@ -1003,7 +1019,8 @@ static int buffer_set_text(buffer * b, const char * name, int kind, const char *
 }
 
 static bool read_only_buffer(buffer * b) {
-  return b->read_only || b->kind == BUFFER_LIST || b->kind == BUFFER_HELP;
+  return b->read_only || b->kind == BUFFER_LIST || b->kind == BUFFER_HELP ||
+    b->kind == BUFFER_RUN;
 }
 
 static void save_pane_state(edit_state * e) {
@@ -1023,6 +1040,12 @@ static int list_buffer(edit_state * e) {
 static int help_buffer(edit_state * e) {
   for (int i = 0; i < e->n_buffers; i++)
     if (e->buffers[i].kind == BUFFER_HELP) return i;
+  return -1;
+}
+
+static int run_buffer(edit_state * e) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_RUN) return i;
   return -1;
 }
 
@@ -1168,16 +1191,23 @@ static void refresh_buffer_list(edit_state * e) {
   free(o.data);
 }
 
-static int recent_path(char * out, size_t n, bool create) {
-  const char * override = getenv("EDIT_RECENT");
-  if (override != NULL && override[0] != '\0')
-    return snprintf(out, n, "%s", override) < (int) n ? 0 : -1;
-
+static int edit_home_path(char * out, size_t n, const char * name, bool create) {
   const char * home = getenv("HOME");
   if (home == NULL || home[0] == '\0') return -1;
   if (snprintf(out, n, "%s/.edit", home) >= (int) n) return -1;
   if (create) mkdir(out, 0755);
-  return snprintf(out, n, "%s/.edit/recent", home) < (int) n ? 0 : -1;
+  return snprintf(out, n, "%s/.edit/%s", home, name) < (int) n ? 0 : -1;
+}
+
+static int recent_path(char * out, size_t n, bool create) {
+  const char * override = getenv("EDIT_RECENT");
+  if (override != NULL && override[0] != '\0')
+    return snprintf(out, n, "%s", override) < (int) n ? 0 : -1;
+  return edit_home_path(out, n, "recent", create);
+}
+
+static int config_path(char * out, size_t n, bool create) {
+  return edit_home_path(out, n, "config", create);
 }
 
 static int recent_save(const char * path) {
@@ -1201,6 +1231,64 @@ static int recent_save(const char * path) {
   f = fopen(recent, "w");
   if (f == NULL) return -1;
   for (int i = 0; i < n; i++) fprintf(f, "%s\n", lines[i]);
+  return fclose(f);
+}
+
+static int run_config_load(const char * path, char * cmd, size_t n) {
+  char config[DEBUG_PATH_SIZE];
+  if (config_path(config, sizeof(config), false) != 0) return -1;
+  FILE * f = fopen(config, "r");
+  if (f == NULL) return -1;
+
+  char line[COMMAND_SIZE + DEBUG_PATH_SIZE];
+  int found = -1;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    chomp(line);
+    if (strncmp(line, "run\t", 4) != 0) continue;
+    char * tab = strchr(line + 4, '\t');
+    if (tab == NULL) continue;
+    *tab = '\0';
+    if (strcmp(line + 4, path) == 0) {
+      snprintf(cmd, n, "%s", tab + 1);
+      found = 0;
+    }
+  }
+  fclose(f);
+  return found;
+}
+
+static int run_config_save(const char * path, const char * cmd) {
+  char config[DEBUG_PATH_SIZE];
+  if (config_path(config, sizeof(config), true) != 0) return -1;
+
+  output o = {0};
+  FILE * f = fopen(config, "r");
+  if (f != NULL) {
+    char line[COMMAND_SIZE + DEBUG_PATH_SIZE];
+    while (fgets(line, sizeof(line), f) != NULL) {
+      char copy[COMMAND_SIZE + DEBUG_PATH_SIZE];
+      snprintf(copy, sizeof(copy), "%s", line);
+      chomp(copy);
+      if (strncmp(copy, "run\t", 4) == 0) {
+        char * tab = strchr(copy + 4, '\t');
+        if (tab != NULL) {
+          *tab = '\0';
+          if (strcmp(copy + 4, path) == 0) continue;
+        }
+      }
+      out_s(&o, line);
+    }
+    fclose(f);
+  }
+  out_f(&o, "run\t%s\t%s\n", path, cmd);
+
+  f = fopen(config, "w");
+  if (f == NULL) {
+    free(o.data);
+    return -1;
+  }
+  if (o.data != NULL) fwrite(o.data, 1, o.len, f);
+  free(o.data);
   return fclose(f);
 }
 
@@ -1346,6 +1434,10 @@ static int input_read(edit_state * e, char * c) {
     return 1;
   }
   return read(STDIN_FILENO, c, 1) == 1;
+}
+
+static void input_clear(edit_state * e) {
+  e->input.len = 0;
 }
 
 static void input_unread(edit_state * e, char c) {
@@ -2900,9 +2992,9 @@ static bool fallback_text_byte(char c) {
 
 static bool fallback_context(edit_state * e, int key) {
   return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
-    ! e->search_prompt && ! e->replace_phase && ! e->debug_recording &&
-    ! e->debug_note_prompt && active_buffer(e)->kind != BUFFER_LIST &&
-    ! read_only_buffer(active_buffer(e));
+    ! e->run_prompt && ! e->search_prompt && ! e->replace_phase &&
+    ! e->debug_recording && ! e->debug_note_prompt &&
+    active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
 }
 
 static int fast_insert(edit_state * e, int key) {
@@ -3169,6 +3261,167 @@ static int cmd_save(edit_state * e, int key) {
   else if (read_only_buffer(b)) set_status(e, "read only");
   else set_status(e, (buffer_save(b) == 0) ? "saved" : "save failed");
   (void) key;
+  return 0;
+}
+
+static int active_file_path(edit_state * e, char * path, size_t n) {
+  buffer * b = active_buffer(e);
+  if (b->kind != BUFFER_FILE) return -1;
+  return path_absolute(b->path, path, n);
+}
+
+static void path_dir(const char * path, char * dir, size_t n) {
+  snprintf(dir, n, "%s", path);
+  char * slash = strrchr(dir, '/');
+  if (slash == NULL) snprintf(dir, n, ".");
+  else if (slash == dir) slash[1] = '\0';
+  else *slash = '\0';
+}
+
+static int shell_capture(edit_state * e, const char * dir, const char * cmd, output * o) {
+  int p[2];
+  size_t max = env_run_output_max();
+  size_t start = o->len;
+  bool truncated = false;
+  bool canceled = false;
+  if (pipe(p) != 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(p[0]);
+    close(p[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    setpgid(0, 0);
+    int nullfd = open("/dev/null", O_RDONLY);
+    if (nullfd >= 0) {
+      dup2(nullfd, STDIN_FILENO);
+      close(nullfd);
+    }
+    dup2(p[1], STDOUT_FILENO);
+    dup2(p[1], STDERR_FILENO);
+    close(p[0]);
+    close(p[1]);
+    chdir(dir);
+    const char * shell = getenv("SHELL");
+    if (shell == NULL || shell[0] == '\0') shell = "/bin/sh";
+    char script[COMMAND_SIZE + 16];
+    snprintf(script, sizeof(script), "set +m\n%s", cmd);
+    execl(shell, file_name(shell), "-ic", script, (char *) NULL);
+    _exit(127);
+  }
+  setpgid(pid, pid);
+
+  close(p[1]);
+  char buf[4096];
+  bool pipe_open = true;
+  while (pipe_open) {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(p[0], &set);
+    FD_SET(STDIN_FILENO, &set);
+    int maxfd = p[0] > STDIN_FILENO ? p[0] : STDIN_FILENO;
+    if (select(maxfd + 1, &set, NULL, NULL, NULL) <= 0) continue;
+
+    if (FD_ISSET(STDIN_FILENO, &set)) {
+      ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+      for (ssize_t i = 0; i < n; i++) {
+        if (buf[i] != KEY_CTRL('g')) continue;
+        canceled = true;
+        kill(-pid, SIGKILL);
+        input_clear(e);
+        tcflush(STDIN_FILENO, TCIFLUSH);
+        break;
+      }
+    }
+    if (FD_ISSET(p[0], &set)) {
+      ssize_t n = read(p[0], buf, sizeof(buf));
+      if (n <= 0) {
+        pipe_open = false;
+        continue;
+      }
+      size_t got = o->len - start;
+      size_t keep = got < max ? max - got : 0;
+      if (keep > (size_t) n) keep = (size_t) n;
+      if (keep > 0) out_add(o, buf, keep);
+      if (! truncated && keep < (size_t) n) {
+        out_s(o, "\n[output truncated]\n");
+        truncated = true;
+      }
+    }
+  }
+  close(p[0]);
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) return -1;
+  if (canceled) {
+    out_s(o, "\n[run canceled]\n");
+    return 130;
+  }
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+  return -1;
+}
+
+static int show_run_buffer(edit_state * e, const char * text) {
+  int r = run_buffer(e);
+  if (r < 0) {
+    if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
+    r = e->n_buffers++;
+  }
+  if (buffer_set_text(&e->buffers[r], "*run*", BUFFER_RUN, text) != 0)
+    return set_status(e, "run buffer failed"), 0;
+  save_pane_state(e);
+  active_pane(e)->buffer = r;
+  active_pane(e)->cursor = 0;
+  active_pane(e)->top = 0;
+  active_pane(e)->left_col = 0;
+  active_pane(e)->preferred_col = SIZE_MAX;
+  active_pane(e)->mark_active = false;
+  refresh_buffer_list(e);
+  return 0;
+}
+
+static int run_submit(edit_state * e) {
+  char path[DEBUG_PATH_SIZE];
+  char dir[DEBUG_PATH_SIZE];
+  if (e->run_len == 0) {
+    e->run_prompt = false;
+    return set_status(e, "no command"), 0;
+  }
+  if (active_file_path(e, path, sizeof(path)) != 0) {
+    e->run_prompt = false;
+    return set_status(e, "no file"), 0;
+  }
+  if (save_current_file(e) != 0) {
+    e->run_prompt = false;
+    return 0;
+  }
+  if (run_config_save(path, e->run_cmd) != 0) {
+    e->run_prompt = false;
+    return set_status(e, "config failed"), 0;
+  }
+
+  e->run_prompt = false;
+  path_dir(path, dir, sizeof(dir));
+  output o = {0};
+  out_f(&o, "dir: %s\ncmd: %s\n\n", dir, e->run_cmd);
+  int status = shell_capture(e, dir, e->run_cmd, &o);
+  out_f(&o, "\nexit %d\n", status);
+  show_run_buffer(e, o.data ? o.data : "");
+  free(o.data);
+  set_status(e, "exit %d", status);
+  return 0;
+}
+
+static int cmd_run(edit_state * e, int key) {
+  char path[DEBUG_PATH_SIZE];
+  (void) key;
+  if (active_file_path(e, path, sizeof(path)) != 0) return set_status(e, "no file"), 0;
+  e->run_cmd[0] = '\0';
+  run_config_load(path, e->run_cmd, sizeof(e->run_cmd));
+  e->run_len = strlen(e->run_cmd);
+  e->run_prompt = true;
+  set_status(e, "run: %s", e->run_cmd);
   return 0;
 }
 
@@ -3462,6 +3715,7 @@ static int cmd_replace(edit_state * e, int key) {
 }
 
 static int cmd_cancel(edit_state * e, int key) {
+  input_clear(e);
   e->prefix = 0;
   e->search_prompt = false;
   e->search_reuse = false;
@@ -3469,6 +3723,7 @@ static int cmd_cancel(edit_state * e, int key) {
   e->search[0] = '\0';
   replace_clear(e);
   e->find_prompt = false;
+  e->run_prompt = false;
   e->quit_confirm = false;
   clear_mark(e);
   set_status(e, "cancel");
@@ -3639,6 +3894,7 @@ static const char HELP_TEXT[] =
   "  C-q                               insert next key literally\n"
   "  C-/, C-_, C-x u                   undo\n"
   "  C-x r                             redo\n"
+  "  C-c x                             run shell command\n"
   "  C-c C-r                           toggle read only\n"
   "  C-c C-w                           toggle visual wrap\n"
   "\n"
@@ -3674,6 +3930,7 @@ static int cmd_help(edit_state * e, int key) {
   int h = help_buffer(e);
   (void) key;
   e->find_prompt = false;
+  e->run_prompt = false;
   e->search_prompt = false;
   replace_clear(e);
   e->footer[0] = '\0';
@@ -3750,6 +4007,7 @@ static binding bindings[] = {
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
   {{KEY_CTRL('c'), KEY_CTRL('r')}, 2, cmd_toggle_read_only},
   {{KEY_CTRL('c'), KEY_CTRL('w')}, 2, cmd_toggle_wrap},
+  {{KEY_CTRL('c'), 'x'}, 2, cmd_run},
   {{KEY_CTRL('x'), '0'}, 2, cmd_close_pane},
   {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
   {{KEY_CTRL('x'), '2'}, 2, cmd_split},
@@ -3776,6 +4034,23 @@ static int find_dispatch(edit_state * e, int key) {
     e->find_path[e->find_len] = '\0';
   }
   set_status(e, "find file: %s", e->find_path);
+  return 0;
+}
+
+static int run_dispatch(edit_state * e, int key) {
+  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (key == KEY_ENTER) return run_submit(e);
+  if (key == KEY_BACKSPACE && e->run_len > 0) {
+    e->run_cmd[--e->run_len] = '\0';
+  } else if (key == KEY_CTRL('y')) {
+    prompt_yank(e->run_cmd, &e->run_len);
+  } else if (key == KEY_PASTE_START) {
+    prompt_paste(e->run_cmd, &e->run_len, e);
+  } else if (key >= 32 && key < 127 && e->run_len + 1 < sizeof(e->run_cmd)) {
+    e->run_cmd[e->run_len++] = (char) key;
+    e->run_cmd[e->run_len] = '\0';
+  }
+  set_status(e, "run: %s", e->run_cmd);
   return 0;
 }
 
@@ -3870,6 +4145,7 @@ static int dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
   if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
   if (e->find_prompt) return action_other(e), find_dispatch(e, key);
+  if (e->run_prompt) return action_other(e), run_dispatch(e, key);
   if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
@@ -3959,8 +4235,8 @@ static int tui(const char * path) {
         action = "esc-meta";
       }
     }
-    if (! e.debug_note_prompt && ! e.find_prompt && ! e.search_prompt &&
-        ! e.replace_phase && e.prefix == 0) {
+    if (! e.debug_note_prompt && ! e.find_prompt && ! e.run_prompt &&
+        ! e.search_prompt && ! e.replace_phase && e.prefix == 0) {
       int repeat = meta_repeat_key(&e, &ev, key);
       if (repeat != key) {
         key = repeat;
@@ -3982,7 +4258,7 @@ static int tui(const char * path) {
         debug_log_state(&e, "before");
         action = "debug-start";
       } else action = "debug-already-recording";
-    } else if (key == KEY_PASTE_START && (e.search_prompt || e.replace_phase)) {
+    } else if (key == KEY_PASTE_START && (e.search_prompt || e.replace_phase || e.run_prompt)) {
       dispatch(&e, key);
       action = "prompt-paste";
     } else if (key == KEY_PASTE_START) {
@@ -3996,7 +4272,8 @@ static int tui(const char * path) {
       if (strcmp(action, "esc-meta") != 0 && strcmp(action, "meta-repeat") != 0)
         action = "dispatch";
     }
-    if (e.debug_note_prompt || e.find_prompt || e.search_prompt || e.replace_phase || e.prefix)
+    if (e.debug_note_prompt || e.find_prompt || e.run_prompt ||
+        e.search_prompt || e.replace_phase || e.prefix)
       e.meta_repeat_key = 0;
     else remember_meta_repeat(&e, key, ev.end_ms);
 

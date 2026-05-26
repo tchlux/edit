@@ -809,8 +809,9 @@ python3 ./tui_view.py 4:100 '<raw><c-space><right>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;7mm\033[0;38;2;224;224;224;48;2;32;32;32;38;2;255;215;95multiline_str')" "$out"
 
 printf 'abc\n' > "$tmp"
-./edit --render-keys 50:80 h "$tmp" > "$out"
+./edit --render-keys 60:80 h "$tmp" > "$out"
 grep -q '\*help\*' "$out"
+grep -q 'C-c.x' "$out"
 grep -q 'C-x.C-f' "$out"
 grep -q 'C-s' "$out"
 grep -q 'Esc.v' "$out"
@@ -1102,6 +1103,55 @@ env -u EDIT_RECENT HOME="$home" python3 ./tui_view.py 5:50 '^x^f
 ' "$dir/a" > "$out"
 test -s "$home/.edit/recent"
 grep -q "^$dir/a$" "$home/.edit/recent"
+
+run_home="$dir/run-home"
+mkdir "$run_home"
+mkdir "$run_home/.edit"
+printf 'theme	dark\n' > "$run_home/.edit/config"
+env SHELL=/bin/zsh HOME="$run_home" python3 ./tui_view.py 8:120 '^cxprintf command-output
+' "$dir/a" > "$out"
+grep -q 'command-output' "$out"
+grep -q 'cursor:1:1' "$out"
+grep -q "theme	dark" "$run_home/.edit/config"
+grep -q "run	$dir/a	printf command-output" "$run_home/.edit/config"
+
+env SHELL=/bin/zsh HOME="$run_home" python3 ./tui_view.py 8:120 '^cx
+' "$dir/a" > "$out"
+grep -q 'cmd:.printf.command-output' "$out"
+
+printf 'alpha\n' > "$dir/a"
+dirty_home="$dir/dirty-home"
+mkdir "$dirty_home"
+env SHELL=/bin/zsh HOME="$dirty_home" python3 ./tui_view.py 8:120 'X^cxcat a
+' "$dir/a" > "$out"
+grep -q 'Xalpha' "$out"
+printf 'Xalpha\n' | cmp -s - "$dir/a"
+
+fail_home="$dir/fail-home"
+mkdir "$fail_home"
+env SHELL=/bin/zsh HOME="$fail_home" python3 ./tui_view.py 8:120 "^cxsh -c 'echo err >&2; exit 7'
+" "$dir/a" > "$out"
+grep -q 'err' "$out"
+grep -q 'exit.7' "$out"
+
+cap_home="$dir/cap-home"
+mkdir "$cap_home"
+env SHELL=/bin/zsh HOME="$cap_home" EDIT_RUN_OUTPUT_MAX=32 python3 ./tui_view.py 9:120 "^cxpython3 -c 'print(\"x\"*80)'
+" "$dir/a" > "$out"
+grep -q 'output.truncated' "$out"
+grep -q 'exit.0' "$out"
+
+cancel_run_home="$dir/cancel-run-home"
+mkdir "$cancel_run_home"
+env SHELL=/bin/zsh HOME="$cancel_run_home" python3 ./tui_view.py 9:120 "^cxpython3 -c 'import time; time.sleep(10)'
+^g" "$dir/a" > "$out"
+grep -q 'run.canceled' "$out"
+grep -q 'exit.130' "$out"
+
+cancel_home="$dir/cancel-home"
+mkdir "$cancel_home"
+env SHELL=/bin/zsh HOME="$cancel_home" python3 ./tui_view.py 5:80 '^cxprintf nope^g' "$dir/a" > "$out"
+test ! -e "$cancel_home/.edit/config"
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
 printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:Edit.app/Contents/MacOS/Edit.--ansi-sel\n 06:\n 07:tmp=$(mktemp)\n' > "$tmp.expected"

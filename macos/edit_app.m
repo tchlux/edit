@@ -18,11 +18,14 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 #include <util.h>
 
 #define TERM_ROWS 30
 #define TERM_COLS 100
+#define SCROLL_MAX_KEYS 1
+#define CSI_MAX 64
 
 enum { AnsiNormal, AnsiEsc, AnsiCsi };
 
@@ -59,10 +62,16 @@ typedef struct {
 @property int ansiState;
 @property CGFloat scrollX;
 @property CGFloat scrollY;
+@property BOOL readPending;
+@property NSUInteger readGeneration;
+@property NSTimeInterval ignoreScrollUntil;
 - (instancetype)initWithPath:(NSString *)path;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
+- (NSUInteger)csiLength;
 - (void)readBytes:(NSData *)data;
+- (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise;
+- (void)panicCancel;
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
 - (void)sendKey:(const char *)bytes;
 - (void)sendCommand:(id)sender;
@@ -185,8 +194,16 @@ static cell blank_cell(attr a) {
   fcntl(_fd, F_SETFL, fcntl(_fd, F_GETFL, 0) | O_NONBLOCK);
   NSFileHandle *handle = [[NSFileHandle alloc] initWithFileDescriptor:_fd closeOnDealloc:NO];
   self.handle = handle;
+  [self installReadHandler];
+}
+
+- (void)installReadHandler {
   __weak EditTerminalView *weakSelf = self;
-  handle.readabilityHandler = ^(NSFileHandle *h) {
+  NSUInteger generation = _readGeneration;
+  self.handle.readabilityHandler = ^(NSFileHandle *h) {
+    h.readabilityHandler = nil;
+    EditTerminalView *pendingView = weakSelf;
+    if (pendingView) pendingView.readPending = true;
     NSData *data = [h availableData];
     if (data.length == 0) {
       dispatch_async(dispatch_get_main_queue(), ^{
@@ -195,7 +212,17 @@ static cell blank_cell(attr a) {
       return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-      [weakSelf readBytes:data];
+      EditTerminalView *view = weakSelf;
+      if (!view) return;
+      if (view.readGeneration != generation) {
+        view.readPending = false;
+        [view installReadHandler];
+        return;
+      }
+      view.readPending = true;
+      [view readBytes:data];
+      view.readPending = false;
+      [view installReadHandler];
     });
   };
 }
@@ -204,12 +231,36 @@ static cell blank_cell(attr a) {
   if (_fd > 0 && length > 0) write(_fd, bytes, length);
 }
 
+- (void)drainPtyOutput {
+  if (_fd <= 0) return;
+  char buf[8192];
+  while (read(_fd, buf, sizeof(buf)) > 0) {}
+}
+
+- (void)panicCancel {
+  _scrollX = 0;
+  _scrollY = 0;
+  _ignoreScrollUntil = [NSDate timeIntervalSinceReferenceDate] + 0.4;
+  _readGeneration++;
+  _readPending = false;
+  if (_handle) _handle.readabilityHandler = nil;
+  if (_fd > 0) {
+    tcflush(_fd, TCIOFLUSH);
+    [self drainPtyOutput];
+    char c = 0x07;
+    write(_fd, &c, 1);
+  }
+  [self installReadHandler];
+}
+
 - (void)sendKey:(const char *)bytes {
   [self sendBytes:bytes length:strlen(bytes)];
 }
 
 - (void)sendCommand:(id)sender {
   NSData *data = [sender representedObject];
+  if (data.length == 1 && ((const unsigned char *)data.bytes)[0] == 0x07)
+    return [self panicCancel];
   [self sendBytes:data.bytes length:data.length];
 }
 
@@ -296,6 +347,11 @@ static cell blank_cell(attr a) {
     }
     if (_ansiState == AnsiCsi) {
       [_csi appendFormat:@"%c", b];
+      if (_csi.length > CSI_MAX) {
+        [_csi setString:@""];
+        _ansiState = AnsiNormal;
+        continue;
+      }
       if (b >= 0x40 && b <= 0x7e) {
         [self handleCsi:_csi];
         [_csi setString:@""];
@@ -325,6 +381,8 @@ static cell blank_cell(attr a) {
   }
   [self setNeedsDisplay:YES];
 }
+
+- (NSUInteger)csiLength { return _csi.length; }
 
 - (NSString *)lineText:(int)width {
   NSMutableString *s = [NSMutableString string];
@@ -369,17 +427,20 @@ static cell blank_cell(attr a) {
 - (void)keyDown:(NSEvent *)event {
   NSString *plain = event.charactersIgnoringModifiers ?: @"";
   NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+  if (flags & NSEventModifierFlagControl) {
+    if (plain.length == 0) return;
+    char c = (char)[plain characterAtIndex:0];
+    char ctrl = (c == ' ') ? 0 : (c & 0x1f);
+    if (ctrl == 0x07) return [self panicCancel];
+    _ignoreScrollUntil = 0;
+    return [self sendBytes:&ctrl length:1];
+  }
+  _ignoreScrollUntil = 0;
   if (event.keyCode == 53) return [self sendKey:"\x1b"];
   if (event.keyCode == 123) return [self sendKey:"\x1b[D"];
   if (event.keyCode == 124) return [self sendKey:"\x1b[C"];
   if (event.keyCode == 125) return [self sendKey:"\x1b[B"];
   if (event.keyCode == 126) return [self sendKey:"\x1b[A"];
-  if (flags & NSEventModifierFlagControl) {
-    if (plain.length == 0) return;
-    char c = (char)[plain characterAtIndex:0];
-    char ctrl = (c == ' ') ? 0 : (c & 0x1f);
-    return [self sendBytes:&ctrl length:1];
-  }
   if ((flags & NSEventModifierFlagOption) && plain.length > 0) {
     [self sendKey:"\x1b"];
     NSData *data = [plain dataUsingEncoding:NSUTF8StringEncoding];
@@ -389,28 +450,41 @@ static cell blank_cell(attr a) {
   [self sendBytes:data.bytes length:data.length];
 }
 
-- (void)scrollWheel:(NSEvent *)event {
+- (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise {
   NSSize cell = [self cellSize];
-  CGFloat dx = event.scrollingDeltaX;
-  CGFloat dy = event.scrollingDeltaY;
   CGFloat ax = fabs(dx), ay = fabs(dy);
-  if (ax == 0 && ay == 0) return;
+  int sent = 0;
+  if ([NSDate timeIntervalSinceReferenceDate] < _ignoreScrollUntil) return 0;
+  if (_readPending) return 0;
+  if (ax == 0 && ay == 0) return 0;
 
   if (ay >= ax) {
     _scrollY += dy;
-    CGFloat step = event.hasPreciseScrollingDeltas ? cell.height : 1;
-    while (fabs(_scrollY) >= step) {
+    CGFloat step = precise ? cell.height : 1;
+    while (fabs(_scrollY) >= step && sent < SCROLL_MAX_KEYS) {
       [self sendKey:_scrollY < 0 ? "\x1b[B" : "\x1b[A"];
       _scrollY += (_scrollY < 0) ? step : -step;
+      sent++;
     }
+    if (sent == SCROLL_MAX_KEYS) _scrollY = 0;
   } else {
     _scrollX += dx;
-    CGFloat step = event.hasPreciseScrollingDeltas ? cell.width : 1;
-    while (fabs(_scrollX) >= step) {
+    CGFloat step = precise ? cell.width : 1;
+    while (fabs(_scrollX) >= step && sent < SCROLL_MAX_KEYS) {
       [self sendKey:_scrollX < 0 ? "\x1b[C" : "\x1b[D"];
       _scrollX += (_scrollX < 0) ? step : -step;
+      sent++;
     }
+    if (sent == SCROLL_MAX_KEYS) _scrollX = 0;
   }
+  if (sent > 0) _readPending = true;
+  return sent;
+}
+
+- (void)scrollWheel:(NSEvent *)event {
+  if (event.momentumPhase != NSEventPhaseNone ||
+      [NSDate timeIntervalSinceReferenceDate] < _ignoreScrollUntil) return;
+  [self sendScrollDeltaX:event.scrollingDeltaX y:event.scrollingDeltaY precise:event.hasPreciseScrollingDeltas];
 }
 
 - (void)paste:(id)sender {
@@ -557,6 +631,7 @@ static cell blank_cell(attr a) {
   [self addCommand:@"One Pane    C-x 1" bytes:"\0301" length:2 to:commands];
   [commands addItem:[NSMenuItem separatorItem]];
 
+  [self addCommand:@"Run Command    C-c x" bytes:"\003x" length:2 to:commands];
   [self addCommand:@"Toggle Read-Only    C-c C-r" bytes:"\003\022" length:2 to:commands];
   [self addCommand:@"Toggle Visual Wrap    C-c C-w" bytes:"\003\027" length:2 to:commands];
   [self addCommand:@"Help    C-h" bytes:"\010" length:1 to:commands];
@@ -589,6 +664,46 @@ static int ansi_self_test(void) {
       [text containsString:@"["] ||
       [text containsString:@"m"]) {
     fprintf(stderr, "ansi self-test failed: %s\n", text.UTF8String);
+    return 1;
+  }
+
+  EditTerminalView *csiView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  char longCsi[CSI_MAX + 2];
+  memset(longCsi, '1', sizeof(longCsi));
+  longCsi[sizeof(longCsi) - 1] = '\0';
+  ansi_feed(csiView, "\033[");
+  ansi_feed(csiView, longCsi);
+  if (csiView.csiLength != 0 || [[csiView lineText:10] containsString:@"1"]) {
+    fprintf(stderr, "ansi csi cap failed\n");
+    return 1;
+  }
+
+  int p[2];
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *scrollView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  scrollView.fd = p[1];
+  int sent = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
+  int dropped = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
+  close(p[1]);
+  scrollView.fd = -1;
+  char buf[128];
+  ssize_t got = read(p[0], buf, sizeof(buf));
+  close(p[0]);
+  if (sent > SCROLL_MAX_KEYS || dropped != 0 || got > SCROLL_MAX_KEYS * 3) {
+    fprintf(stderr, "scroll cap failed: sent=%d dropped=%d got=%zd\n", sent, dropped, got);
+    return 1;
+  }
+
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *cancelView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  cancelView.fd = p[1];
+  [cancelView panicCancel];
+  int afterCancel = [cancelView sendScrollDeltaX:0 y:-100000 precise:NO];
+  close(p[1]);
+  cancelView.fd = -1;
+  close(p[0]);
+  if (afterCancel != 0) {
+    fprintf(stderr, "scroll cancel failed: sent=%d\n", afterCancel);
     return 1;
   }
   return 0;
