@@ -378,7 +378,11 @@ static cell blank_cell(attr a) {
     char ctrl = (c == ' ') ? 0 : (c & 0x1f);
     return [self sendBytes:&ctrl length:1];
   }
-  if ((flags & NSEventModifierFlagOption) && plain.length > 0) [self sendKey:"\x1b"];
+  if ((flags & NSEventModifierFlagOption) && plain.length > 0) {
+    [self sendKey:"\x1b"];
+    NSData *data = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    return [self sendBytes:data.bytes length:data.length];
+  }
   NSData *data = [event.characters dataUsingEncoding:NSUTF8StringEncoding];
   [self sendBytes:data.bytes length:data.length];
 }
