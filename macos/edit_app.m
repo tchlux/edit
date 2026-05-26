@@ -65,6 +65,9 @@ typedef struct {
 @property BOOL readPending;
 @property NSUInteger readGeneration;
 @property NSTimeInterval ignoreScrollUntil;
+@property BOOL dirtyAll;
+@property BOOL hasDirty;
+@property NSRect dirtyRect;
 - (instancetype)initWithPath:(NSString *)path;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
@@ -96,6 +99,12 @@ static cell blank_cell(attr a) {
   c.italic = a.italic;
   c.reverse = a.reverse;
   return c;
+}
+
+static bool cell_equal(cell a, cell b) {
+  return a.ch == b.ch && memcmp(a.fg, b.fg, sizeof(a.fg)) == 0 &&
+    memcmp(a.bg, b.bg, sizeof(a.bg)) == 0 && a.bold == b.bold &&
+    a.italic == b.italic && a.reverse == b.reverse;
 }
 
 @implementation EditTerminalView
@@ -153,6 +162,31 @@ static cell blank_cell(attr a) {
   for (int i = 0; i < _rows * _cols; i++) _cells[i] = blank_cell(_current);
   _row = 0;
   _col = 0;
+  _dirtyAll = YES;
+}
+
+- (NSRect)cellRectRow:(int)row col:(int)col {
+  NSSize size = [self cellSize];
+  return NSMakeRect(col * size.width, self.bounds.size.height - (row + 1) * size.height,
+                    size.width, size.height);
+}
+
+- (void)markCellDirtyRow:(int)row col:(int)col {
+  if (_dirtyAll || row < 0 || row >= _rows || col < 0 || col >= _cols) return;
+  NSRect r = [self cellRectRow:row col:col];
+  _dirtyRect = _hasDirty ? NSUnionRect(_dirtyRect, r) : r;
+  _hasDirty = YES;
+}
+
+- (void)markCursorDirty {
+  if (_cursorVisible) [self markCellDirtyRow:_row col:_col];
+}
+
+- (void)flushDirty {
+  if (_dirtyAll) [self setNeedsDisplay:YES];
+  else if (_hasDirty) [self setNeedsDisplayInRect:NSInsetRect(_dirtyRect, -1, -1)];
+  _dirtyAll = NO;
+  _hasDirty = NO;
 }
 
 - (void)resizeGrid {
@@ -268,7 +302,11 @@ static cell blank_cell(attr a) {
   if (_row < 0 || _row >= _rows || _col < 0 || _col >= _cols) return;
   cell c = blank_cell(_current);
   c.ch = ch;
-  _cells[_row * _cols + _col] = c;
+  int at = _row * _cols + _col;
+  if (!cell_equal(_cells[at], c)) {
+    _cells[at] = c;
+    [self markCellDirtyRow:_row col:_col];
+  }
   if (++_col >= _cols) {
     _col = 0;
     if (_row + 1 < _rows) _row++;
@@ -277,8 +315,14 @@ static cell blank_cell(attr a) {
 
 - (void)clearLine {
   if (_row < 0 || _row >= _rows) return;
-  for (int c = MAX(0, _col); c < _cols; c++)
-    _cells[_row * _cols + c] = blank_cell(_current);
+  for (int c = MAX(0, _col); c < _cols; c++) {
+    int at = _row * _cols + c;
+    cell blank = blank_cell(_current);
+    if (!cell_equal(_cells[at], blank)) {
+      _cells[at] = blank;
+      [self markCellDirtyRow:_row col:c];
+    }
+  }
 }
 
 - (NSArray<NSString *> *)csiParts:(NSString *)seq final:(char *)final {
@@ -319,8 +363,10 @@ static cell blank_cell(attr a) {
   char final = 0;
   NSArray<NSString *> *parts = [self csiParts:seq final:&final];
   if (final == 'H' || final == 'f') {
+    [self markCursorDirty];
     _row = MAX(0, MIN(_rows - 1, [self csiInt:parts at:0 fallback:1] - 1));
     _col = MAX(0, MIN(_cols - 1, [self csiInt:parts at:1 fallback:1] - 1));
+    [self markCursorDirty];
   } else if (final == 'K') {
     [self clearLine];
   } else if (final == 'J') {
@@ -328,8 +374,14 @@ static cell blank_cell(attr a) {
   } else if (final == 'm') {
     [self applySgr:parts];
   } else if (final == 'l' || final == 'h') {
-    if ([seq containsString:@"?25l"]) _cursorVisible = false;
-    if ([seq containsString:@"?25h"]) _cursorVisible = true;
+    if ([seq containsString:@"?25l"]) {
+      [self markCursorDirty];
+      _cursorVisible = false;
+    }
+    if ([seq containsString:@"?25h"]) {
+      _cursorVisible = true;
+      [self markCursorDirty];
+    }
   }
 }
 
@@ -379,7 +431,7 @@ static cell blank_cell(attr a) {
       }
     }
   }
-  [self setNeedsDisplay:YES];
+  [self flushDirty];
 }
 
 - (NSUInteger)csiLength { return _csi.length; }
@@ -400,7 +452,7 @@ static cell blank_cell(attr a) {
   NSFont *font = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular];
   NSSize size = [self cellSize];
   [[NSColor colorWithCalibratedRed:32 / 255.0 green:32 / 255.0 blue:32 / 255.0 alpha:1] setFill];
-  NSRectFill(self.bounds);
+  NSRectFill(dirtyRect);
 
   for (int r = 0; r < _rows; r++) {
     for (int c = 0; c < _cols; c++) {
@@ -408,6 +460,7 @@ static cell blank_cell(attr a) {
       int *fg = x.reverse ? x.bg : x.fg;
       int *bg = x.reverse ? x.fg : x.bg;
       NSRect rect = NSMakeRect(c * size.width, self.bounds.size.height - (r + 1) * size.height, size.width, size.height);
+      if (!NSIntersectsRect(dirtyRect, rect)) continue;
       [[self color:bg] setFill];
       NSRectFill(rect);
       NSDictionary *attrs = @{

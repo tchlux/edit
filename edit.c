@@ -89,7 +89,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
 enum { LAYOUT_LEAF = -1 };
-enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN };
+enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN, BUFFER_FIND };
 enum { ACTION_OTHER, ACTION_KILL, ACTION_YANK };
 
 typedef struct {
@@ -200,6 +200,9 @@ struct edit_state {
   bool find_prompt;
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
+  int find_origin_pane;
+  int find_pane;
+  bool find_created_pane;
   bool run_prompt;
   char run_cmd[COMMAND_SIZE];
   size_t run_len;
@@ -255,6 +258,8 @@ static void init_state(edit_state * e) {
   e->layout_root = 0;
   e->tab_width = env_tab_width();
   e->yank_index = -1;
+  e->find_origin_pane = -1;
+  e->find_pane = -1;
 }
 
 static char * _dup(const char * s) {
@@ -999,7 +1004,9 @@ static void chomp(char * s) {
 
 static int recent_save(const char * path);
 static int selected_buffer(edit_state * e);
+static pane_rect pane_area(edit_state * e, int i);
 static int split_pane(edit_state * e, int layout);
+static int cmd_close_pane(edit_state * e, int key);
 static void refresh_buffer_list(edit_state * e);
 static const char * file_name(const char * path);
 
@@ -1034,6 +1041,12 @@ static void save_pane_state(edit_state * e) {
 static int list_buffer(edit_state * e) {
   for (int i = 0; i < e->n_buffers; i++)
     if (e->buffers[i].kind == BUFFER_LIST) return i;
+  return -1;
+}
+
+static int find_buffer(edit_state * e) {
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_FIND) return i;
   return -1;
 }
 
@@ -1340,12 +1353,90 @@ static bool find_name_matches(const char * name, const char * base, bool regex) 
     starts_with(name, base);
 }
 
+static void find_complete_line(output * o, const char * name, const char * path) {
+  char abs[DEBUG_PATH_SIZE];
+  if (path_absolute(path, abs, sizeof(abs)) != 0) snprintf(abs, sizeof(abs), "%s", path);
+  out_f(o, "%s%s\t%s%s\n", name, directory_path(abs) ? "/" : "",
+        abs, directory_path(abs) ? "/" : "");
+}
+
+static void find_close_created_pane(edit_state * e) {
+  if (! e->find_created_pane || e->find_pane < 0 || e->find_pane >= e->n_panes)
+    return;
+  int keep = e->active_pane == e->find_pane ? -1 : e->active_pane;
+  e->active_pane = e->find_pane;
+  cmd_close_pane(e, 0);
+  if (keep >= 0) {
+    if (keep > e->find_pane) keep--;
+    if (keep < e->n_panes) e->active_pane = keep;
+  }
+  e->find_pane = -1;
+  e->find_created_pane = false;
+}
+
+static size_t footer_message_cols(edit_state * e) {
+  size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
+  size_t hint = strlen(HELP_HINT);
+  return (limit > hint) ? limit - hint : 0;
+}
+
+static int largest_other_pane(edit_state * e) {
+  int best = -1;
+  int area = -1;
+  for (int i = 0; i < e->n_panes; i++) {
+    if (i == e->active_pane) continue;
+    pane_rect r = pane_area(e, i);
+    int a = r.rows * r.cols;
+    if (a > area) best = i, area = a;
+  }
+  return best;
+}
+
+static int show_find_completions(edit_state * e, output * paths) {
+  int bnum = find_buffer(e);
+  if (bnum < 0) {
+    if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
+    bnum = e->n_buffers++;
+  }
+  if (buffer_set_text(&e->buffers[bnum], "*find completions*", BUFFER_FIND,
+                      paths->data ? paths->data : "") != 0)
+    return set_status(e, "completion failed"), 0;
+  e->buffers[bnum].read_only = true;
+
+  int target = (e->find_pane >= 0 && e->find_pane < e->n_panes &&
+                e->find_pane != e->active_pane) ?
+    e->find_pane : largest_other_pane(e);
+  if (target < 0) {
+    pane_rect r = pane_area(e, e->active_pane);
+    int old = e->n_panes;
+    split_pane(e, r.cols >= r.rows ? LAYOUT_COLS : LAYOUT_ROWS);
+    if (e->n_panes == old) return 0;
+    target = e->active_pane + 1;
+    e->find_created_pane = true;
+  }
+
+  e->find_pane = target;
+  e->panes[target].buffer = bnum;
+  e->panes[target].cursor = 0;
+  e->panes[target].top = 0;
+  e->panes[target].left_col = 0;
+  e->panes[target].preferred_col = SIZE_MAX;
+  e->panes[target].mark_active = false;
+  e->active_pane = target;
+  refresh_buffer_list(e);
+  set_status(e, "find completions");
+  return 0;
+}
+
 static int find_complete(edit_state * e) {
   char dir[DEBUG_PATH_SIZE];
   char prefix[DEBUG_PATH_SIZE];
   char base[DEBUG_PATH_SIZE];
   char match[DEBUG_PATH_SIZE] = "";
-  char list[STATUS_SIZE] = "";
+  output dir_footer = {0};
+  output file_footer = {0};
+  output dir_paths = {0};
+  output file_paths = {0};
   int n = 0;
 
   path_parts(e->find_path, dir, prefix, base);
@@ -1359,25 +1450,54 @@ static int find_complete(edit_state * e) {
     if (n == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
     else if (! regex) common_prefix(match, ent->d_name);
     char path[DEBUG_PATH_SIZE];
-    size_t used = strlen(list);
     snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
-    snprintf(list + used, sizeof(list) - used, "%s%s%s",
-             used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
+    bool is_dir = directory_path(path);
+    output * footer = is_dir ? &dir_footer : &file_footer;
+    output * paths = is_dir ? &dir_paths : &file_paths;
+    out_f(footer, "%s%s%s", footer->len ? " " : "", ent->d_name, is_dir ? "/" : "");
+    find_complete_line(paths, ent->d_name, path);
     n++;
   }
   closedir(d);
 
-  if (n == 0) return set_footer(e, "no match"), 0;
-  if (base[0] == '\0') return set_footer(e, "%s", list[0] ? list : "empty directory"), 0;
-  if (regex && n > 1) return set_footer(e, "%s", list), 0;
+  output footer = {0};
+  output paths = {0};
+  out_s(&footer, dir_footer.data ? dir_footer.data : "");
+  if (dir_footer.len && file_footer.len) out_s(&footer, " ");
+  out_s(&footer, file_footer.data ? file_footer.data : "");
+  out_s(&paths, dir_paths.data ? dir_paths.data : "");
+  out_s(&paths, file_paths.data ? file_paths.data : "");
+  free(dir_footer.data);
+  free(file_footer.data);
+  free(dir_paths.data);
+  free(file_paths.data);
+
+  if (n == 0) {
+    free(footer.data);
+    free(paths.data);
+    return set_footer(e, "no match"), 0;
+  }
+  if (base[0] == '\0' || (regex && n > 1)) {
+    int rc = footer.len <= footer_message_cols(e) ?
+      (set_footer(e, "%s", footer.data ? footer.data : "empty directory"), 0) :
+      show_find_completions(e, &paths);
+    free(footer.data);
+    free(paths.data);
+    return rc;
+  }
 
   char path[DEBUG_PATH_SIZE];
   snprintf(path, sizeof(path), "%s%s", prefix, match);
   if (n == 1 && directory_path(path) && strlen(path) + 1 < sizeof(path))
     strcat(path, "/");
-  if (n > 1) set_footer(e, "%s", list);
+  if (n > 1) {
+    if (footer.len <= footer_message_cols(e)) set_footer(e, "%s", footer.data);
+    else show_find_completions(e, &paths);
+  }
   find_set(e, path);
   set_status(e, "find file: %s", e->find_path);
+  free(footer.data);
+  free(paths.data);
   return 0;
 }
 
@@ -1822,7 +1942,7 @@ static void render_span_sgr(edit_state * e, output * o, const char * sgr,
   out_s(o, "m");
 }
 
-static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
+static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
                                size_t * pos, size_t skip, size_t limit) {
   char line[LINE_RENDER_MAX];
   const char * search_sgrs[LINE_RENDER_MAX];
@@ -1905,6 +2025,7 @@ static void render_buffer_line(edit_state * e, output * o, buffer * b, pane * p,
     *pos = read;
     if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
   }
+  return shown;
 }
 
 static void render_line(edit_state * e, output * o, size_t * pos) {
@@ -1976,17 +2097,32 @@ static const char * file_name(const char * path) {
   return slash ? slash + 1 : path;
 }
 
+static bool find_footer_cursor(edit_state * e) {
+  return e->find_prompt && e->footer[0] == '\0' && active_buffer(e)->kind != BUFFER_FIND;
+}
+
+static size_t find_footer_cursor_col(edit_state * e, int cols) {
+  size_t msg = strlen("find file: ") + e->find_len;
+  size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t hint = strlen(HELP_HINT);
+  size_t max = (limit > hint + 1) ? limit - hint - 1 : 0;
+  return msg < max ? msg : max;
+}
+
 static void footer_line(edit_state * e, output * o, int cols) {
   const char * msg = e->footer[0] ? e->footer : e->status;
   size_t used = 0;
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t hint = strlen(HELP_HINT);
+  bool cursor = ! e->raw && find_footer_cursor(e);
+  size_t cursor_col = cursor ? find_footer_cursor_col(e, cols) : SIZE_MAX;
   if (limit <= hint) {
     out_clip(o, HELP_HINT, &used, limit);
     return;
   }
   out_clip(o, msg, &used, limit - hint);
   while (used < limit - hint) {
+    if (used == cursor_col) out_s(o, "|");
     out_s(o, " ");
     used++;
   }
@@ -2052,14 +2188,14 @@ static void render(edit_state * e) {
     out_f(&o, "\x1b[0m\x1b[%sm\r\n\x1b[90m", BASE_SGR);
     render_footer(e, &o, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
+    if (find_footer_cursor(e))
+      out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, find_footer_cursor_col(e, e->cols) + 1);
+    else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
     debug_log_render(e, &o);
     write(STDOUT_FILENO, o.data, o.len);
     free(o.data);
     return;
   }
-
-  for (int row = 0; row < e->rows; row++) out_f(&o, "\x1b[%d;1H\x1b[K", row + 1);
 
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
@@ -2079,8 +2215,10 @@ static void render(edit_state * e) {
     size_t limit = (rects[i].cols > 1) ? (size_t) rects[i].cols - 1 : 1;
     for (int row = 0; row < body_rows; row++) {
       out_f(&o, "\x1b[%d;%dH", rects[i].row + row + 1, rects[i].col + 1);
+      size_t shown = 0;
       if (pos[i] < buffer_len(b))
-        render_buffer_line(e, &o, b, p, &pos[i], p->left_col, limit);
+        shown = render_buffer_line(e, &o, b, p, &pos[i], p->left_col, limit);
+      while (shown++ < limit) out_s(&o, " ");
     }
     out_f(&o, "\x1b[%d;%dH\x1b[7m", rects[i].row + body_rows + 1, rects[i].col + 1);
     render_modeline(e, &o, p, i == e->active_pane, rects[i].cols);
@@ -2089,10 +2227,12 @@ static void render(edit_state * e) {
 
   pane_rect root = {0, 0, (e->rows > 1) ? e->rows - 1 : 1, e->cols};
   render_layout_dividers(e, &o, e->layout_root, root);
-  out_f(&o, "\x1b[%d;1H\x1b[90m", e->rows);
+  out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
   render_footer(e, &o, e->cols);
   out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-  out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
+  if (find_footer_cursor(e))
+    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, find_footer_cursor_col(e, e->cols) + 1);
+  else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
   debug_log_render(e, &o);
   write(STDOUT_FILENO, o.data, o.len);
@@ -2891,6 +3031,34 @@ static int cmd_insert(edit_state * e, int key) {
     if (key == KEY_ENTER) return switch_to_buffer(e, selected_buffer(e));
     return set_status(e, "read only"), 0;
   }
+  if (active_buffer(e)->kind == BUFFER_FIND) {
+    if (key != KEY_ENTER) return set_status(e, "read only"), 0;
+    buffer * b = active_buffer(e);
+    pane * p = active_pane(e);
+    size_t start = line_start(b, p->cursor);
+    size_t end = line_end(b, p->cursor);
+    char path[DEBUG_PATH_SIZE];
+    size_t n = end - start;
+    if (n >= sizeof(path)) n = sizeof(path) - 1;
+    for (size_t i = 0; i < n; i++) path[i] = buffer_at(b, start + i);
+    path[n] = '\0';
+    char * tab = strchr(path, '\t');
+    if (tab != NULL) memmove(path, tab + 1, strlen(tab + 1) + 1);
+    if (path[0] == '\0') return set_status(e, "no file"), 0;
+    bool dir = directory_path(path);
+    e->find_prompt = false;
+    if (e->find_created_pane) find_close_created_pane(e);
+    else if (dir && e->find_origin_pane >= 0 && e->find_origin_pane < e->n_panes)
+      e->active_pane = e->find_origin_pane;
+    if (dir) {
+      if (strlen(path) + 1 < sizeof(path) && path[strlen(path) - 1] != '/') strcat(path, "/");
+      find_set(e, path);
+      e->find_origin_pane = e->active_pane;
+      e->find_prompt = true;
+      return set_status(e, "find file: %s", e->find_path), 0;
+    }
+    return switch_to_path(e, path);
+  }
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   char c = (key == KEY_ENTER) ? '\n' : (char) key;
   pane * p = active_pane(e);
@@ -3439,6 +3607,7 @@ static int open_find_path(edit_state * e) {
   if (stat(path, &st) == 0) {
     if (! S_ISDIR(st.st_mode)) {
       e->find_prompt = false;
+      find_close_created_pane(e);
       return switch_to_path(e, path);
     }
     e->find_prompt = false;
@@ -3450,11 +3619,13 @@ static int open_find_path(edit_state * e) {
   path_parts(path, dir, prefix, base);
   if (! regex_path(base)) {
     e->find_prompt = false;
+    find_close_created_pane(e);
     return switch_to_path(e, path);
   }
 
   char match[DEBUG_PATH_SIZE] = "";
-  char list[STATUS_SIZE] = "";
+  output footer = {0};
+  output paths = {0};
   int n = 0;
   DIR * d = opendir(dir);
   if (d == NULL) return set_status(e, "no such directory"), 0;
@@ -3462,22 +3633,37 @@ static int open_find_path(edit_state * e) {
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
     if (! find_name_matches(ent->d_name, base, true)) continue;
     if (n++ == 0) snprintf(match, sizeof(match), "%s", ent->d_name);
-    size_t used = strlen(list);
     snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
-    snprintf(list + used, sizeof(list) - used, "%s%s%s",
-             used ? " " : "", ent->d_name, directory_path(path) ? "/" : "");
+    out_f(&footer, "%s%s%s", footer.len ? " " : "", ent->d_name,
+          directory_path(path) ? "/" : "");
+    find_complete_line(&paths, ent->d_name, path);
   }
   closedir(d);
-  if (n == 0) return set_footer(e, "no match"), 0;
-  if (n > 1) return set_footer(e, "%s", list), 0;
+  if (n == 0) {
+    free(footer.data);
+    free(paths.data);
+    return set_footer(e, "no match"), 0;
+  }
+  if (n > 1) {
+    int rc = footer.len <= footer_message_cols(e) ?
+      (set_footer(e, "%s", footer.data), 0) : show_find_completions(e, &paths);
+    free(footer.data);
+    free(paths.data);
+    return rc;
+  }
 
   snprintf(path, sizeof(path), "%s%s", prefix, match);
   if (directory_path(path)) {
     if (strlen(path) + 1 < sizeof(path)) strcat(path, "/");
     find_set(e, path);
+    free(footer.data);
+    free(paths.data);
     return set_status(e, "find file: %s", e->find_path), 0;
   }
   e->find_prompt = false;
+  find_close_created_pane(e);
+  free(footer.data);
+  free(paths.data);
   return switch_to_path(e, path);
 }
 
@@ -3493,6 +3679,7 @@ static int cmd_find_file(edit_state * e, int key) {
                (int) (slash - current + 1), current);
   }
   e->find_len = strlen(e->find_path);
+  e->find_origin_pane = e->active_pane;
   e->find_prompt = true;
   set_status(e, "find file: %s", e->find_path);
   return 0;
@@ -3716,6 +3903,7 @@ static int cmd_replace(edit_state * e, int key) {
 
 static int cmd_cancel(edit_state * e, int key) {
   input_clear(e);
+  bool find = e->find_prompt;
   e->prefix = 0;
   e->search_prompt = false;
   e->search_reuse = false;
@@ -3723,6 +3911,7 @@ static int cmd_cancel(edit_state * e, int key) {
   e->search[0] = '\0';
   replace_clear(e);
   e->find_prompt = false;
+  if (find) find_close_created_pane(e);
   e->run_prompt = false;
   e->quit_confirm = false;
   clear_mark(e);
@@ -4144,7 +4333,8 @@ static int dispatch(edit_state * e, int key) {
 
   if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
   if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
-  if (e->find_prompt) return action_other(e), find_dispatch(e, key);
+  if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND)
+    return action_other(e), find_dispatch(e, key);
   if (e->run_prompt) return action_other(e), run_dispatch(e, key);
   if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);

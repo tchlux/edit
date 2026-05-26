@@ -969,6 +969,7 @@ printf 'child\n' > "$dir/sub/child"
 
 python3 ./tui_view.py 5:200 '^x^f' "$dir/a" > "$out"
 grep -Fq "find.file:.$dir/" "$out"
+grep -q 'cursor:5:' "$out"
 
 ./edit --render-keys 5:30 xk "$dir/a" > "$out"
 grep -q '\*scratch\*' "$out"
@@ -1088,6 +1089,16 @@ case "$(cat "$tmp.head")" in *child*) ;; *) exit 1;; esac
 python3 ./tui_view.py 5:70 "^x^f<tab>" "$dir/a" > "$out"
 grep -q 'gamma' "$out"
 grep -q 'sub/' "$out"
+
+for n in 1 2 3 4; do printf 'long-open\n' > "$dir/long_completion_name_$n"; done
+python3 ./tui_view.py 8:60 "^x^flong_completion<tab>" "$dir/a" > "$out"
+grep -q '\*find.completions\*' "$out"
+grep -q 'long_completion_name_' "$out"
+python3 ./tui_view.py 8:60 "^x^flong_completion<tab>
+" "$dir/a" > "$out"
+grep -q 'long-open' "$out"
+python3 ./tui_view.py 8:60 "^x^flong_completion<tab>^g^xb" "$dir/a" > "$out"
+grep -q '\*find.completions\*' "$out"
 
 printf '%s\n' "$dir/b" > "$recent"
 printf 'alpha\n' > "$dir/a"
