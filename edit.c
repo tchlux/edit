@@ -218,6 +218,10 @@ struct edit_state {
   char run_cmd[COMMAND_SIZE];
   size_t run_len;
   size_t run_pos;
+  bool goto_prompt;
+  char goto_line[STATUS_SIZE];
+  size_t goto_len;
+  size_t goto_pos;
   char status[STATUS_SIZE];
   long long status_ms;
   char footer[STATUS_SIZE];
@@ -760,7 +764,8 @@ static void set_status(edit_state * e, const char * fmt, ...) {
 
 static bool status_busy(edit_state * e) {
   return e->footer[0] || e->debug_note_prompt || e->find_prompt ||
-    e->run_prompt || e->search_prompt || e->replace_phase || e->prefix;
+    e->run_prompt || e->goto_prompt || e->search_prompt ||
+    e->replace_phase || e->prefix;
 }
 
 static int status_timeout(edit_state * e) {
@@ -2127,6 +2132,11 @@ static bool active_prompt_slot(edit_state * e, prompt_slot * s) {
                        &e->run_pos, sizeof(e->run_cmd)};
     return true;
   }
+  if (e->goto_prompt) {
+    *s = (prompt_slot){"goto line: ", e->goto_line, &e->goto_len,
+                       &e->goto_pos, sizeof(e->goto_line)};
+    return true;
+  }
   if (e->search_prompt) {
     *s = (prompt_slot){e->search_reverse ? "rsearch: " : "search: ", e->search,
                        &e->search_len, &e->search_pos, sizeof(e->search)};
@@ -3307,7 +3317,7 @@ static bool fallback_text_byte(char c) {
 
 static bool fallback_context(edit_state * e, int key) {
   return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
-    ! e->run_prompt && ! e->search_prompt && ! e->replace_phase &&
+    ! e->run_prompt && ! e->goto_prompt && ! e->search_prompt && ! e->replace_phase &&
     ! e->debug_recording && ! e->debug_note_prompt &&
     active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
 }
@@ -4054,6 +4064,48 @@ static int cmd_replace(edit_state * e, int key) {
   return 0;
 }
 
+static int cmd_goto_line(edit_state * e, int key) {
+  e->goto_prompt = true;
+  e->goto_len = 0;
+  e->goto_pos = 0;
+  e->goto_line[0] = '\0';
+  set_status(e, "goto line: ");
+  (void) key;
+  return 0;
+}
+
+static bool parse_goto_line(edit_state * e, size_t * line) {
+  if (e->goto_len == 0) return false;
+  for (size_t i = 0; i < e->goto_len; i++)
+    if (! isdigit((unsigned char) e->goto_line[i])) return false;
+  char * end = NULL;
+  errno = 0;
+  unsigned long long n = strtoull(e->goto_line, &end, 10);
+  if (end == e->goto_line || *end != '\0' || n == 0) return false;
+  *line = errno == ERANGE ? SIZE_MAX : (size_t) n;
+  return true;
+}
+
+static size_t goto_line_pos(buffer * b, size_t line) {
+  size_t pos = 0;
+  for (size_t l = 1; l < line && pos < buffer_len(b); l++) pos = next_line(b, pos);
+  return pos;
+}
+
+static int goto_submit(edit_state * e) {
+  size_t line;
+  if (! parse_goto_line(e, &line)) {
+    e->goto_prompt = false;
+    return set_status(e, "bad line"), 0;
+  }
+  pane * p = active_pane(e);
+  p->cursor = goto_line_pos(active_buffer(e), line);
+  p->preferred_col = SIZE_MAX;
+  e->goto_prompt = false;
+  set_status(e, "goto line %zu", line);
+  return 0;
+}
+
 static int cmd_cancel(edit_state * e, int key) {
   input_clear(e);
   bool find = e->find_prompt;
@@ -4067,6 +4119,7 @@ static int cmd_cancel(edit_state * e, int key) {
   e->find_prompt = false;
   if (find) find_close_created_pane(e);
   e->run_prompt = false;
+  e->goto_prompt = false;
   e->quit_confirm = false;
   clear_mark(e);
   set_status(e, "cancel");
@@ -4224,6 +4277,7 @@ static const char HELP_TEXT[] =
   "  C-v, Esc v                        page down and up\n"
   "  Esc n, Esc p                      move 10 lines down and up\n"
   "  Esc <, Esc >                      file start and end\n"
+  "  Esc g g                           goto line\n"
   "  Esc q                             fill paragraph\n"
   "\n"
   "Editing\n"
@@ -4274,6 +4328,7 @@ static int cmd_help(edit_state * e, int key) {
   (void) key;
   e->find_prompt = false;
   e->run_prompt = false;
+  e->goto_prompt = false;
   e->search_prompt = false;
   replace_clear(e);
   e->footer[0] = '\0';
@@ -4327,6 +4382,7 @@ static binding bindings[] = {
   {{KEY_META('q'), 0}, 1, cmd_fill_paragraph},
   {{KEY_META('v'), 0}, 1, cmd_page_up},
   {{KEY_META('%'), 0}, 1, cmd_replace},
+  {{KEY_META('g'), 'g'}, 2, cmd_goto_line},
   {{KEY_META('w'), 0}, 1, cmd_copy_region},
   {{KEY_META('y'), 0}, 1, cmd_yank_pop},
   {{KEY_META('<'), 0}, 1, cmd_file_start},
@@ -4384,6 +4440,16 @@ static int run_dispatch(edit_state * e, int key) {
                    &e->run_pos, sizeof(e->run_cmd)};
   prompt_edit(e, &s, key);
   set_status(e, "run: %s", e->run_cmd);
+  return 0;
+}
+
+static int goto_dispatch(edit_state * e, int key) {
+  if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (key == KEY_ENTER) return goto_submit(e);
+  prompt_slot s = {"goto line: ", e->goto_line, &e->goto_len,
+                   &e->goto_pos, sizeof(e->goto_line)};
+  prompt_edit(e, &s, key);
+  set_status(e, "goto line: %s", e->goto_line);
   return 0;
 }
 
@@ -4463,6 +4529,7 @@ static int dispatch(edit_state * e, int key) {
   if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND)
     return action_other(e), find_dispatch(e, key);
   if (e->run_prompt) return action_other(e), run_dispatch(e, key);
+  if (e->goto_prompt) return action_other(e), goto_dispatch(e, key);
   if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
@@ -4472,10 +4539,10 @@ static int dispatch(edit_state * e, int key) {
     n_keys = 2;
     e->prefix = 0;
     if (keys[0] == KEY_CTRL('q')) return action_other(e), cmd_literal(e, key);
-  } else if (key == KEY_CTRL('x') || key == KEY_CTRL('c')) {
+  } else if (key == KEY_CTRL('x') || key == KEY_CTRL('c') || key == KEY_META('g')) {
     action_other(e);
     e->prefix = key;
-    set_status(e, key == KEY_CTRL('x') ? "C-x" : "C-c");
+    set_status(e, key == KEY_CTRL('x') ? "C-x" : key == KEY_CTRL('c') ? "C-c" : "M-g");
     return 0;
   }
 
@@ -4575,7 +4642,7 @@ static int tui(const char * path) {
         action = "debug-start";
       } else action = "debug-already-recording";
     } else if (key == KEY_PASTE_START && (e.find_prompt || e.search_prompt ||
-               e.replace_phase || e.run_prompt)) {
+               e.replace_phase || e.run_prompt || e.goto_prompt)) {
       dispatch(&e, key);
       action = "prompt-paste";
     } else if (key == KEY_PASTE_START) {

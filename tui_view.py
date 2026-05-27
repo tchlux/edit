@@ -65,6 +65,9 @@ def keys(s):
         elif s.startswith("<m-d>", i):
             out += b"\x1bd"
             i += 5
+        elif s.startswith("<m-g>", i):
+            out += b"\x1bg"
+            i += 5
         elif s.startswith("<m-del>", i):
             out += b"\x1b\x7f"
             i += 7

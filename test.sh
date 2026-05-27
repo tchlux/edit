@@ -306,6 +306,23 @@ python3 ./tui_view.py 6:30 '<opt-gt><opt-lt>' "$tmp" > "$out"
 sed -n '5p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *1:1*) ;; *) exit 1;; esac
 
+python3 ./tui_view.py 6:30 '<right><right><m-g>g7
+' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *7:1*) ;; *) exit 1;; esac
+case "$(tail -n 1 "$out")" in cursor:*:1) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 6:30 '<m-g>g99
+' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *13:1*) ;; *) exit 1;; esac
+
+python3 ./tui_view.py 6:30 '<right><right><down><m-g>gabc
+' "$tmp" > "$out"
+sed -n '5p' "$out" > "$tmp.head"
+case "$(cat "$tmp.head")" in *2:3*) ;; *) exit 1;; esac
+grep -q 'bad.line' "$out"
+
 printf 'one, two_three 9x\n' > "$tmp"
 ./edit --render-keys 4:30 F "$tmp" > "$out"
 printf 'one|,.two_three.9x\n\n%s 1:4\n%s\n' "$base" "$(foot 30 "")" | cmp -s - "$out"
