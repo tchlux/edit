@@ -77,6 +77,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define SEARCH_BLINK_MS 500
 #define STATUS_TIMEOUT_MS 3000
 #define META_REPEAT_MS 1000
+#define ARROW_BATCH_MAX 128
 #define HELP_HINT "C-h help"
 #define DEFAULT_STATUS "C-s/C-r search, C-g cancel, Esc r debug"
 #define PANE_DIVIDER "│"
@@ -250,6 +251,7 @@ struct edit_state {
   struct termios raw_termios;
   grammar grammar;
   bool has_grammar;
+  bool batch_arrows;
 };
 
 static int env_tab_width(void) {
@@ -277,6 +279,7 @@ static void init_state(edit_state * e) {
   e->yank_index = -1;
   e->find_origin_pane = -1;
   e->find_pane = -1;
+  e->batch_arrows = getenv("EDIT_BATCH_ARROWS") != NULL;
 }
 
 static char * _dup(const char * s) {
@@ -3338,6 +3341,32 @@ static int fast_insert(edit_state * e, int key) {
   return rc;
 }
 
+static bool arrow_key(int key) {
+  return key == KEY_UP || key == KEY_DOWN || key == KEY_LEFT || key == KEY_RIGHT;
+}
+
+static bool arrow_batch_context(edit_state * e, int key) {
+  return e->batch_arrows && arrow_key(key) && e->prefix == 0 && ! e->find_prompt &&
+    ! e->run_prompt && ! e->goto_prompt && ! e->search_prompt && ! e->replace_phase &&
+    ! e->debug_recording && ! e->debug_note_prompt;
+}
+
+static void input_unread_event(edit_state * e, key_event * ev) {
+  for (int i = ev->n_raw - 1; i >= 0; i--) input_unread(e, (char) ev->raw[i]);
+}
+
+static void batch_queued_arrows(edit_state * e, int key) {
+  if (! arrow_batch_context(e, key)) return;
+  for (int i = 1; i < ARROW_BATCH_MAX && input_wait(e, 0); i++) {
+    key_event ev = read_key_event(e, 0);
+    if (ev.key != key) {
+      input_unread_event(e, &ev);
+      return;
+    }
+    dispatch(e, key);
+  }
+}
+
 static bool path_suffix(const char * path, const char * suffix) {
   size_t n = strlen(path);
   size_t m = strlen(suffix);
@@ -4653,6 +4682,7 @@ static int tui(const char * path) {
       action = "fast-insert";
     } else if (key != KEY_ESC && key != -1) {
       dispatch(&e, key);
+      batch_queued_arrows(&e, key);
       if (strcmp(action, "esc-meta") != 0 && strcmp(action, "meta-repeat") != 0)
         action = "dispatch";
     }

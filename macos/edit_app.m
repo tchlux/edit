@@ -24,7 +24,7 @@
 
 #define TERM_ROWS 30
 #define TERM_COLS 100
-#define SCROLL_MAX_KEYS 1
+#define SCROLL_MAX_KEYS 48
 #define CSI_MAX 64
 
 enum { AnsiNormal, AnsiEsc, AnsiCsi };
@@ -67,7 +67,12 @@ typedef struct {
 @property NSTimeInterval ignoreScrollUntil;
 @property BOOL dirtyAll;
 @property BOOL hasDirty;
-@property NSRect dirtyRect;
+@property BOOL *dirtyRows;
+@property NSFont *font;
+@property NSFont *boldFont;
+@property NSSize cachedCellSize;
+@property NSMutableDictionary<NSNumber *, NSColor *> *colorCache;
+@property NSMutableDictionary<NSNumber *, NSDictionary *> *attrCache;
 - (instancetype)initWithPath:(NSString *)path;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
@@ -107,7 +112,35 @@ static bool cell_equal(cell a, cell b) {
     a.italic == b.italic && a.reverse == b.reverse;
 }
 
+static int rgb_key(const int *rgb) {
+  return (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+}
+
+static bool rgb_equal(const int *a, const int *b) {
+  return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+}
+
+static const int *cell_fg(cell *c) { return c->reverse ? c->bg : c->fg; }
+static const int *cell_bg(cell *c) { return c->reverse ? c->fg : c->bg; }
+
+static bool cell_same_bg(cell *a, cell *b) {
+  return rgb_equal(cell_bg(a), cell_bg(b));
+}
+
+static bool cell_same_text(cell *a, cell *b) {
+  return rgb_equal(cell_fg(a), cell_fg(b)) && a->bold == b->bold &&
+    a->italic == b->italic;
+}
+
 @implementation EditTerminalView
+
+- (void)setupRenderCache {
+  self.font = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular];
+  self.boldFont = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightBold];
+  self.cachedCellSize = [@"M" sizeWithAttributes:@{ NSFontAttributeName: _font }];
+  self.colorCache = [NSMutableDictionary dictionary];
+  self.attrCache = [NSMutableDictionary dictionary];
+}
 
 - (instancetype)initWithPath:(NSString *)path {
   self = [super initWithFrame:NSMakeRect(0, 0, 900, 520)];
@@ -118,8 +151,10 @@ static bool cell_equal(cell a, cell b) {
   self.utf8 = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
+  [self setupRenderCache];
   attr_default(&_current);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
+  _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
   [self clearScreen];
   [self startEdit:path];
   return self;
@@ -134,8 +169,10 @@ static bool cell_equal(cell a, cell b) {
   self.utf8 = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
+  [self setupRenderCache];
   attr_default(&_current);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
+  _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
   [self clearScreen];
   return self;
 }
@@ -144,8 +181,7 @@ static bool cell_equal(cell a, cell b) {
 - (BOOL)isOpaque { return YES; }
 
 - (NSSize)cellSize {
-  NSDictionary *attrs = @{ NSFontAttributeName: [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular] };
-  return [@"M" sizeWithAttributes:attrs];
+  return _cachedCellSize;
 }
 
 - (void)viewDidMoveToWindow {
@@ -156,6 +192,7 @@ static bool cell_equal(cell a, cell b) {
   if (_fd > 0) close(_fd);
   if (_pid > 0) kill(_pid, SIGHUP);
   free(_cells);
+  free(_dirtyRows);
 }
 
 - (void)clearScreen {
@@ -165,16 +202,15 @@ static bool cell_equal(cell a, cell b) {
   _dirtyAll = YES;
 }
 
-- (NSRect)cellRectRow:(int)row col:(int)col {
+- (NSRect)rowRect:(int)row {
   NSSize size = [self cellSize];
-  return NSMakeRect(col * size.width, self.bounds.size.height - (row + 1) * size.height,
-                    size.width, size.height);
+  return NSMakeRect(0, self.bounds.size.height - (row + 1) * size.height,
+                    _cols * size.width, size.height);
 }
 
 - (void)markCellDirtyRow:(int)row col:(int)col {
   if (_dirtyAll || row < 0 || row >= _rows || col < 0 || col >= _cols) return;
-  NSRect r = [self cellRectRow:row col:col];
-  _dirtyRect = _hasDirty ? NSUnionRect(_dirtyRect, r) : r;
+  _dirtyRows[row] = YES;
   _hasDirty = YES;
 }
 
@@ -184,9 +220,13 @@ static bool cell_equal(cell a, cell b) {
 
 - (void)flushDirty {
   if (_dirtyAll) [self setNeedsDisplay:YES];
-  else if (_hasDirty) [self setNeedsDisplayInRect:NSInsetRect(_dirtyRect, -1, -1)];
+  else if (_hasDirty) {
+    for (int r = 0; r < _rows; r++)
+      if (_dirtyRows[r]) [self setNeedsDisplayInRect:NSInsetRect([self rowRect:r], -1, -1)];
+  }
   _dirtyAll = NO;
   _hasDirty = NO;
+  if (_dirtyRows) memset(_dirtyRows, 0, (size_t)_rows * sizeof(BOOL));
 }
 
 - (void)resizeGrid {
@@ -197,7 +237,9 @@ static bool cell_equal(cell a, cell b) {
   _cols = cols;
   _rows = rows;
   free(_cells);
+  free(_dirtyRows);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
+  _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
   [self clearScreen];
   struct winsize ws = { .ws_row = (unsigned short)_rows, .ws_col = (unsigned short)_cols };
   if (_fd > 0) ioctl(_fd, TIOCSWINSZ, &ws);
@@ -218,6 +260,7 @@ static bool cell_equal(cell a, cell b) {
   pid_t child = forkpty(&master, NULL, NULL, &ws);
   if (child == 0) {
     setenv("TERM", "xterm-256color", 1);
+    setenv("EDIT_BATCH_ARROWS", "1", 1);
     execl(edit.fileSystemRepresentation, "edit", path.fileSystemRepresentation, NULL);
     _exit(127);
   }
@@ -443,34 +486,67 @@ static bool cell_equal(cell a, cell b) {
   return s;
 }
 
-- (NSColor *)color:(int *)rgb {
-  return [NSColor colorWithCalibratedRed:rgb[0] / 255.0 green:rgb[1] / 255.0 blue:rgb[2] / 255.0 alpha:1.0];
+- (NSColor *)color:(const int *)rgb {
+  NSNumber *key = @(rgb_key(rgb));
+  NSColor *color = _colorCache[key];
+  if (!color) {
+    color = [NSColor colorWithCalibratedRed:rgb[0] / 255.0 green:rgb[1] / 255.0 blue:rgb[2] / 255.0 alpha:1.0];
+    _colorCache[key] = color;
+  }
+  return color;
+}
+
+- (NSDictionary *)attrsForCell:(cell *)x {
+  NSUInteger key = ((NSUInteger)rgb_key(cell_fg(x)) << 2) | (x->italic ? 1 : 0) | (x->bold ? 2 : 0);
+  NSNumber *boxed = @(key);
+  NSDictionary *attrs = _attrCache[boxed];
+  if (!attrs) {
+    attrs = @{
+      NSFontAttributeName: x->bold ? _boldFont : _font,
+      NSForegroundColorAttributeName: [self color:cell_fg(x)],
+      NSObliquenessAttributeName: x->italic ? @0.18 : @0
+    };
+    _attrCache[boxed] = attrs;
+  }
+  return attrs;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
   [self resizeGrid];
-  NSFont *font = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular];
   NSSize size = [self cellSize];
   [[NSColor colorWithCalibratedRed:32 / 255.0 green:32 / 255.0 blue:32 / 255.0 alpha:1] setFill];
   NSRectFill(dirtyRect);
 
+  unichar *chars = malloc((size_t)_cols * sizeof(unichar));
   for (int r = 0; r < _rows; r++) {
-    for (int c = 0; c < _cols; c++) {
-      cell x = _cells[r * _cols + c];
-      int *fg = x.reverse ? x.bg : x.fg;
-      int *bg = x.reverse ? x.fg : x.bg;
-      NSRect rect = NSMakeRect(c * size.width, self.bounds.size.height - (r + 1) * size.height, size.width, size.height);
-      if (!NSIntersectsRect(dirtyRect, rect)) continue;
-      [[self color:bg] setFill];
-      NSRectFill(rect);
-      NSDictionary *attrs = @{
-        NSFontAttributeName: font,
-        NSForegroundColorAttributeName: [self color:fg],
-        NSObliquenessAttributeName: x.italic ? @0.18 : @0
-      };
-      [[NSString stringWithCharacters:&x.ch length:1] drawAtPoint:rect.origin withAttributes:attrs];
+    NSRect rowRect = [self rowRect:r];
+    if (!NSIntersectsRect(dirtyRect, rowRect)) continue;
+
+    for (int c = 0; c < _cols;) {
+      int start = c;
+      cell *first = &_cells[r * _cols + c++];
+      while (c < _cols && cell_same_bg(first, &_cells[r * _cols + c])) c++;
+      [[self color:cell_bg(first)] setFill];
+      NSRectFill(NSMakeRect(start * size.width, rowRect.origin.y,
+                            (c - start) * size.width, size.height));
+    }
+
+    for (int c = 0; c < _cols;) {
+      int start = c;
+      bool hasText = false;
+      cell *first = &_cells[r * _cols + c];
+      while (c < _cols && cell_same_text(first, &_cells[r * _cols + c])) {
+        chars[c - start] = _cells[r * _cols + c].ch;
+        if (_cells[r * _cols + c].ch != ' ') hasText = true;
+        c++;
+      }
+      if (!hasText) continue;
+      NSString *s = [[NSString alloc] initWithCharacters:chars length:c - start];
+      [s drawAtPoint:NSMakePoint(start * size.width, rowRect.origin.y)
+      withAttributes:[self attrsForCell:first]];
     }
   }
+  free(chars);
   if (_cursorVisible && _row >= 0 && _row < _rows && _col >= 0 && _col < _cols) {
     [[NSColor colorWithCalibratedWhite:0.85 alpha:1] setFill];
     NSRectFillUsingOperation(NSMakeRect(_col * size.width, self.bounds.size.height - (_row + 1) * size.height, size.width, size.height), NSCompositingOperationDifference);
@@ -508,7 +584,6 @@ static bool cell_equal(cell a, cell b) {
   CGFloat ax = fabs(dx), ay = fabs(dy);
   int sent = 0;
   if ([NSDate timeIntervalSinceReferenceDate] < _ignoreScrollUntil) return 0;
-  if (_readPending) return 0;
   if (ax == 0 && ay == 0) return 0;
 
   if (ay >= ax) {
@@ -519,7 +594,6 @@ static bool cell_equal(cell a, cell b) {
       _scrollY += (_scrollY < 0) ? step : -step;
       sent++;
     }
-    if (sent == SCROLL_MAX_KEYS) _scrollY = 0;
   } else {
     _scrollX += dx;
     CGFloat step = precise ? cell.width : 1;
@@ -528,15 +602,12 @@ static bool cell_equal(cell a, cell b) {
       _scrollX += (_scrollX < 0) ? step : -step;
       sent++;
     }
-    if (sent == SCROLL_MAX_KEYS) _scrollX = 0;
   }
-  if (sent > 0) _readPending = true;
   return sent;
 }
 
 - (void)scrollWheel:(NSEvent *)event {
-  if (event.momentumPhase != NSEventPhaseNone ||
-      [NSDate timeIntervalSinceReferenceDate] < _ignoreScrollUntil) return;
+  if ([NSDate timeIntervalSinceReferenceDate] < _ignoreScrollUntil) return;
   [self sendScrollDeltaX:event.scrollingDeltaX y:event.scrollingDeltaY precise:event.hasPreciseScrollingDeltas];
 }
 
@@ -702,6 +773,41 @@ static void ansi_feed(EditTerminalView *view, const char *s) {
   [view readBytes:[NSData dataWithBytes:s length:strlen(s)]];
 }
 
+static NSData *ansi_bench_frame(EditTerminalView *view, int phase) {
+  NSMutableString *s = [NSMutableString stringWithString:@"\033[H"];
+  for (int r = 0; r < view.rows; r++) {
+    [s appendFormat:@"\033[%d;1H\033[38;2;%d;%d;%dm", r + 1,
+     180 + ((r + phase) % 50), 190 + ((r * 3) % 40), 210 + ((phase * 7) % 30)];
+    for (int c = 0; c < view.cols; c++)
+      [s appendFormat:@"%c", 'a' + ((r + c + phase) % 26)];
+  }
+  return [s dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static int ansi_bench(void) {
+  EditTerminalView *view = [[EditTerminalView alloc] initForAnsiSelfTest];
+  NSData *frames[] = { ansi_bench_frame(view, 0), ansi_bench_frame(view, 1) };
+  NSBitmapImageRep *rep = [[NSBitmapImageRep alloc]
+    initWithBitmapDataPlanes:NULL pixelsWide:view.bounds.size.width
+    pixelsHigh:view.bounds.size.height bitsPerSample:8 samplesPerPixel:4
+    hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace
+    bytesPerRow:0 bitsPerPixel:0];
+  NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+  int n = 300;
+  CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+  [NSGraphicsContext saveGraphicsState];
+  [NSGraphicsContext setCurrentContext:ctx];
+  for (int i = 0; i < n; i++) {
+    [view readBytes:frames[i & 1]];
+    [view drawRect:view.bounds];
+  }
+  [NSGraphicsContext restoreGraphicsState];
+  CFAbsoluteTime secs = CFAbsoluteTimeGetCurrent() - start;
+  printf("ansi-bench frames=%d seconds=%.3f fps=%.1f cells_per_second=%.0f\n",
+         n, secs, n / secs, (double)n * view.rows * view.cols / secs);
+  return 0;
+}
+
 static int ansi_self_test(void) {
   EditTerminalView *view = [[EditTerminalView alloc] initForAnsiSelfTest];
   ansi_feed(view, "\033[38;2;232");
@@ -736,14 +842,36 @@ static int ansi_self_test(void) {
   EditTerminalView *scrollView = [[EditTerminalView alloc] initForAnsiSelfTest];
   scrollView.fd = p[1];
   int sent = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
-  int dropped = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
+  int sent2 = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
   close(p[1]);
   scrollView.fd = -1;
-  char buf[128];
+  char buf[512];
   ssize_t got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  if (sent > SCROLL_MAX_KEYS || dropped != 0 || got > SCROLL_MAX_KEYS * 3) {
-    fprintf(stderr, "scroll cap failed: sent=%d dropped=%d got=%zd\n", sent, dropped, got);
+  if (sent != SCROLL_MAX_KEYS || sent2 != SCROLL_MAX_KEYS ||
+      got != (sent + sent2) * 3) {
+    fprintf(stderr, "scroll cap failed: sent=%d sent2=%d got=%zd\n", sent, sent2, got);
+    return 1;
+  }
+  for (ssize_t i = 0; i < got; i += 3)
+    if (buf[i] != 0x1b || buf[i + 1] != '[' || buf[i + 2] != 'B') {
+      fprintf(stderr, "scroll emitted non-line-key bytes\n");
+      return 1;
+    }
+
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *preciseView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  preciseView.fd = p[1];
+  NSSize cell = [preciseView cellSize];
+  int half = [preciseView sendScrollDeltaX:0 y:-cell.height / 2 precise:YES];
+  int rest = [preciseView sendScrollDeltaX:0 y:-cell.height / 2 precise:YES];
+  close(p[1]);
+  preciseView.fd = -1;
+  got = read(p[0], buf, sizeof(buf));
+  close(p[0]);
+  if (half != 0 || rest != 1 || got != 3 ||
+      buf[0] != 0x1b || buf[1] != '[' || buf[2] != 'B') {
+    fprintf(stderr, "precise scroll failed: half=%d rest=%d got=%zd\n", half, rest, got);
     return 1;
   }
 
@@ -766,6 +894,8 @@ int main(int argc, const char **argv) {
   @autoreleasepool {
     if (argc == 2 && strcmp(argv[1], "--ansi-self-test") == 0)
       return ansi_self_test();
+    if (argc == 2 && strcmp(argv[1], "--ansi-bench") == 0)
+      return ansi_bench();
     NSApplication *app = [NSApplication sharedApplication];
     EditAppDelegate *delegate = [[EditAppDelegate alloc] init];
     app.delegate = delegate;
