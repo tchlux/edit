@@ -445,6 +445,10 @@ grep -q 'kind=mac-option key=M-f raw=c6 92' "$tmp.debug3"
 grep -q 'state after .*cursor=3.*line=1.*col=4' "$tmp.debug3"
 grep -q '^note=mac option' "$tmp.debug3"
 
+EDIT_DEBUG_LOG="$tmp.debug3" python3 ./tui_view.py 4:60 '<m-r><esc>foo bar^a<m-f>X
+' "$tmp" > "$out"
+grep -q '^note=fooX bar' "$tmp.debug3"
+
 printf 'l01xx\nl02xx\nl03xx\nl04xx\nl05xx\nl06xx\nl07xx\nl08xx\nl09xx\nl10xx\nl11xx\nl12xx\n' > "$tmp"
 python3 ./tui_view.py 6:20 '<right><right><opt-n>' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
@@ -626,6 +630,15 @@ ONE
 !^x^s' "$tmp" > "$out"
 printf 'ONE ONE\n' | cmp -s - "$tmp"
 
+printf 'foo bar\n' > "$tmp"
+python3 ./tui_view.py 4:50 '<opt-%>foo bar^a<m-f>X' "$tmp" > "$out"
+grep -q 'replace:.fooX.bar' "$out"
+
+printf 'foo bar\n' > "$tmp"
+python3 ./tui_view.py 4:50 '<opt-%>foo
+bar baz^a<m-f>X' "$tmp" > "$out"
+grep -q 'with:.barX.baz' "$out"
+
 printf '* one *\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<esc>%*
 X
@@ -797,6 +810,20 @@ python3 ./tui_view.py 4:40 '^s<paste>PASTE</paste>
 ' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:2:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'fooX bar\n' > "$tmp"
+python3 ./tui_view.py 4:50 '^sfoo bar^a<m-f>X
+' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+printf 'foo\n' > "$tmp"
+python3 ./tui_view.py 4:50 '^sfoo bar<m-del>
+' "$tmp" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:1:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 printf 'abc\n' > "$tmp"
@@ -971,6 +998,17 @@ python3 ./tui_view.py 5:200 '^x^f' "$dir/a" > "$out"
 grep -Fq "find.file:.$dir/" "$out"
 grep -q 'cursor:5:' "$out"
 
+python3 ./tui_view.py 5:80 '^x^f^a^kfoo bar^a<m-f>' "$dir/a" > "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:5:15\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
+python3 ./tui_view.py 5:80 '^x^f^a^kfoo bar<m-del>' "$dir/a" > "$out"
+grep -q 'find.file:.foo' "$out"
+tail -n 1 "$out" > "$tmp.head"
+printf 'cursor:5:16\n' > "$tmp.expected"
+cmp -s "$tmp.expected" "$tmp.head"
+
 ./edit --render-keys 5:30 xk "$dir/a" > "$out"
 grep -q '\*scratch\*' "$out"
 
@@ -1125,6 +1163,12 @@ grep -q 'command-output' "$out"
 grep -q 'cursor:1:1' "$out"
 grep -q "theme	dark" "$run_home/.edit/config"
 grep -q "run	$dir/a	printf command-output" "$run_home/.edit/config"
+
+run_prompt_home="$dir/run-prompt-home"
+mkdir "$run_prompt_home"
+env SHELL=/bin/zsh HOME="$run_prompt_home" python3 ./tui_view.py 8:120 '^cx^a^kecho two^a<m-f> one
+' "$dir/a" > "$out"
+grep -q 'one.two' "$out"
 
 env SHELL=/bin/zsh HOME="$run_home" python3 ./tui_view.py 8:120 '^cx
 ' "$dir/a" > "$out"

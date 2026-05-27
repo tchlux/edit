@@ -173,6 +173,14 @@ typedef struct {
   char kind[24];
 } key_event;
 
+typedef struct {
+  const char * label;
+  char * text;
+  size_t * len;
+  size_t * pos;
+  size_t cap;
+} prompt_slot;
+
 struct edit_state {
   buffer buffers[8];
   pane panes[PANE_MAX];
@@ -192,20 +200,24 @@ struct edit_state {
   bool search_reuse;
   char search[STATUS_SIZE];
   size_t search_len;
+  size_t search_pos;
   int replace_phase;
   char replace[STATUS_SIZE];
   size_t replace_len;
+  size_t replace_pos;
   size_t replace_start;
   size_t replace_end;
   bool find_prompt;
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
+  size_t find_pos;
   int find_origin_pane;
   int find_pane;
   bool find_created_pane;
   bool run_prompt;
   char run_cmd[COMMAND_SIZE];
   size_t run_len;
+  size_t run_pos;
   char status[STATUS_SIZE];
   long long status_ms;
   char footer[STATUS_SIZE];
@@ -228,6 +240,7 @@ struct edit_state {
   char debug_path[DEBUG_PATH_SIZE];
   char debug_note[STATUS_SIZE];
   size_t debug_note_len;
+  size_t debug_note_pos;
   unsigned debug_event;
   struct termios saved_termios;
   struct termios raw_termios;
@@ -1343,6 +1356,7 @@ static bool directory_path(const char * path) {
 static void find_set(edit_state * e, const char * path) {
   snprintf(e->find_path, sizeof(e->find_path), "%s", path);
   e->find_len = strlen(e->find_path);
+  e->find_pos = e->find_len;
 }
 
 static bool find_name_matches(const char * name, const char * base, bool regex) {
@@ -2097,12 +2111,51 @@ static const char * file_name(const char * path) {
   return slash ? slash + 1 : path;
 }
 
-static bool find_footer_cursor(edit_state * e) {
-  return e->find_prompt && e->footer[0] == '\0' && active_buffer(e)->kind != BUFFER_FIND;
+static bool active_prompt_slot(edit_state * e, prompt_slot * s) {
+  if (e->debug_note_prompt) {
+    *s = (prompt_slot){"debug note: ", e->debug_note, &e->debug_note_len,
+                       &e->debug_note_pos, sizeof(e->debug_note)};
+    return true;
+  }
+  if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND) {
+    *s = (prompt_slot){"find file: ", e->find_path, &e->find_len,
+                       &e->find_pos, sizeof(e->find_path)};
+    return true;
+  }
+  if (e->run_prompt) {
+    *s = (prompt_slot){"run: ", e->run_cmd, &e->run_len,
+                       &e->run_pos, sizeof(e->run_cmd)};
+    return true;
+  }
+  if (e->search_prompt) {
+    *s = (prompt_slot){e->search_reverse ? "rsearch: " : "search: ", e->search,
+                       &e->search_len, &e->search_pos, sizeof(e->search)};
+    return true;
+  }
+  if (e->replace_phase == REPLACE_SEARCH) {
+    *s = (prompt_slot){"replace: ", e->search, &e->search_len,
+                       &e->search_pos, sizeof(e->search)};
+    return true;
+  }
+  if (e->replace_phase == REPLACE_WITH) {
+    *s = (prompt_slot){"with: ", e->replace, &e->replace_len,
+                       &e->replace_pos, sizeof(e->replace)};
+    return true;
+  }
+  return false;
 }
 
-static size_t find_footer_cursor_col(edit_state * e, int cols) {
-  size_t msg = strlen("find file: ") + e->find_len;
+static bool prompt_footer_cursor(edit_state * e) {
+  prompt_slot s;
+  return e->footer[0] == '\0' && active_prompt_slot(e, &s) &&
+    strncmp(e->status, s.label, strlen(s.label)) == 0;
+}
+
+static size_t prompt_footer_cursor_col(edit_state * e, int cols) {
+  prompt_slot s;
+  if (! active_prompt_slot(e, &s)) return 0;
+  if (*s.pos > *s.len) *s.pos = *s.len;
+  size_t msg = strlen(s.label) + *s.pos;
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t hint = strlen(HELP_HINT);
   size_t max = (limit > hint + 1) ? limit - hint - 1 : 0;
@@ -2114,13 +2167,25 @@ static void footer_line(edit_state * e, output * o, int cols) {
   size_t used = 0;
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t hint = strlen(HELP_HINT);
-  bool cursor = ! e->raw && find_footer_cursor(e);
-  size_t cursor_col = cursor ? find_footer_cursor_col(e, cols) : SIZE_MAX;
+  bool cursor = ! e->raw && prompt_footer_cursor(e);
+  size_t cursor_col = cursor ? prompt_footer_cursor_col(e, cols) : SIZE_MAX;
   if (limit <= hint) {
     out_clip(o, HELP_HINT, &used, limit);
     return;
   }
-  out_clip(o, msg, &used, limit - hint);
+  if (cursor) {
+    prompt_slot s;
+    active_prompt_slot(e, &s);
+    if (*s.pos > *s.len) *s.pos = *s.len;
+    for (const char * p = s.label; *p && used < limit - hint; p++, used++) {
+      if (used == cursor_col) out_s(o, "|");
+      out_add(o, p, 1);
+    }
+    for (size_t i = 0; i < *s.len && used < limit - hint; i++, used++) {
+      if (used == cursor_col) out_s(o, "|");
+      out_add(o, s.text + i, 1);
+    }
+  } else out_clip(o, msg, &used, limit - hint);
   while (used < limit - hint) {
     if (used == cursor_col) out_s(o, "|");
     out_s(o, " ");
@@ -2188,8 +2253,8 @@ static void render(edit_state * e) {
     out_f(&o, "\x1b[0m\x1b[%sm\r\n\x1b[90m", BASE_SGR);
     render_footer(e, &o, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-    if (find_footer_cursor(e))
-      out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, find_footer_cursor_col(e, e->cols) + 1);
+    if (prompt_footer_cursor(e))
+      out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, prompt_footer_cursor_col(e, e->cols) + 1);
     else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
     debug_log_render(e, &o);
     write(STDOUT_FILENO, o.data, o.len);
@@ -2230,8 +2295,8 @@ static void render(edit_state * e) {
   out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
   render_footer(e, &o, e->cols);
   out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-  if (find_footer_cursor(e))
-    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, find_footer_cursor_col(e, e->cols) + 1);
+  if (prompt_footer_cursor(e))
+    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, prompt_footer_cursor_col(e, e->cols) + 1);
   else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
   debug_log_render(e, &o);
@@ -2511,9 +2576,12 @@ static void debug_stop_prompt(edit_state * e) {
   e->debug_recording = false;
   e->debug_note_prompt = true;
   e->debug_note_len = 0;
+  e->debug_note_pos = 0;
   e->debug_note[0] = '\0';
   set_status(e, "debug note: ");
 }
+
+static bool prompt_edit(edit_state * e, prompt_slot * s, int key);
 
 static const char * debug_note_key(edit_state * e, key_event * ev) {
   if (ev->key == KEY_ENTER) {
@@ -2524,12 +2592,9 @@ static const char * debug_note_key(edit_state * e, key_event * ev) {
     set_status(e, "debug saved %s", e->debug_path);
     return "debug-note-saved";
   }
-  if (ev->key == KEY_BACKSPACE && e->debug_note_len > 0)
-    e->debug_note[--e->debug_note_len] = '\0';
-  else if (ev->key >= 32 && ev->key < 127 && e->debug_note_len + 1 < sizeof(e->debug_note)) {
-    e->debug_note[e->debug_note_len++] = (char) ev->key;
-    e->debug_note[e->debug_note_len] = '\0';
-  }
+  prompt_slot s = {"debug note: ", e->debug_note, &e->debug_note_len,
+                   &e->debug_note_pos, sizeof(e->debug_note)};
+  prompt_edit(e, &s, ev->key);
   set_status(e, "debug note: %s", e->debug_note);
   return "debug-note";
 }
@@ -3129,28 +3194,110 @@ static int cmd_paste(edit_state * e) {
   return rc;
 }
 
-static void prompt_add(char * prompt, size_t * len, const char * data, size_t n) {
-  for (size_t i = 0; i < n && *len + 1 < STATUS_SIZE; i++) {
-    if (data[i] == '\0') continue;
-    prompt[(*len)++] = data[i];
-  }
-  prompt[*len] = '\0';
+static bool prompt_utf8_cont(const char * text, size_t pos) {
+  return ((unsigned char) text[pos] & 0xc0) == 0x80;
 }
 
-static bool prompt_yank(char * prompt, size_t * len) {
+static size_t prompt_next_char(prompt_slot * s, size_t pos) {
+  if (pos >= *s->len) return *s->len;
+  do pos++;
+  while (pos < *s->len && prompt_utf8_cont(s->text, pos));
+  return pos;
+}
+
+static size_t prompt_prev_char(prompt_slot * s, size_t pos) {
+  if (pos == 0) return 0;
+  if (pos > *s->len) pos = *s->len;
+  do pos--;
+  while (pos > 0 && prompt_utf8_cont(s->text, pos));
+  return pos;
+}
+
+static bool prompt_word_byte(prompt_slot * s, size_t pos) {
+  if (pos >= *s->len) return false;
+  unsigned char c = (unsigned char) s->text[pos];
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+    (c >= '0' && c <= '9');
+}
+
+static bool prompt_camel_boundary(prompt_slot * s, size_t pos) {
+  if (pos == 0 || pos >= *s->len) return false;
+  unsigned char a = (unsigned char) s->text[pos - 1];
+  unsigned char c = (unsigned char) s->text[pos];
+  return prompt_word_byte(s, pos - 1) && prompt_word_byte(s, pos) &&
+    islower(a) && isupper(c);
+}
+
+static size_t prompt_word_forward(prompt_slot * s, size_t pos) {
+  while (pos < *s->len && ! prompt_word_byte(s, pos)) pos++;
+  if (pos < *s->len) pos++;
+  while (pos < *s->len && prompt_word_byte(s, pos) && ! prompt_camel_boundary(s, pos)) pos++;
+  return pos;
+}
+
+static size_t prompt_word_back(prompt_slot * s, size_t pos) {
+  size_t original = pos;
+  while (pos > 0 && ! prompt_word_byte(s, pos - 1)) pos--;
+  while (pos > 0 && prompt_word_byte(s, pos - 1)) {
+    if (pos != original && prompt_camel_boundary(s, pos)) break;
+    pos--;
+  }
+  return pos;
+}
+
+static void prompt_delete(prompt_slot * s, size_t start, size_t end) {
+  if (start > *s->len) start = *s->len;
+  if (end > *s->len) end = *s->len;
+  if (start >= end) return;
+  memmove(s->text + start, s->text + end, *s->len - end + 1);
+  *s->len -= end - start;
+  *s->pos = start;
+}
+
+static void prompt_insert(prompt_slot * s, const char * data, size_t n) {
+  if (*s->pos > *s->len) *s->pos = *s->len;
+  for (size_t i = 0; i < n && *s->len + 1 < s->cap; i++) {
+    if (data[i] == '\0') continue;
+    memmove(s->text + *s->pos + 1, s->text + *s->pos, *s->len - *s->pos + 1);
+    s->text[(*s->pos)++] = data[i];
+    (*s->len)++;
+  }
+}
+
+static bool prompt_yank(prompt_slot * s) {
   output o = {0};
   bool ok = clipboard_read(&o);
-  if (ok) prompt_add(prompt, len, o.data, o.len);
+  if (ok) prompt_insert(s, o.data, o.len);
   free(o.data);
   return ok;
 }
 
-static bool prompt_paste(char * prompt, size_t * len, edit_state * e) {
+static bool prompt_paste(prompt_slot * s, edit_state * e) {
   output o = read_paste(e);
   bool ok = o.len > 0;
-  prompt_add(prompt, len, o.data, o.len);
+  prompt_insert(s, o.data, o.len);
   free(o.data);
   return ok;
+}
+
+static bool prompt_edit(edit_state * e, prompt_slot * s, int key) {
+  if (*s->pos > *s->len) *s->pos = *s->len;
+  if (key == KEY_LEFT || key == KEY_CTRL('b')) *s->pos = prompt_prev_char(s, *s->pos);
+  else if (key == KEY_RIGHT || key == KEY_CTRL('f')) *s->pos = prompt_next_char(s, *s->pos);
+  else if (key == KEY_CTRL('a')) *s->pos = 0;
+  else if (key == KEY_CTRL('e')) *s->pos = *s->len;
+  else if (key == KEY_META('b')) *s->pos = prompt_word_back(s, *s->pos);
+  else if (key == KEY_META('f')) *s->pos = prompt_word_forward(s, *s->pos);
+  else if (key == KEY_BACKSPACE) prompt_delete(s, prompt_prev_char(s, *s->pos), *s->pos);
+  else if (key == KEY_CTRL('d')) prompt_delete(s, *s->pos, prompt_next_char(s, *s->pos));
+  else if (key == KEY_META(KEY_BACKSPACE)) prompt_delete(s, prompt_word_back(s, *s->pos), *s->pos);
+  else if (key == KEY_META('d')) prompt_delete(s, *s->pos, prompt_word_forward(s, *s->pos));
+  else if (key == KEY_CTRL('k')) prompt_delete(s, *s->pos, *s->len);
+  else if (key == KEY_CTRL('y')) prompt_yank(s);
+  else if (key == KEY_PASTE_START) prompt_paste(s, e);
+  else if (key >= 32 && key < 127) prompt_insert(s, &(char){(char) key}, 1);
+  else return false;
+  return true;
 }
 
 static bool fallback_text_byte(char c) {
@@ -3588,6 +3735,7 @@ static int cmd_run(edit_state * e, int key) {
   e->run_cmd[0] = '\0';
   run_config_load(path, e->run_cmd, sizeof(e->run_cmd));
   e->run_len = strlen(e->run_cmd);
+  e->run_pos = e->run_len;
   e->run_prompt = true;
   set_status(e, "run: %s", e->run_cmd);
   return 0;
@@ -3679,6 +3827,7 @@ static int cmd_find_file(edit_state * e, int key) {
                (int) (slash - current + 1), current);
   }
   e->find_len = strlen(e->find_path);
+  e->find_pos = e->find_len;
   e->find_origin_pane = e->active_pane;
   e->find_prompt = true;
   set_status(e, "find file: %s", e->find_path);
@@ -3816,6 +3965,7 @@ static int cmd_search_dir(edit_state * e, bool reverse) {
   e->search_prompt = true;
   e->search_reverse = reverse;
   e->search_reuse = e->search_len > 0;
+  e->search_pos = e->search_len;
   set_status(e, "%ssearch: %s", reverse ? "r" : "", e->search);
   return 0;
 }
@@ -3834,9 +3984,11 @@ static void replace_clear(edit_state * e) {
   bool active = e->replace_phase != 0;
   e->replace_phase = 0;
   e->replace_len = 0;
+  e->replace_pos = 0;
   e->replace[0] = '\0';
   if (active) {
     e->search_len = 0;
+    e->search_pos = 0;
     e->search[0] = '\0';
   }
 }
@@ -3893,6 +4045,7 @@ static int replace_all(edit_state * e) {
 static int cmd_replace(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   e->search_len = 0;
+  e->search_pos = 0;
   e->search[0] = '\0';
   replace_clear(e);
   e->replace_phase = REPLACE_SEARCH;
@@ -3908,6 +4061,7 @@ static int cmd_cancel(edit_state * e, int key) {
   e->search_prompt = false;
   e->search_reuse = false;
   e->search_len = 0;
+  e->search_pos = 0;
   e->search[0] = '\0';
   replace_clear(e);
   e->find_prompt = false;
@@ -4216,12 +4370,9 @@ static int find_dispatch(edit_state * e, int key) {
   e->footer[0] = '\0';
   if (key == KEY_ENTER) return open_find_path(e);
   if (key == KEY_CTRL('i')) return find_complete(e);
-  if (key == KEY_BACKSPACE && e->find_len > 0) {
-    e->find_path[--e->find_len] = '\0';
-  } else if (key >= 32 && key < 127 && e->find_len + 1 < sizeof(e->find_path)) {
-    e->find_path[e->find_len++] = (char) key;
-    e->find_path[e->find_len] = '\0';
-  }
+  prompt_slot s = {"find file: ", e->find_path, &e->find_len,
+                   &e->find_pos, sizeof(e->find_path)};
+  prompt_edit(e, &s, key);
   set_status(e, "find file: %s", e->find_path);
   return 0;
 }
@@ -4229,16 +4380,9 @@ static int find_dispatch(edit_state * e, int key) {
 static int run_dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
   if (key == KEY_ENTER) return run_submit(e);
-  if (key == KEY_BACKSPACE && e->run_len > 0) {
-    e->run_cmd[--e->run_len] = '\0';
-  } else if (key == KEY_CTRL('y')) {
-    prompt_yank(e->run_cmd, &e->run_len);
-  } else if (key == KEY_PASTE_START) {
-    prompt_paste(e->run_cmd, &e->run_len, e);
-  } else if (key >= 32 && key < 127 && e->run_len + 1 < sizeof(e->run_cmd)) {
-    e->run_cmd[e->run_len++] = (char) key;
-    e->run_cmd[e->run_len] = '\0';
-  }
+  prompt_slot s = {"run: ", e->run_cmd, &e->run_len,
+                   &e->run_pos, sizeof(e->run_cmd)};
+  prompt_edit(e, &s, key);
   set_status(e, "run: %s", e->run_cmd);
   return 0;
 }
@@ -4262,22 +4406,13 @@ static int search_dispatch(edit_state * e, int key) {
   if (e->search_reuse &&
       (key == KEY_CTRL('y') || key == KEY_PASTE_START || (key >= 32 && key < 127))) {
     e->search_len = 0;
+    e->search_pos = 0;
     e->search[0] = '\0';
     e->search_reuse = false;
   }
-  if (key == KEY_BACKSPACE && e->search_len > 0) {
-    e->search[--e->search_len] = '\0';
-    e->search_reuse = false;
-  } else if (key == KEY_CTRL('y')) {
-    prompt_yank(e->search, &e->search_len);
-    e->search_reuse = false;
-  } else if (key == KEY_PASTE_START) {
-    prompt_paste(e->search, &e->search_len, e);
-    e->search_reuse = false;
-  } else if ((key >= 32) && (key < 127) && e->search_len + 1 < sizeof(e->search)) {
-    e->search[e->search_len++] = (char) key;
-    e->search[e->search_len] = '\0';
-  }
+  prompt_slot s = {e->search_reverse ? "rsearch: " : "search: ", e->search,
+                   &e->search_len, &e->search_pos, sizeof(e->search)};
+  if (prompt_edit(e, &s, key)) e->search_reuse = false;
   set_status(e, "%ssearch: %s", e->search_reverse ? "r" : "", e->search);
   return 0;
 }
@@ -4291,25 +4426,17 @@ static int replace_dispatch(edit_state * e, int key) {
       set_status(e, "with: %s", e->replace);
       return 0;
     }
-    if (key == KEY_BACKSPACE && e->search_len > 0) e->search[--e->search_len] = '\0';
-    else if (key == KEY_CTRL('y')) prompt_yank(e->search, &e->search_len);
-    else if (key == KEY_PASTE_START) prompt_paste(e->search, &e->search_len, e);
-    else if (key >= 32 && key < 127 && e->search_len + 1 < sizeof(e->search)) {
-      e->search[e->search_len++] = (char) key;
-      e->search[e->search_len] = '\0';
-    }
+    prompt_slot s = {"replace: ", e->search, &e->search_len,
+                     &e->search_pos, sizeof(e->search)};
+    prompt_edit(e, &s, key);
     set_status(e, "replace: %s", e->search);
     return 0;
   }
   if (e->replace_phase == REPLACE_WITH) {
     if (key == KEY_ENTER) return replace_find(e, active_pane(e)->cursor);
-    if (key == KEY_BACKSPACE && e->replace_len > 0) e->replace[--e->replace_len] = '\0';
-    else if (key == KEY_CTRL('y')) prompt_yank(e->replace, &e->replace_len);
-    else if (key == KEY_PASTE_START) prompt_paste(e->replace, &e->replace_len, e);
-    else if (key >= 32 && key < 127 && e->replace_len + 1 < sizeof(e->replace)) {
-      e->replace[e->replace_len++] = (char) key;
-      e->replace[e->replace_len] = '\0';
-    }
+    prompt_slot s = {"with: ", e->replace, &e->replace_len,
+                     &e->replace_pos, sizeof(e->replace)};
+    prompt_edit(e, &s, key);
     set_status(e, "with: %s", e->replace);
     return 0;
   }
@@ -4425,8 +4552,7 @@ static int tui(const char * path) {
         action = "esc-meta";
       }
     }
-    if (! e.debug_note_prompt && ! e.find_prompt && ! e.run_prompt &&
-        ! e.search_prompt && ! e.replace_phase && e.prefix == 0) {
+    if (! e.debug_recording && e.prefix == 0) {
       int repeat = meta_repeat_key(&e, &ev, key);
       if (repeat != key) {
         key = repeat;
@@ -4448,7 +4574,8 @@ static int tui(const char * path) {
         debug_log_state(&e, "before");
         action = "debug-start";
       } else action = "debug-already-recording";
-    } else if (key == KEY_PASTE_START && (e.search_prompt || e.replace_phase || e.run_prompt)) {
+    } else if (key == KEY_PASTE_START && (e.find_prompt || e.search_prompt ||
+               e.replace_phase || e.run_prompt)) {
       dispatch(&e, key);
       action = "prompt-paste";
     } else if (key == KEY_PASTE_START) {
@@ -4462,8 +4589,7 @@ static int tui(const char * path) {
       if (strcmp(action, "esc-meta") != 0 && strcmp(action, "meta-repeat") != 0)
         action = "dispatch";
     }
-    if (e.debug_note_prompt || e.find_prompt || e.run_prompt ||
-        e.search_prompt || e.replace_phase || e.prefix)
+    if (e.debug_recording || e.prefix)
       e.meta_repeat_key = 0;
     else remember_meta_repeat(&e, key, ev.end_ms);
 
