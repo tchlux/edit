@@ -138,6 +138,10 @@ static int _text_path(const char * path) {
   return _suffix(path, ".txt");
 }
 
+static int _fortran_path(const char * path) {
+  return _suffix(path, ".f90");
+}
+
 static void _paint(const char ** sgrs, size_t len, size_t start, size_t end,
                    const char * sgr) {
   if (start > len) start = len;
@@ -185,10 +189,36 @@ static int _word_in(const char * words, const char * s, size_t n) {
   return 0;
 }
 
+static int _word_in_ci(const char * words, const char * s, size_t n) {
+  const char * p = words;
+  while (*p != '\0') {
+    while (*p == ' ') p++;
+    const char * q = p;
+    while (*q != '\0' && *q != ' ') q++;
+    if ((size_t) (q - p) == n) {
+      size_t i = 0;
+      while (i < n && tolower((unsigned char) p[i]) ==
+             tolower((unsigned char) s[i])) i++;
+      if (i == n) return 1;
+    }
+    p = q;
+  }
+  return 0;
+}
+
 static size_t _quote_end(const char * line, size_t len, size_t i) {
   char quote = line[i++];
   while (i < len) {
     if (line[i] == '\\' && i + 1 < len) i += 2;
+    else if (line[i++] == quote) break;
+  }
+  return i;
+}
+
+static size_t _fortran_quote_end(const char * line, size_t len, size_t i) {
+  char quote = line[i++];
+  while (i < len) {
+    if (line[i] == quote && i + 1 < len && line[i+1] == quote) i += 2;
     else if (line[i++] == quote) break;
   }
   return i;
@@ -230,6 +260,44 @@ static size_t _number_end(const char * line, size_t len, size_t i) {
   if (i + 1 < len && line[i] == '.' && isdigit((unsigned char) line[i+1]))
     while (++i < len && isdigit((unsigned char) line[i])) {}
   return i;
+}
+
+static size_t _fortran_number_end(const char * line, size_t len, size_t i) {
+  while (i < len && isdigit((unsigned char) line[i])) i++;
+  if (i + 1 < len && line[i] == '.' && isdigit((unsigned char) line[i+1]))
+    while (++i < len && isdigit((unsigned char) line[i])) {}
+  if (i < len && (line[i] == 'e' || line[i] == 'E')) {
+    size_t j = i + 1;
+    if (j < len && (line[j] == '+' || line[j] == '-')) j++;
+    if (j < len && isdigit((unsigned char) line[j])) {
+      while (++j < len && isdigit((unsigned char) line[j])) {}
+      i = j;
+    }
+  }
+  if (i < len && line[i] == '_') {
+    i++;
+    while (i < len && _word_char(line[i])) i++;
+  }
+  return i;
+}
+
+static int _fortran_after(const char * line, size_t start, const char * words) {
+  size_t i = start;
+  while (i > 0 && isspace((unsigned char) line[i-1])) i--;
+  size_t end = i;
+  while (i > 0 && _word_char(line[i-1])) i--;
+  return _word_in_ci(words, line + i, end - i);
+}
+
+static size_t _fortran_dot_end(const char * line, size_t len, size_t i) {
+  size_t j = i + 1;
+  while (j < len && isalpha((unsigned char) line[j])) j++;
+  if (j < len && line[j] == '.') j++;
+  if (j < len && line[j] == '_') {
+    j++;
+    while (j < len && _word_char(line[j])) j++;
+  }
+  return j;
 }
 
 static int _call_ahead(const char * line, size_t len, size_t i) {
@@ -512,6 +580,88 @@ static void _document_highlight(grammar * g, const char * path, const char * lin
   if (markdown) _markdown_inline(g, line, len, sgrs, attrs);
 }
 
+static void _fortran_highlight(grammar * g, const char * line, size_t len,
+                               const char ** sgrs) {
+  const char * keywords =
+    "MODULE USE ONLY IMPLICIT NONE PARAMETER SAVE TARGET OPTIONAL PUBLIC PRIVATE "
+    "CONTAINS FUNCTION SUBROUTINE RESULT IF THEN ELSE ENDIF DO WHILE SELECT CASE "
+    "DEFAULT RETURN STOP END BIND INTENT KIND LEN IN OUT INOUT ALLOCATE DEALLOCATE CALL";
+  const char * types =
+    "TYPE INTEGER REAL LOGICAL CHARACTER COMPLEX DOUBLE PRECISION CLASS";
+  const char * constants = "TRUE FALSE";
+  const char * dot_operators = "LT LE GT GE EQ NE AND OR NOT EQV NEQV";
+  int decl = 0;
+  int decl_item = 0;
+  int decl_class = 0;
+  int import_list = 0;
+  int starts_type = 0;
+
+  for (size_t i = 0; i < len;) {
+    if (line[i] == '!') {
+      _paint(sgrs, len, i, len, _sgr(g, "comment"));
+      return;
+    } else if (line[i] == '"' || line[i] == '\'') {
+      size_t j = _fortran_quote_end(line, len, i);
+      _paint(sgrs, len, i, j, _sgr(g, "string"));
+      i = j;
+    } else if (isdigit((unsigned char) line[i]) &&
+               (i == 0 || !_word_char(line[i-1]))) {
+      size_t j = _fortran_number_end(line, len, i);
+      if (j == len || !_word_char(line[j])) _paint(sgrs, len, i, j, _sgr(g, "number"));
+      i = j;
+    } else if (line[i] == '.' && i + 1 < len && isalpha((unsigned char) line[i+1])) {
+      size_t j = _fortran_dot_end(line, len, i);
+      size_t k = i + 1;
+      while (k < j && isalpha((unsigned char) line[k])) k++;
+      const char * sgr = _word_in_ci(constants, line + i + 1, k - i - 1) ?
+        _sgr(g, "number") : _word_in_ci(dot_operators, line + i + 1, k - i - 1) ?
+        _sgr(g, "keyword") : _sgr(g, "operator");
+      _paint(sgrs, len, i, j, sgr);
+      i = j;
+    } else if (_word_start(line[i])) {
+      size_t j = i + 1;
+      while (j < len && _word_char(line[j])) j++;
+      const char * sgr = NULL;
+      if (i == _lead(line, len) && _word_in_ci("TYPE", line + i, j - i)) {
+        size_t k = j;
+        while (k < len && isspace((unsigned char) line[k])) k++;
+        starts_type = k >= len || line[k] != '(';
+      }
+      if (decl_class && decl_item) {
+        sgr = _sgr(g, "class");
+        decl_item = 0;
+      } else if (decl_item) {
+        sgr = _sgr(g, "variable");
+        decl_item = 0;
+      } else if (import_list) sgr = _sgr(g, "builtin");
+      else if (_fortran_after(line, i, "FUNCTION SUBROUTINE")) sgr = _sgr(g, "function");
+      else if (_fortran_after(line, i, "TYPE")) sgr = _sgr(g, "class");
+      else if (_word_in_ci(types, line + i, j - i)) sgr = _sgr(g, "type");
+      else if (_word_in_ci(keywords, line + i, j - i)) sgr = _sgr(g, "keyword");
+      else if (_word_in_ci(constants, line + i, j - i)) sgr = _sgr(g, "constant");
+      else if (_call_ahead(line, len, j)) sgr = _sgr(g, "call");
+      if (sgr != NULL) _paint(sgrs, len, i, j, sgr);
+      i = j;
+    } else {
+      if (line[i] == ':' && !decl && _fortran_after(line, i, "ONLY")) import_list = 1;
+      if (line[i] == ':' && i + 1 < len && line[i+1] == ':') {
+        decl = 1;
+        decl_class = starts_type;
+        decl_item = 1;
+        import_list = 0;
+        _paint(sgrs, len, i, i + 2, _sgr(g, "operator"));
+        i += 2;
+        continue;
+      }
+      if (decl && line[i] == ',') decl_item = 1;
+      if (line[i] == '=') decl_item = 0;
+      if (strchr("-+*/%=!<>|&^~:.,;(){}[]", line[i]) != NULL)
+        _paint(sgrs, len, i, i + 1, _sgr(g, "operator"));
+      i++;
+    }
+  }
+}
+
 static void _default_highlight(grammar * g, const char * line, size_t len,
                                const char ** sgrs) {
   const char * keywords =
@@ -653,6 +803,8 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
 
   if (g->is_default && (_markdown_path(path) || _text_path(path)))
     _document_highlight(g, path, line, len, sgrs, attrs);
+  else if (g->is_default && _fortran_path(path))
+    _fortran_highlight(g, line, len, sgrs);
   else if (g->is_default)
     _default_highlight(g, line, len, sgrs);
   for (int i = 0; !g->is_default && i < g->n_rules; i++) {

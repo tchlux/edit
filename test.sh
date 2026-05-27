@@ -158,6 +158,32 @@ if grep -F -q "$(printf 'obj.%s[38;2;255;215;95manswer%s[0m' "$esc" "$esc")" "$o
 if grep -F -q "$(printf '%s[38;2;255;215;95mint%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 if grep -F -q "$(printf '%s[38;2;255;215;95mlimit%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
 
+f90="$dir/sample.f90"
+printf 'MODULE demo\nUSE iso_fortran_env, ONLY: INT32\nIMPLICIT NONE\nINTEGER(KIND=INT32) :: value = SELECTED_INT_KIND(19)\nINTEGER(KIND=INT32) :: DO      ! dimension output\nTYPE, BIND(C) :: PROFILE_ENTRY\nREAL(KIND=REAL64) :: WALL_TIME\nEND TYPE PROFILE_ENTRY\nTYPE(PROFILE_ENTRY) :: PROFILE\nFUNCTION f(x) RESULT(y)\nREAL :: y\nIF (0.0_REAL32 .LT. 1.0_REAL32) y = x\nMASK = .FALSE.\nCALL g(MODEL(CONFIG%ASEV:CONFIG%AEEV), RANDOM_LENGTHS=.TRUE._C_BOOL)\nDO i = 1, 3\nEND DO\nEND FUNCTION f\n! this is and for prose\n' > "$f90"
+./edit --render-color 20:100 "$f90" > "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mMODULE%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mUSE%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mIMPLICIT%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;150;190;255mINTEGER%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mFUNCTION%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mEND%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;232;232;232mSELECTED_INT_KIND%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;220;255m0.0_REAL32%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255m.LT.%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;220;255m.FALSE.%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;220;255m.TRUE._C_BOOL%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;255;166;102m! this is and for prose%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;224;224;224m::%s[0m %s[38;2;120;255;175mDO%s[0m      %s[38;2;255;166;102m! dimension output%s[0m' "$esc" "$esc" "$esc" "$esc" "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;210;255;90mPROFILE_ENTRY%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;175mWALL_TIME%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;175mPROFILE%s[0m' "$esc" "$esc")" "$out"
+grep -F -q "$(printf '%s[38;2;120;255;255mDO%s[0m i %s[38;2;224;224;224m=%s[0m' "$esc" "$esc" "$esc" "$esc")" "$out"
+if grep -F -q "$(printf '%s[38;2;120;255;255mis%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;120;255;255mand%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf '%s[38;2;120;255;255mfor%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf ':: %s[38;2;120;255;255mDO%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+if grep -F -q "$(printf 'CONFIG%%ASEV:%s[38;2;120;220;255mCONFIG%%AEEV%s[0m' "$esc" "$esc")" "$out"; then exit 1; fi
+
 md="$dir/sample.md"
 printf '# Title\n- item\n> quote\nSee [guide](https://example.com) and `code`.\n```\nreturn 0;\n```\nTODO: write docs\n' > "$md"
 ./edit --render-color 10:80 "$md" > "$out"
