@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+regex_src=../regex/regex/regex.c
+[ ! -f "$regex_src" ] || cmp -s "$regex_src" regex.c || cp "$regex_src" regex.c
 cc -std=c11 -Wall -Wextra -pedantic -O2 -o edit edit.c grammar.c regex.c
 
 app=Edit.app
