@@ -611,6 +611,9 @@ printf 'one.two.one.|two\n\n%s 1:13\n%s\n' "$base" "$(foot 40 "match two")" | cm
 ./edit --render-keys 4:40 "stwo${enter}ssr" "$tmp" > "$out"
 printf 'one.|two.one.two\n\n%s 1:5\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
+./edit --render-keys 4:40 "stwosf" "$tmp" > "$out"
+printf 'one.t|wo.one.two\n\n%s 1:6\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
+
 ./edit --render-keys 4:40 "stwo${enter}sss" "$tmp" > "$out"
 printf 'one.|two.one.two\n\n%s 1:5\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
@@ -618,8 +621,7 @@ printf 'one.|two.one.two\n\n%s 1:5\n%s\n' "$base" "$(foot 40 "match two")" | cmp
 printf 'one.two.one.|two\n\n%s 1:13\n%s\n' "$base" "$(foot 40 "match two")" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}" "$tmp" > "$out"
-printf 'one %s[48;5;241mtwo%s[0m one %s[48;5;238mtwo%s[0m\n\n\n' \
-  "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+printf 'one two one two\n\n\n' | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ss" "$tmp" > "$out"
 printf 'one %s[48;5;238mtwo%s[0m one %s[48;5;241mtwo%s[0m\n\n\n' \
@@ -629,10 +631,17 @@ printf 'one %s[48;5;238mtwo%s[0m one %s[48;5;241mtwo%s[0m\n\n\n' \
 printf 'one %s[48;5;241mtwo%s[0m one %s[48;5;238mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
+./edit --render-keys-color 4:40 "stwosf" "$tmp" > "$out"
+printf 'one two one two\n\n\n' | cmp -s - "$out"
+
 printf '42 42\n' > "$tmp"
 ./edit --render-keys-color 3:40 "s42${enter}" "$tmp" > "$out"
-printf '%s[48;5;241m42%s[0m %s[48;5;238m42%s[0m\n\n' \
+printf '%s[38;2;120;220;255m42%s[0m %s[38;2;120;220;255m42%s[0m\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
+
+printf 'one\ntwo\nthree\n' > "$tmp"
+./edit --render-keys 6:20 "stwosn" "$tmp" > "$out"
+printf 'one\ntwo\n|three\n\n%s 3:1\n%s\n' "$base" "$(foot 20 "match two")" | cmp -s - "$out"
 
 printf 'one two one two\n' > "$tmp"
 ./edit --render-keys-color 4:40 "stwo${enter}g" "$tmp" > "$out"
@@ -1317,7 +1326,7 @@ cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 12:40 '<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
 tail -n 1 "$out" > "$tmp.head"
-printf 'cursor:6:14\n' > "$tmp.expected"
+printf 'cursor:6:15\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
 python3 ./tui_view.py 12:28 '<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"

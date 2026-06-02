@@ -1950,9 +1950,13 @@ static void scroll_line_move(edit_state * e, int direction) {
 
 static void debug_log_render(edit_state * e, output * o);
 
+static bool search_highlight_active(edit_state * e) {
+  return e->search_len > 0 && (e->search_prompt || e->replace_phase);
+}
+
 static void paint_search(edit_state * e, const char * line, size_t len,
                          size_t start, const char ** sgrs) {
-  if (e->search_len == 0 || len == 0) return;
+  if (! search_highlight_active(e) || len == 0) return;
 
   for (size_t from = 0; from < len;) {
     int a = -1;
@@ -4084,6 +4088,15 @@ static int search_move(edit_state * e, bool reverse, bool skip_current) {
   return 0;
 }
 
+static bool search_navigation_key(int key) {
+  return arrow_key(key) || key == KEY_CTRL('b') || key == KEY_CTRL('f') ||
+    key == KEY_CTRL('p') || key == KEY_CTRL('n') || key == KEY_CTRL('a') ||
+    key == KEY_CTRL('e') || key == KEY_CTRL('v') || key == KEY_CTRL('l') ||
+    key == KEY_META('b') || key == KEY_META('f') || key == KEY_META('n') ||
+    key == KEY_META('p') || key == KEY_META('v') || key == KEY_META('<') ||
+    key == KEY_META('>');
+}
+
 static int cmd_search_dir(edit_state * e, bool reverse) {
   e->search_prompt = true;
   e->search_reverse = reverse;
@@ -4568,6 +4581,11 @@ static int goto_dispatch(edit_state * e, int key) {
 
 static int search_dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
+  if (e->search_reuse && search_navigation_key(key)) {
+    e->search_prompt = false;
+    e->search_reuse = false;
+    return dispatch(e, key);
+  }
   if (key == KEY_CTRL('s') || key == KEY_CTRL('r')) {
     bool reverse = key == KEY_CTRL('r');
     bool skip = e->search_reuse;
@@ -4714,7 +4732,7 @@ static int tui(const char * path) {
     auto_reload(&e);
     render(&e);
     int timeout = status_timeout(&e);
-    if (e.search_len > 0 && (timeout < 0 || SEARCH_BLINK_MS < timeout))
+    if (search_highlight_active(&e) && (timeout < 0 || SEARCH_BLINK_MS < timeout))
       timeout = SEARCH_BLINK_MS;
     key_event ev = read_key_event(&e, timeout);
     status_expire(&e);
