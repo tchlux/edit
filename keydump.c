@@ -27,6 +27,8 @@ static struct termios saved;
 static bool raw = false;
 
 static void raw_off(void) {
+  const char * mouse_off = "\x1b[?1006l\x1b[?1000l\x1b[?1007l";
+  write(STDOUT_FILENO, mouse_off, strlen(mouse_off));
   if (raw) tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
   raw = false;
 }
@@ -76,9 +78,12 @@ int main(void) {
   }
 
   printf("keydump: press keys; Ctrl-C twice quits\r\n");
+  printf("mouse reporting enabled; scroll or click to inspect mouse bytes\r\n");
   printf("note: macOS Option may send Unicode/dead-key text, not Meta commands\r\n");
   printf("time_ms bytes hex dec names\r\n");
   fflush(stdout);
+  const char * mouse_on = "\x1b[?1007h\x1b[?1000h\x1b[?1006h";
+  write(STDOUT_FILENO, mouse_on, strlen(mouse_on));
 
   int ctrl_c = 0;
   for (;;) {

@@ -960,9 +960,52 @@ python3 ./tui_view.py 4:40 '<c-c>^r<c-c>^rX' "$tmp" > "$out"
 grep -q 'Xabc' "$out"
 
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
+grep -F -q "$(printf '\033[?1007h')" "$out"
+grep -F -q "$(printf '\033[?1000h')" "$out"
+grep -F -q "$(printf '\033[?1006h')" "$out"
 grep -F -q "$(printf '\033[38;2;224;224;224;48;2;32;32;32m')" "$out"
 grep -F -q "$(printf '\033[2 q')" "$out"
 grep -F -q "$(printf '\033[?12l')" "$out"
+
+python3 ./tui_view.py 4:40 '<raw><c-x>^c' "$tmp" > "$out"
+grep -F -q "$(printf '\033[?1006l')" "$out"
+grep -F -q "$(printf '\033[?1000l')" "$out"
+grep -F -q "$(printf '\033[?1007l')" "$out"
+
+printf 'one\ntwo\nthree\n' > "$tmp"
+python3 ./tui_view.py 4:40 '<wheel-down>' "$tmp" > "$out"
+grep -q 'cursor:2:1' "$out"
+
+python3 ./tui_view.py 4:40 '<down><wheel-up>' "$tmp" > "$out"
+grep -q 'cursor:1:1' "$out"
+
+python3 ./tui_view.py 4:40 '<wheel-x10-down>' "$tmp" > "$out"
+grep -q 'cursor:2:1' "$out"
+
+python3 ./tui_view.py 4:40 '<wheel-right>' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
+
+python3 ./tui_view.py 4:40 '<right><wheel-left>' "$tmp" > "$out"
+grep -q 'cursor:1:1' "$out"
+
+python3 ./tui_view.py 4:40 '<wheel-x10-right>' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
+
+python3 ./tui_view.py 4:40 '<right><wheel-shift-up>' "$tmp" > "$out"
+grep -q 'cursor:1:1' "$out"
+
+python3 ./tui_view.py 4:40 '<wheel-shift-down>' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
+
+python3 ./tui_view.py 4:40 '<wheel-x10-shift-down>' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
+
+printf 'abc\ndef\n' > "$tmp"
+python3 ./tui_view.py 5:40 '<click:3:2>' "$tmp" > "$out"
+grep -q 'cursor:2:3' "$out"
+
+python3 ./tui_view.py 5:40 '<click-x10:2:1>' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
 
 printf 'int x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"

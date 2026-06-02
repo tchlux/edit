@@ -58,6 +58,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define KEY_LEFT 1003
 #define KEY_PASTE_START 1004
 #define KEY_PASTE_END 1005
+#define KEY_MOUSE 1006
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
 #define COMMAND_SIZE 1024
@@ -169,6 +170,9 @@ typedef struct {
   int key;
   unsigned char raw[32];
   int n_raw;
+  int mouse_button;
+  int mouse_row;
+  int mouse_col;
   long long start_ms;
   long long end_ms;
   char kind[24];
@@ -808,6 +812,7 @@ static void key_text(int key, char * out, size_t n) {
   else if (key == KEY_RIGHT) snprintf(out, n, "RIGHT");
   else if (key == KEY_PASTE_START) snprintf(out, n, "PASTE-START");
   else if (key == KEY_PASTE_END) snprintf(out, n, "PASTE-END");
+  else if (key == KEY_MOUSE) snprintf(out, n, "MOUSE");
   else if (key >= KEY_META(0) && key < KEY_META(128)) {
     int c = key - KEY_META(0);
     snprintf(out, n, (c >= 32 && c < 127) ? "M-%c" : "M-%d", c);
@@ -1029,6 +1034,7 @@ static pane_rect pane_area(edit_state * e, int i);
 static int split_pane(edit_state * e, int layout);
 static int cmd_close_pane(edit_state * e, int key);
 static void refresh_buffer_list(edit_state * e);
+static bool prompt_footer_cursor(edit_state * e);
 static const char * file_name(const char * path);
 
 static int save_current_file(edit_state * e) {
@@ -1595,6 +1601,18 @@ static void input_unread(edit_state * e, char c) {
   e->input.len++;
 }
 
+static int mouse_wheel_key(int button) {
+  if ((button & 64) == 0) return -1;
+  int dir = button & 3;
+  if ((button & 4) && dir == 0) return KEY_LEFT;
+  if ((button & 4) && dir == 1) return KEY_RIGHT;
+  if (dir == 0) return KEY_UP;
+  if (dir == 1) return KEY_DOWN;
+  if (dir == 2) return KEY_LEFT;
+  if (dir == 3) return KEY_RIGHT;
+  return -1;
+}
+
 static key_event read_key_event(edit_state * e, int timeout_ms) {
   key_event ev;
   memset(&ev, 0, sizeof(ev));
@@ -1651,6 +1669,13 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
     n++;
     if ((n == 1) && ((seq[0] != '[') && (seq[0] != 'O'))) break;
     if ((seq[0] == 'O') && (n == 2)) break;
+    if ((seq[0] == '[') && (n == 2) && seq[1] == 'M') {
+      while (n < 5 && input_wait(e, 20000) && input_read(e, &seq[n])) {
+        if (ev.n_raw < (int) sizeof(ev.raw)) ev.raw[ev.n_raw++] = (unsigned char) seq[n];
+        n++;
+      }
+      break;
+    }
     if ((seq[0] == '[') && (n > 1) &&
         (seq[n-1] >= '@') && (seq[n-1] <= '~')) {
       break;
@@ -1671,7 +1696,28 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
   char final = seq[n-1];
   if ((seq[0] == '[') || (seq[0] == 'O')) {
     snprintf(ev.kind, sizeof(ev.kind), "%s", seq[0] == '[' ? "csi" : "ss3");
-    if (seq[0] == '[' && n == 5 && memcmp(seq, "[200~", 5) == 0) ev.key = KEY_PASTE_START;
+    int button, x, y;
+    if (seq[0] == '[' && (final == 'M' || final == 'm') &&
+        sscanf(seq, "[<%d;%d;%d", &button, &x, &y) == 3) {
+      snprintf(ev.kind, sizeof(ev.kind), "sgr-mouse");
+      ev.key = mouse_wheel_key(button);
+      if (ev.key < 0 && final == 'M' && button == 0) {
+        ev.key = KEY_MOUSE;
+        ev.mouse_button = button;
+        ev.mouse_col = x - 1;
+        ev.mouse_row = y - 1;
+      }
+    } else if (seq[0] == '[' && n == 5 && memcmp(seq, "[M", 2) == 0) {
+      button = (unsigned char) seq[2] - 32;
+      snprintf(ev.kind, sizeof(ev.kind), "x10-mouse");
+      ev.key = mouse_wheel_key(button);
+      if (ev.key < 0 && button == 0) {
+        ev.key = KEY_MOUSE;
+        ev.mouse_button = button;
+        ev.mouse_col = (unsigned char) seq[3] - 33;
+        ev.mouse_row = (unsigned char) seq[4] - 33;
+      }
+    } else if (seq[0] == '[' && n == 5 && memcmp(seq, "[200~", 5) == 0) ev.key = KEY_PASTE_START;
     else if (seq[0] == '[' && n == 5 && memcmp(seq, "[201~", 5) == 0) ev.key = KEY_PASTE_END;
     else if (final == 'A') ev.key = KEY_UP;
     else if (final == 'B') ev.key = KEY_DOWN;
@@ -1843,6 +1889,44 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
 
 static void ensure_visible(edit_state * e) {
   ensure_pane_visible(e, active_pane(e), pane_body_rows(e, e->active_pane));
+}
+
+static int pane_at(edit_state * e, int row, int col, pane_rect rects[PANE_MAX]) {
+  for (int i = 0; i < e->n_panes; i++)
+    if (row >= rects[i].row && row < rects[i].row + rects[i].rows &&
+        col >= rects[i].col && col < rects[i].col + rects[i].cols)
+      return i;
+  return -1;
+}
+
+static int mouse_click(edit_state * e, key_event * ev) {
+  if (prompt_footer_cursor(e)) return 0;
+  pane_rect rects[PANE_MAX];
+  pane_rects(e, rects);
+  int i = pane_at(e, ev->mouse_row, ev->mouse_col, rects);
+  if (i < 0) return 0;
+  int body_rows = pane_body_rows(e, i);
+  int local_row = ev->mouse_row - rects[i].row;
+  if (local_row < 0 || local_row >= body_rows) return 0;
+
+  save_pane_state(e);
+  e->active_pane = i;
+  pane * p = active_pane(e);
+  buffer * b = active_buffer(e);
+  size_t pos = p->top;
+  size_t width = pane_wrap_width(e, p);
+  for (int row = 0; row < local_row; row++)
+    pos = p->wrap ? visual_row_next(e, b, pos, width) : next_line(b, pos);
+
+  size_t start = line_start(b, pos);
+  size_t col = (size_t) (ev->mouse_col - rects[i].col);
+  if (p->wrap) col += visual_col(e, b, start, pos);
+  else col += p->left_col;
+  p->cursor = visual_column_pos(e, b, start, col);
+  p->preferred_col = SIZE_MAX;
+  p->mark_active = false;
+  refresh_buffer_list(e);
+  return 0;
 }
 
 static int pane_cursor_row(edit_state * e, pane * p, int body_rows);
@@ -4621,7 +4705,8 @@ static int tui(const char * path) {
     buffers_free(&e);
     return 1;
   }
-  const char * start = "\x1b[?1049h\x1b[?2004h\x1b[38;2;224;224;224m"
+  const char * start = "\x1b[?1049h\x1b[?1007h\x1b[?1000h\x1b[?1006h"
+    "\x1b[?2004h\x1b[38;2;224;224;224m"
     "\x1b[48;2;32;32;32m\x1b[2 q\x1b[?12l";
   write(STDOUT_FILENO, start, strlen(start));
 
@@ -4640,6 +4725,14 @@ static int tui(const char * path) {
       debug_log_state(&e, "before");
     }
 
+    if (key == KEY_MOUSE) {
+      e.prefix = 0;
+      e.quit_confirm = false;
+      active_pane(&e)->recenter = 0;
+      mouse_click(&e, &ev);
+      action = "mouse";
+      key = -1;
+    }
     if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC &&
         key != KEY_CTRL('g')) {
       e.prefix = 0;
@@ -4698,7 +4791,8 @@ static int tui(const char * path) {
   }
 
   raw_off(&e);
-  const char * clear = "\x1b[?2004l\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
+  const char * clear = "\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[?2004l"
+    "\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
   write(STDOUT_FILENO, clear, strlen(clear));
   free(e.input.data);
   kill_ring_free(&e);

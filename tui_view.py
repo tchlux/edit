@@ -47,6 +47,52 @@ def keys(s):
         elif s.startswith("<down-csi>", i):
             out += b"\x1b[1;2B"
             i += 10
+        elif s.startswith("<wheel-up>", i):
+            out += b"\x1b[<64;1;1M"
+            i += 10
+        elif s.startswith("<wheel-down>", i):
+            out += b"\x1b[<65;1;1M"
+            i += 12
+        elif s.startswith("<wheel-left>", i):
+            out += b"\x1b[<66;1;1M"
+            i += 12
+        elif s.startswith("<wheel-right>", i):
+            out += b"\x1b[<67;1;1M"
+            i += 13
+        elif s.startswith("<wheel-shift-up>", i):
+            out += b"\x1b[<68;1;1M"
+            i += 16
+        elif s.startswith("<wheel-shift-down>", i):
+            out += b"\x1b[<69;1;1M"
+            i += 18
+        elif s.startswith("<wheel-x10-up>", i):
+            out += b"\x1b[M`!!"
+            i += 14
+        elif s.startswith("<wheel-x10-down>", i):
+            out += b"\x1b[Ma!!"
+            i += 16
+        elif s.startswith("<wheel-x10-left>", i):
+            out += b"\x1b[Mb!!"
+            i += 16
+        elif s.startswith("<wheel-x10-right>", i):
+            out += b"\x1b[Mc!!"
+            i += 17
+        elif s.startswith("<wheel-x10-shift-up>", i):
+            out += b"\x1b[Md!!"
+            i += 20
+        elif s.startswith("<wheel-x10-shift-down>", i):
+            out += b"\x1b[Me!!"
+            i += 22
+        elif s.startswith("<click:", i):
+            j = s.find(">", i)
+            col, row = [int(x) for x in s[i + 7:j].split(":")]
+            out += ("\x1b[<0;%d;%dM" % (col, row)).encode()
+            i = j + 1
+        elif s.startswith("<click-x10:", i):
+            j = s.find(">", i)
+            col, row = [int(x) for x in s[i + 11:j].split(":")]
+            out += bytes([0x1b, ord("["), ord("M"), 32, col + 32, row + 32])
+            i = j + 1
         elif s.startswith("<m-v>", i):
             out += b"\x1bv"
             i += 5
