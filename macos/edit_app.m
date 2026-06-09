@@ -78,6 +78,7 @@ typedef struct {
 - (NSString *)lineText:(int)width;
 - (NSUInteger)csiLength;
 - (void)readBytes:(NSData *)data;
+- (BOOL)sendMouseClickRow:(int)row col:(int)col;
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise;
 - (void)panicCancel;
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
@@ -579,6 +580,24 @@ static bool cell_same_text(cell *a, cell *b) {
   [self sendBytes:data.bytes length:data.length];
 }
 
+- (BOOL)sendMouseClickRow:(int)row col:(int)col {
+  if (row < 0 || row >= _rows || col < 0 || col >= _cols) return NO;
+  char seq[32];
+  int n = snprintf(seq, sizeof(seq), "\033[<0;%d;%dM", col + 1, row + 1);
+  if (n <= 0 || n >= (int)sizeof(seq)) return NO;
+  [self sendBytes:seq length:(NSUInteger)n];
+  return YES;
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  [self.window makeFirstResponder:self];
+  NSSize cell = [self cellSize];
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  int col = (int)(p.x / cell.width);
+  int row = (int)((self.bounds.size.height - p.y) / cell.height);
+  [self sendMouseClickRow:row col:col];
+}
+
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise {
   NSSize cell = [self cellSize];
   CGFloat ax = fabs(dx), ay = fabs(dy);
@@ -858,6 +877,20 @@ static int ansi_self_test(void) {
       fprintf(stderr, "scroll emitted non-line-key bytes\n");
       return 1;
     }
+
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *mouseView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  mouseView.fd = p[1];
+  BOOL clicked = [mouseView sendMouseClickRow:1 col:1];
+  close(p[1]);
+  mouseView.fd = -1;
+  got = read(p[0], buf, sizeof(buf));
+  close(p[0]);
+  const char mouse[] = "\033[<0;2;2M";
+  if (!clicked || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
+    fprintf(stderr, "mouse click bytes failed\n");
+    return 1;
+  }
 
   if (pipe(p) != 0) return 1;
   EditTerminalView *preciseView = [[EditTerminalView alloc] initForAnsiSelfTest];

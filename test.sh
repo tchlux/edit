@@ -1016,6 +1016,11 @@ grep -q 'cursor:2:3' "$out"
 python3 ./tui_view.py 5:40 '<click-x10:2:1>' "$tmp" > "$out"
 grep -q 'cursor:1:2' "$out"
 
+printf 'abcdefghijklmnopqrstuvwxyz\n' > "$tmp"
+python3 ./tui_view.py 5:25 '<c-c>^w<click:2:2>' "$tmp" > "$out"
+grep -q 'cursor:2:2' "$out"
+grep -q '1:26.Wrap' "$out"
+
 printf 'int x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[0;38;2;224;224;224;48;2;32;32;32;38;2;150;190;255m')" "$out"
