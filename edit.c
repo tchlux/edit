@@ -72,8 +72,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define RUN_OUTPUT_MAX (1024 * 1024)
 #define FILL_COLUMN 70
 #define BASE_SGR "38;2;224;224;224;48;2;32;32;32"
-#define SEARCH_SGR "48;5;238"
-#define SEARCH_CURRENT_SGR "48;5;241"
+#define SEARCH_SGR "48;2;68;68;68"
+#define SEARCH_CURRENT_SGR "48;2;98;98;98"
 #define REGION_SGR "7"
 #define SEARCH_BLINK_MS 500
 #define STATUS_TIMEOUT_MS 3000

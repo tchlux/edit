@@ -624,11 +624,11 @@ printf 'one.two.one.|two\n\n%s 1:13\n%s\n' "$base" "$(foot 40 "match two")" | cm
 printf 'one two one two\n\n\n' | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ss" "$tmp" > "$out"
-printf 'one %s[48;5;238mtwo%s[0m one %s[48;5;241mtwo%s[0m\n\n\n' \
+printf 'one %s[48;2;68;68;68mtwo%s[0m one %s[48;2;98;98;98mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwo${enter}ssr" "$tmp" > "$out"
-printf 'one %s[48;5;241mtwo%s[0m one %s[48;5;238mtwo%s[0m\n\n\n' \
+printf 'one %s[48;2;98;98;98mtwo%s[0m one %s[48;2;68;68;68mtwo%s[0m\n\n\n' \
   "$esc" "$esc" "$esc" "$esc" | cmp -s - "$out"
 
 ./edit --render-keys-color 4:40 "stwosf" "$tmp" > "$out"

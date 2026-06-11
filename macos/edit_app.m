@@ -862,6 +862,14 @@ static int ansi_self_test(void) {
     return 1;
   }
 
+  EditTerminalView *bgView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  ansi_feed(bgView, "\033[48;2;68;68;68mtwo");
+  if (bgView.cells[0].bg[0] != 68 || bgView.cells[0].bg[1] != 68 ||
+      bgView.cells[0].bg[2] != 68) {
+    fprintf(stderr, "ansi background failed\n");
+    return 1;
+  }
+
   EditTerminalView *csiView = [[EditTerminalView alloc] initForAnsiSelfTest];
   char longCsi[CSI_MAX + 2];
   memset(longCsi, '1', sizeof(longCsi));
