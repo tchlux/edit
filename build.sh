@@ -11,6 +11,7 @@ rm -rf "$app"
 mkdir -p "$bin" "$res"
 cc -O2 -fobjc-arc -framework Cocoa -lutil -o "$bin/Edit" macos/edit_app.m
 cp edit "$res/edit"
+cp macos/Edit.icns "$res/Edit.icns"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -21,6 +22,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>
   <string>com.thomaslux.edit</string>
   <key>CFBundleName</key>
+  <string>Edit</string>
+  <key>CFBundleIconFile</key>
   <string>Edit</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>

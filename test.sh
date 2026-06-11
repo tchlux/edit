@@ -855,7 +855,69 @@ if [ "$clip_has" = 1 ]; then
   tail -n 1 "$out" > "$tmp.head"
   printf 'cursor:2:1\n' > "$tmp.expected"
   cmp -s "$tmp.expected" "$tmp.head"
+
+  printf 'abc\n' > "$tmp"
+  printf OLD | pbcopy
+  python3 ./tui_view.py 4:80 '<c-x>^f^a^kabc<c-space><left><left><m-w>' "$tmp" > "$out"
+  [ "$(pbpaste)" = "bc" ]
+
+  printf 'abc\n' > "$tmp"
+  printf OLD | pbcopy
+  python3 ./tui_view.py 4:80 '<c-x>^f^a^kabc<c-space><left><left>^w' "$tmp" > "$out"
+  [ "$(pbpaste)" = "bc" ]
+
+  printf 'abc\n' > "$tmp"
+  printf OLD | pbcopy
+  python3 ./tui_view.py 4:80 '<c-x>^f^a^kabc^a^k' "$tmp" > "$out"
+  [ "$(pbpaste)" = "abc" ]
 fi
+
+new_path="$dir/new-file.txt"
+keys="<c-x>^f^a^k$new_path
+^x^c"
+python3 ./tui_view.py 4:80 "$keys" "$tmp" > "$out" || true
+test ! -e "$new_path"
+
+keys="<c-x>^f^a^k$new_path
+^x^s"
+python3 ./tui_view.py 4:80 "$keys" "$tmp" > "$out" || true
+test -e "$new_path"
+
+tree_path="$dir/missing/tree/new.txt"
+keys="<c-x>^f^a^k$tree_path
+n"
+python3 ./tui_view.py 4:90 "$keys" "$tmp" > "$out"
+grep -q 'create.canceled' "$out"
+test ! -d "$dir/missing"
+
+keys="<c-x>^f^a^k$tree_path
+y"
+python3 ./tui_view.py 4:90 "$keys" "$tmp" > "$out"
+grep -q 'new.file.new.txt' "$out"
+test -d "$dir/missing/tree"
+rm -f "$new_path"
+rm -rf "$dir/missing"
+
+printf 'abc\n' > "$tmp"
+python3 ./tui_view.py 4:80 '<c-x>^f^a^kabc<c-space><left><left>^w^y' "$tmp" > "$out"
+grep -q 'find.file:.abc' "$out"
+
+python3 ./tui_view.py 4:80 '<c-x>^f^a^kabc^a^k^y' "$tmp" > "$out"
+grep -q 'find.file:.abc' "$out"
+
+python3 ./tui_view.py 4:80 '^h<c-space><right><right>^w' "$tmp" > "$out"
+grep -q 'copied' "$out"
+grep -q '\*help\*' "$out"
+
+i=0
+while [ "$i" -lt 8 ]; do
+  : > "$dir/aa_completion_$i"
+  i=$((i + 1))
+done
+python3 ./tui_view.py 6:24 "<c-x>^f^a^k$dir/aa_completion_<tab><c-space><right><right>^w" "$tmp" > "$out"
+grep -q 'copied' "$out"
+grep -q '\*find.compl' "$out"
+rm -f "$dir"/aa_completion_*
 
 printf 'abc\nPASTE\n' > "$tmp"
 python3 ./tui_view.py 4:40 '^s<paste>PASTE</paste>
@@ -936,6 +998,20 @@ rights='<right><right><right><right><right><right><right><right><right><right><r
 python3 ./tui_view.py 5:12 "<c-c>^w$rights" "$wrap" > "$out"
 grep -q 'cursor:2:3' "$out"
 grep -q '04:w.1:14.Wrap' "$out"
+
+wrap_exact="$dir/w-exact"
+printf 'abcdefghijklmnopqrstuv' > "$wrap_exact"
+python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>' "$wrap_exact" > "$out"
+grep -q 'cursor:3:1' "$out"
+python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>X' "$wrap_exact" > "$out"
+grep -q 'cursor:3:2' "$out"
+
+wrap_partial="$dir/w-partial"
+printf 'abcdefghijklmnopqrstuvw' > "$wrap_partial"
+python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>' "$wrap_partial" > "$out"
+grep -q 'cursor:3:2' "$out"
+python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>X' "$wrap_partial" > "$out"
+grep -q 'cursor:3:3' "$out"
 
 printf '  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$tmp"
 ./edit --render-keys 6:90 Q "$tmp" > "$out"

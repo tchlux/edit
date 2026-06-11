@@ -216,6 +216,9 @@ struct edit_state {
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
   size_t find_pos;
+  bool find_mkdir_prompt;
+  char find_mkdir_dir[DEBUG_PATH_SIZE];
+  char find_mkdir_target[DEBUG_PATH_SIZE];
   int find_origin_pane;
   int find_pane;
   bool find_created_pane;
@@ -243,6 +246,9 @@ struct edit_state {
   int yank_index;
   size_t yank_start;
   size_t yank_len;
+  char * prompt_mark_text;
+  size_t prompt_mark;
+  bool prompt_mark_active;
   bool debug_recording;
   bool debug_note_prompt;
   FILE * debug_log;
@@ -860,6 +866,12 @@ static void clear_mark(edit_state * e) {
   active_pane(e)->mark_active = false;
 }
 
+static void clear_prompt_mark(edit_state * e) {
+  e->prompt_mark_text = NULL;
+  e->prompt_mark = 0;
+  e->prompt_mark_active = false;
+}
+
 static bool region_range(pane * p, size_t * start, size_t * end) {
   if (! p->mark_active || p->mark == p->cursor) return false;
   *start = p->mark < p->cursor ? p->mark : p->cursor;
@@ -890,13 +902,22 @@ static output * kill_entry(edit_state * e, bool append) {
   return &e->kill_ring[e->kill_head];
 }
 
-static bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
-  if (end <= start) return false;
+static bool kill_push_text(edit_state * e, const char * data, size_t len) {
+  if (len == 0) return false;
   output * k = kill_entry(e, e->last_action == ACTION_KILL);
-  for (size_t i = start; i < end; i++) out_add(k, &(char){buffer_at(b, i)}, 1);
+  out_add(k, data, len);
   clipboard_write(k->data, k->len);
   e->last_action = ACTION_KILL;
   return true;
+}
+
+static bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
+  if (end <= start) return false;
+  output o = {0};
+  for (size_t i = start; i < end; i++) out_add(&o, &(char){buffer_at(b, i)}, 1);
+  bool ok = kill_push_text(e, o.data, o.len);
+  free(o.data);
+  return ok;
 }
 
 static void history_free_one(history * h) {
@@ -1035,6 +1056,8 @@ static int split_pane(edit_state * e, int layout);
 static int cmd_close_pane(edit_state * e, int key);
 static void refresh_buffer_list(edit_state * e);
 static bool prompt_footer_cursor(edit_state * e);
+static bool prompt_region_range(edit_state * e, prompt_slot * s,
+                                size_t * start, size_t * end);
 static const char * file_name(const char * path);
 
 static int save_current_file(edit_state * e) {
@@ -1180,6 +1203,7 @@ static int switch_to_path(edit_state * e, const char * path) {
   if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
   if (save_current_file(e) != 0) return 0;
   save_pane_state(e);
+  bool exists = access(path, F_OK) == 0;
   if (buffer_load(&e->buffers[e->n_buffers], path) != 0)
     return set_status(e, "open failed"), 0;
   i = e->n_buffers++;
@@ -1191,7 +1215,7 @@ static int switch_to_path(edit_state * e, const char * path) {
   active_pane(e)->mark_active = false;
   recent_save(path);
   refresh_buffer_list(e);
-  set_status(e, "opened %s", file_name(path));
+  set_status(e, "%s %s", exists ? "opened" : "new file", file_name(path));
   return 0;
 }
 
@@ -1362,9 +1386,30 @@ static void path_parts(const char * path, char * dir, char * prefix, char * base
   else snprintf(dir, DEBUG_PATH_SIZE, "%.*s", (int) (n - 1), path);
 }
 
+static void path_parent(const char * path, char * dir, size_t n) {
+  snprintf(dir, n, "%s", path);
+  char * slash = strrchr(dir, '/');
+  if (slash == NULL) snprintf(dir, n, ".");
+  else if (slash == dir) slash[1] = '\0';
+  else *slash = '\0';
+}
+
 static bool directory_path(const char * path) {
   struct stat st;
   return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int mkdir_p(const char * path) {
+  char tmp[DEBUG_PATH_SIZE];
+  snprintf(tmp, sizeof(tmp), "%s", path);
+  if (tmp[0] == '\0' || directory_path(tmp)) return 0;
+  for (char * p = tmp + 1; *p != '\0'; p++) {
+    if (*p != '/') continue;
+    *p = '\0';
+    if (tmp[0] != '\0' && mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+    *p = '/';
+  }
+  return mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1;
 }
 
 static void find_set(edit_state * e, const char * path) {
@@ -1454,6 +1499,18 @@ static int show_find_completions(edit_state * e, output * paths) {
   refresh_buffer_list(e);
   set_status(e, "find completions");
   return 0;
+}
+
+static bool find_start_mkdir_prompt(edit_state * e, const char * path) {
+  char parent[DEBUG_PATH_SIZE];
+  path_parent(path, parent, sizeof(parent));
+  if (directory_path(parent)) return false;
+  snprintf(e->find_mkdir_dir, sizeof(e->find_mkdir_dir), "%s", parent);
+  snprintf(e->find_mkdir_target, sizeof(e->find_mkdir_target), "%s", path);
+  e->find_prompt = false;
+  e->find_mkdir_prompt = true;
+  set_status(e, "Create directory %s? y/n", parent);
+  return true;
 }
 
 static int find_complete(edit_state * e) {
@@ -1789,10 +1846,13 @@ static size_t pane_wrap_width(edit_state * e, pane * p) {
   return (cols > 1) ? (size_t) cols - 1 : 1;
 }
 
-static size_t visual_row_next(edit_state * e, buffer * b, size_t pos, size_t width) {
+static size_t visual_row_end(edit_state * e, buffer * b, size_t pos, size_t width,
+                             bool * full, bool * newline) {
   size_t len = buffer_len(b);
   size_t shown = 0;
   size_t col = visual_col(e, b, line_start(b, pos), pos);
+  *full = false;
+  *newline = false;
   while (pos < len && buffer_at(b, pos) != '\n' && shown < width) {
     size_t bytes = utf8_len_at(b, pos, len);
     size_t w = char_width(e, b, pos, col);
@@ -1800,8 +1860,23 @@ static size_t visual_row_next(edit_state * e, buffer * b, size_t pos, size_t wid
     col += w;
     pos += bytes;
   }
-  if (pos < len && buffer_at(b, pos) == '\n') pos++;
+  *full = shown == width;
+  if (pos < len && buffer_at(b, pos) == '\n') {
+    *newline = true;
+    pos++;
+  }
   return pos;
+}
+
+static size_t visual_row_next(edit_state * e, buffer * b, size_t pos, size_t width) {
+  bool full;
+  bool newline;
+  return visual_row_end(e, b, pos, width, &full, &newline);
+}
+
+static bool visual_row_before_cursor(size_t next, size_t cursor,
+                                     bool full, bool newline) {
+  return next < cursor || (next == cursor && (full || newline));
 }
 
 static size_t visual_row_prev(edit_state * e, buffer * b, size_t pos, size_t width) {
@@ -1852,8 +1927,10 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
       size_t pos = p->top;
       int row = 0;
       while (pos < cursor && row < body_rows) {
-        size_t next = visual_row_next(e, b, pos, width);
-        if (next <= pos || next > cursor) break;
+        bool full;
+        bool newline;
+        size_t next = visual_row_end(e, b, pos, width, &full, &newline);
+        if (next <= pos || ! visual_row_before_cursor(next, cursor, full, newline)) break;
         row++;
         pos = next;
       }
@@ -2151,8 +2228,10 @@ static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
     while (row_pos < p->cursor && cy < body_rows) {
-      size_t next = visual_row_next(e, b, row_pos, width);
-      if (next <= row_pos || next > p->cursor) break;
+      bool full;
+      bool newline;
+      size_t next = visual_row_end(e, b, row_pos, width, &full, &newline);
+      if (next <= row_pos || ! visual_row_before_cursor(next, p->cursor, full, newline)) break;
       row_pos = next;
       cy++;
     }
@@ -2174,8 +2253,10 @@ static size_t pane_cursor_col(edit_state * e, pane * p) {
     size_t row = line_start(b, p->cursor);
     size_t width = pane_wrap_width(e, p);
     while (row < p->cursor) {
-      size_t next = visual_row_next(e, b, row, width);
-      if (next <= row || next > p->cursor) break;
+      bool full;
+      bool newline;
+      size_t next = visual_row_end(e, b, row, width, &full, &newline);
+      if (next <= row || ! visual_row_before_cursor(next, p->cursor, full, newline)) break;
       row = next;
     }
     cx -= visual_col(e, b, line_start(b, p->cursor), row);
@@ -2278,14 +2359,20 @@ static void footer_line(edit_state * e, output * o, int cols) {
     prompt_slot s;
     active_prompt_slot(e, &s);
     if (*s.pos > *s.len) *s.pos = *s.len;
+    size_t rs = 0;
+    size_t re = 0;
+    bool region = prompt_region_range(e, &s, &rs, &re);
     for (const char * p = s.label; *p && used < limit - hint; p++, used++) {
       if (used == cursor_col) out_s(o, "|");
       out_add(o, p, 1);
     }
     for (size_t i = 0; i < *s.len && used < limit - hint; i++, used++) {
       if (used == cursor_col) out_s(o, "|");
+      if (region && i == rs) out_s(o, "\x1b[7m");
       out_add(o, s.text + i, 1);
+      if (region && i + 1 == re) out_s(o, "\x1b[27m");
     }
+    if (region && re >= *s.len) out_s(o, "\x1b[27m");
   } else out_clip(o, msg, &used, limit - hint);
   while (used < limit - hint) {
     if (used == cursor_col) out_s(o, "|");
@@ -2679,6 +2766,7 @@ static void debug_stop_prompt(edit_state * e) {
   e->debug_note_len = 0;
   e->debug_note_pos = 0;
   e->debug_note[0] = '\0';
+  clear_prompt_mark(e);
   set_status(e, "debug note: ");
 }
 
@@ -2690,6 +2778,7 @@ static const char * debug_note_key(edit_state * e, key_event * ev) {
     fclose(e->debug_log);
     e->debug_log = NULL;
     e->debug_note_prompt = false;
+    clear_prompt_mark(e);
     set_status(e, "debug saved %s", e->debug_path);
     return "debug-note-saved";
   }
@@ -3109,13 +3198,18 @@ static int cmd_mark(edit_state * e, int key) {
 }
 
 static int cmd_cut_region(edit_state * e, int key) {
-  if (read_only_buffer(active_buffer(e))) return action_other(e), set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   size_t start;
   size_t end;
   if (! region_range(p, &start, &end)) return action_other(e), set_status(e, "no region"), 0;
   kill_push(e, b, start, end);
+  if (read_only_buffer(b)) {
+    clear_mark(e);
+    set_status(e, "copied");
+    (void) key;
+    return 0;
+  }
   edit_delete(e, start, end, ++b->history_group, true);
   p->cursor = start;
   p->preferred_col = SIZE_MAX;
@@ -3346,13 +3440,30 @@ static size_t prompt_word_back(prompt_slot * s, size_t pos) {
   return pos;
 }
 
-static void prompt_delete(prompt_slot * s, size_t start, size_t end) {
+static void prompt_prepare(edit_state * e, prompt_slot * s) {
+  if (e->prompt_mark_text != s->text) clear_prompt_mark(e);
+}
+
+static bool prompt_region_range(edit_state * e, prompt_slot * s,
+                                size_t * start, size_t * end) {
+  if (! e->prompt_mark_active || e->prompt_mark_text != s->text ||
+      e->prompt_mark == *s->pos) return false;
+  *start = e->prompt_mark < *s->pos ? e->prompt_mark : *s->pos;
+  *end = e->prompt_mark < *s->pos ? *s->pos : e->prompt_mark;
+  if (*end > *s->len) *end = *s->len;
+  return *start < *end;
+}
+
+static void prompt_delete(edit_state * e, prompt_slot * s,
+                          size_t start, size_t end, bool kill) {
   if (start > *s->len) start = *s->len;
   if (end > *s->len) end = *s->len;
   if (start >= end) return;
+  if (kill) kill_push_text(e, s->text + start, end - start);
   memmove(s->text + start, s->text + end, *s->len - end + 1);
   *s->len -= end - start;
   *s->pos = start;
+  clear_prompt_mark(e);
 }
 
 static void prompt_insert(prompt_slot * s, const char * data, size_t n) {
@@ -3365,10 +3476,15 @@ static void prompt_insert(prompt_slot * s, const char * data, size_t n) {
   }
 }
 
-static bool prompt_yank(prompt_slot * s) {
+static bool prompt_yank(edit_state * e, prompt_slot * s) {
   output o = {0};
   bool ok = clipboard_read(&o);
   if (ok) prompt_insert(s, o.data, o.len);
+  else if (e->n_kills > 0) {
+    output * k = &e->kill_ring[e->kill_head];
+    prompt_insert(s, k->data, k->len);
+    ok = k->len > 0;
+  }
   free(o.data);
   return ok;
 }
@@ -3382,21 +3498,51 @@ static bool prompt_paste(prompt_slot * s, edit_state * e) {
 }
 
 static bool prompt_edit(edit_state * e, prompt_slot * s, int key) {
+  size_t start;
+  size_t end;
   if (*s->pos > *s->len) *s->pos = *s->len;
+  prompt_prepare(e, s);
   if (key == KEY_LEFT || key == KEY_CTRL('b')) *s->pos = prompt_prev_char(s, *s->pos);
   else if (key == KEY_RIGHT || key == KEY_CTRL('f')) *s->pos = prompt_next_char(s, *s->pos);
   else if (key == KEY_CTRL('a')) *s->pos = 0;
   else if (key == KEY_CTRL('e')) *s->pos = *s->len;
   else if (key == KEY_META('b')) *s->pos = prompt_word_back(s, *s->pos);
   else if (key == KEY_META('f')) *s->pos = prompt_word_forward(s, *s->pos);
-  else if (key == KEY_BACKSPACE) prompt_delete(s, prompt_prev_char(s, *s->pos), *s->pos);
-  else if (key == KEY_CTRL('d')) prompt_delete(s, *s->pos, prompt_next_char(s, *s->pos));
-  else if (key == KEY_META(KEY_BACKSPACE)) prompt_delete(s, prompt_word_back(s, *s->pos), *s->pos);
-  else if (key == KEY_META('d')) prompt_delete(s, *s->pos, prompt_word_forward(s, *s->pos));
-  else if (key == KEY_CTRL('k')) prompt_delete(s, *s->pos, *s->len);
-  else if (key == KEY_CTRL('y')) prompt_yank(s);
-  else if (key == KEY_PASTE_START) prompt_paste(s, e);
-  else if (key >= 32 && key < 127) prompt_insert(s, &(char){(char) key}, 1);
+  else if (key == KEY_CTRL(' ')) {
+    e->prompt_mark_text = s->text;
+    e->prompt_mark = *s->pos;
+    e->prompt_mark_active = true;
+  } else if (key == KEY_CTRL('w')) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, true);
+  } else if (key == KEY_META('w')) {
+    if (prompt_region_range(e, s, &start, &end)) {
+      kill_push_text(e, s->text + start, end - start);
+      clear_prompt_mark(e);
+    }
+  } else if (key == KEY_BACKSPACE) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, false);
+    else prompt_delete(e, s, prompt_prev_char(s, *s->pos), *s->pos, false);
+  } else if (key == KEY_CTRL('d')) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, false);
+    else prompt_delete(e, s, *s->pos, prompt_next_char(s, *s->pos), false);
+  } else if (key == KEY_META(KEY_BACKSPACE))
+    prompt_delete(e, s, prompt_word_back(s, *s->pos), *s->pos, false);
+  else if (key == KEY_META('d'))
+    prompt_delete(e, s, *s->pos, prompt_word_forward(s, *s->pos), false);
+  else if (key == KEY_CTRL('k')) prompt_delete(e, s, *s->pos, *s->len, true);
+  else if (key == KEY_CTRL('y')) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, false);
+    prompt_yank(e, s);
+    clear_prompt_mark(e);
+  } else if (key == KEY_PASTE_START) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, false);
+    prompt_paste(s, e);
+    clear_prompt_mark(e);
+  } else if (key >= 32 && key < 127) {
+    if (prompt_region_range(e, s, &start, &end)) prompt_delete(e, s, start, end, false);
+    prompt_insert(s, &(char){(char) key}, 1);
+    clear_prompt_mark(e);
+  }
   else return false;
   return true;
 }
@@ -3864,6 +4010,7 @@ static int cmd_run(edit_state * e, int key) {
   e->run_len = strlen(e->run_cmd);
   e->run_pos = e->run_len;
   e->run_prompt = true;
+  clear_prompt_mark(e);
   set_status(e, "run: %s", e->run_cmd);
   return 0;
 }
@@ -3893,6 +4040,7 @@ static int open_find_path(edit_state * e) {
   char base[DEBUG_PATH_SIZE];
   path_parts(path, dir, prefix, base);
   if (! regex_path(base)) {
+    if (find_start_mkdir_prompt(e, path)) return 0;
     e->find_prompt = false;
     find_close_created_pane(e);
     return switch_to_path(e, path);
@@ -3903,7 +4051,10 @@ static int open_find_path(edit_state * e) {
   output paths = {0};
   int n = 0;
   DIR * d = opendir(dir);
-  if (d == NULL) return set_status(e, "no such directory"), 0;
+  if (d == NULL) {
+    if (find_start_mkdir_prompt(e, path)) return 0;
+    return set_status(e, "no such directory"), 0;
+  }
   for (struct dirent * ent = readdir(d); ent != NULL; ent = readdir(d)) {
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
     if (! find_name_matches(ent->d_name, base, true)) continue;
@@ -3917,7 +4068,10 @@ static int open_find_path(edit_state * e) {
   if (n == 0) {
     free(footer.data);
     free(paths.data);
-    return set_footer(e, "no match"), 0;
+    if (find_start_mkdir_prompt(e, path)) return 0;
+    e->find_prompt = false;
+    find_close_created_pane(e);
+    return switch_to_path(e, path);
   }
   if (n > 1) {
     int rc = footer.len <= footer_message_cols(e) ?
@@ -3957,6 +4111,8 @@ static int cmd_find_file(edit_state * e, int key) {
   e->find_pos = e->find_len;
   e->find_origin_pane = e->active_pane;
   e->find_prompt = true;
+  e->find_mkdir_prompt = false;
+  clear_prompt_mark(e);
   set_status(e, "find file: %s", e->find_path);
   return 0;
 }
@@ -4102,6 +4258,7 @@ static int cmd_search_dir(edit_state * e, bool reverse) {
   e->search_reverse = reverse;
   e->search_reuse = e->search_len > 0;
   e->search_pos = e->search_len;
+  clear_prompt_mark(e);
   set_status(e, "%ssearch: %s", reverse ? "r" : "", e->search);
   return 0;
 }
@@ -4185,6 +4342,7 @@ static int cmd_replace(edit_state * e, int key) {
   e->search[0] = '\0';
   replace_clear(e);
   e->replace_phase = REPLACE_SEARCH;
+  clear_prompt_mark(e);
   set_status(e, "replace: ");
   (void) key;
   return 0;
@@ -4195,6 +4353,7 @@ static int cmd_goto_line(edit_state * e, int key) {
   e->goto_len = 0;
   e->goto_pos = 0;
   e->goto_line[0] = '\0';
+  clear_prompt_mark(e);
   set_status(e, "goto line: ");
   (void) key;
   return 0;
@@ -4234,6 +4393,14 @@ static int goto_submit(edit_state * e) {
 
 static int cmd_cancel(edit_state * e, int key) {
   input_clear(e);
+  if (e->find_mkdir_prompt) {
+    e->find_mkdir_prompt = false;
+    e->find_prompt = true;
+    clear_prompt_mark(e);
+    set_status(e, "find file: %s", e->find_path);
+    (void) key;
+    return 0;
+  }
   bool find = e->find_prompt;
   e->prefix = 0;
   e->search_prompt = false;
@@ -4242,12 +4409,14 @@ static int cmd_cancel(edit_state * e, int key) {
   e->search_pos = 0;
   e->search[0] = '\0';
   replace_clear(e);
+  e->find_mkdir_prompt = false;
   e->find_prompt = false;
   if (find) find_close_created_pane(e);
   e->run_prompt = false;
   e->goto_prompt = false;
   e->quit_confirm = false;
   clear_mark(e);
+  clear_prompt_mark(e);
   set_status(e, "cancel");
   (void) key;
   return 0;
@@ -4550,7 +4719,7 @@ static binding bindings[] = {
 
 static int find_dispatch(edit_state * e, int key) {
   e->footer[0] = '\0';
-  if (key == KEY_ENTER) return open_find_path(e);
+  if (key == KEY_ENTER) return clear_prompt_mark(e), open_find_path(e);
   if (key == KEY_CTRL('i')) return find_complete(e);
   prompt_slot s = {"find file: ", e->find_path, &e->find_len,
                    &e->find_pos, sizeof(e->find_path)};
@@ -4559,9 +4728,33 @@ static int find_dispatch(edit_state * e, int key) {
   return 0;
 }
 
+static int find_mkdir_dispatch(edit_state * e, int key) {
+  if (key == 'n' || key == 'N') {
+    e->find_mkdir_prompt = false;
+    e->find_prompt = true;
+    clear_prompt_mark(e);
+    return set_status(e, "create canceled"), 0;
+  }
+  if (key != 'y' && key != 'Y')
+    return set_status(e, "Create directory %s? y/n", e->find_mkdir_dir), 0;
+  if (mkdir_p(e->find_mkdir_dir) != 0) {
+    e->find_mkdir_prompt = false;
+    e->find_prompt = true;
+    clear_prompt_mark(e);
+    return set_status(e, "create directory failed"), 0;
+  }
+  char path[DEBUG_PATH_SIZE];
+  snprintf(path, sizeof(path), "%s", e->find_mkdir_target);
+  e->find_mkdir_prompt = false;
+  e->find_prompt = false;
+  clear_prompt_mark(e);
+  find_close_created_pane(e);
+  return switch_to_path(e, path);
+}
+
 static int run_dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
-  if (key == KEY_ENTER) return run_submit(e);
+  if (key == KEY_ENTER) return clear_prompt_mark(e), run_submit(e);
   prompt_slot s = {"run: ", e->run_cmd, &e->run_len,
                    &e->run_pos, sizeof(e->run_cmd)};
   prompt_edit(e, &s, key);
@@ -4571,7 +4764,7 @@ static int run_dispatch(edit_state * e, int key) {
 
 static int goto_dispatch(edit_state * e, int key) {
   if (key == KEY_CTRL('g')) return cmd_cancel(e, key);
-  if (key == KEY_ENTER) return goto_submit(e);
+  if (key == KEY_ENTER) return clear_prompt_mark(e), goto_submit(e);
   prompt_slot s = {"goto line: ", e->goto_line, &e->goto_len,
                    &e->goto_pos, sizeof(e->goto_line)};
   prompt_edit(e, &s, key);
@@ -4598,6 +4791,7 @@ static int search_dispatch(edit_state * e, int key) {
     search_move(e, e->search_reverse, false);
     e->search_prompt = false;
     e->search_reuse = false;
+    clear_prompt_mark(e);
     return 0;
   }
   if (e->search_reuse &&
@@ -4620,6 +4814,7 @@ static int replace_dispatch(edit_state * e, int key) {
     if (key == KEY_ENTER) {
       if (e->search_len == 0) return set_status(e, "no search"), 0;
       e->replace_phase = REPLACE_WITH;
+      clear_prompt_mark(e);
       set_status(e, "with: %s", e->replace);
       return 0;
     }
@@ -4630,7 +4825,7 @@ static int replace_dispatch(edit_state * e, int key) {
     return 0;
   }
   if (e->replace_phase == REPLACE_WITH) {
-    if (key == KEY_ENTER) return replace_find(e, active_pane(e)->cursor);
+    if (key == KEY_ENTER) return clear_prompt_mark(e), replace_find(e, active_pane(e)->cursor);
     prompt_slot s = {"with: ", e->replace, &e->replace_len,
                      &e->replace_pos, sizeof(e->replace)};
     prompt_edit(e, &s, key);
@@ -4657,6 +4852,7 @@ static int dispatch(edit_state * e, int key) {
 
   if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
   if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
+  if (e->find_mkdir_prompt) return action_other(e), find_mkdir_dispatch(e, key);
   if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND)
     return action_other(e), find_dispatch(e, key);
   if (e->run_prompt) return action_other(e), run_dispatch(e, key);

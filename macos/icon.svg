@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#30363b"/>
+      <stop offset="1" stop-color="#1d2023"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="30" stdDeviation="28" flood-color="#000" flood-opacity=".34"/>
+    </filter>
+  </defs>
+  <rect x="72" y="72" width="880" height="880" rx="206" fill="url(#tile)"/>
+  <rect x="188" y="204" width="648" height="616" rx="86" fill="#111417" stroke="#4b5156" stroke-width="28" filter="url(#shadow)"/>
+  <circle cx="282" cy="302" r="24" fill="#8dbb54"/>
+  <circle cx="354" cy="302" r="24" fill="#777c80"/>
+  <circle cx="426" cy="302" r="24" fill="#777c80"/>
+  <rect x="290" y="416" width="32" height="208" rx="8" fill="#f1eee8"/>
+  <rect x="368" y="438" width="354" height="28" rx="14" fill="#f1eee8"/>
+  <rect x="368" y="528" width="292" height="28" rx="14" fill="#f1eee8"/>
+  <rect x="368" y="618" width="178" height="28" rx="14" fill="#f1eee8"/>
+</svg>

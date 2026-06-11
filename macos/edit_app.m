@@ -84,6 +84,8 @@ typedef struct {
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
 - (void)sendKey:(const char *)bytes;
 - (void)sendCommand:(id)sender;
+- (void)pasteString:(NSString *)s;
+- (void)cut:(id)sender;
 - (void)saveDocument:(id)sender;
 - (void)quitDocument:(id)sender;
 @end
@@ -557,6 +559,13 @@ static bool cell_same_text(cell *a, cell *b) {
 - (void)keyDown:(NSEvent *)event {
   NSString *plain = event.charactersIgnoringModifiers ?: @"";
   NSEventModifierFlags flags = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+  if (flags & NSEventModifierFlagCommand) {
+    if ([plain isEqualToString:@"x"]) return [self cut:nil];
+    if ([plain isEqualToString:@"c"]) return [self copy:nil];
+    if ([plain isEqualToString:@"v"]) return [self paste:nil];
+    if ([plain isEqualToString:@"s"]) return [self saveDocument:nil];
+    return;
+  }
   if (flags & NSEventModifierFlagControl) {
     if (plain.length == 0) return;
     char c = (char)[plain characterAtIndex:0];
@@ -633,6 +642,10 @@ static bool cell_same_text(cell *a, cell *b) {
 - (void)paste:(id)sender {
   NSString *s = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
   if (!s) return;
+  [self pasteString:s];
+}
+
+- (void)pasteString:(NSString *)s {
   [self sendKey:"\x1b[200~"];
   NSData *data = [s dataUsingEncoding:NSUTF8StringEncoding];
   [self sendBytes:data.bytes length:data.length];
@@ -640,15 +653,10 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)copy:(id)sender {
-  NSMutableString *s = [NSMutableString string];
-  for (int r = 0; r < _rows; r++) {
-    for (int c = 0; c < _cols; c++) [s appendFormat:@"%C", _cells[r * _cols + c].ch];
-    [s appendString:@"\n"];
-  }
-  [NSPasteboard.generalPasteboard clearContents];
-  [NSPasteboard.generalPasteboard setString:s forType:NSPasteboardTypeString];
+  [self sendKey:"\x1bw"];
 }
 
+- (void)cut:(id)sender { [self sendKey:"\027"]; }
 - (void)saveDocument:(id)sender { [self sendKey:"\030\023"]; }
 - (void)quitDocument:(id)sender { [self sendKey:"\030\003"]; }
 
@@ -716,6 +724,15 @@ static bool cell_same_text(cell *a, cell *b) {
   [bar addItem:commandsItem];
   NSMenu *commands = [[NSMenu alloc] initWithTitle:@"Commands"];
   commandsItem.submenu = commands;
+
+  NSMenuItem *editItem = [[NSMenuItem alloc] init];
+  [bar addItem:editItem];
+  NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+  editItem.submenu = edit;
+  [edit addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+  [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+  [edit addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+  [edit addItem:[NSMenuItem separatorItem]];
 
   [self addCommand:@"Backward Character    C-b / Left" bytes:"\002" length:1 to:commands];
   [self addCommand:@"Forward Character    C-f / Right" bytes:"\006" length:1 to:commands];
@@ -889,6 +906,23 @@ static int ansi_self_test(void) {
   const char mouse[] = "\033[<0;2;2M";
   if (!clicked || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
     fprintf(stderr, "mouse click bytes failed\n");
+    return 1;
+  }
+
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *shortcutView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  shortcutView.fd = p[1];
+  [shortcutView cut:nil];
+  [shortcutView copy:nil];
+  [shortcutView pasteString:@"PASTE"];
+  close(p[1]);
+  shortcutView.fd = -1;
+  got = read(p[0], buf, sizeof(buf));
+  close(p[0]);
+  const char shortcuts[] = "\027\033w\033[200~PASTE\033[201~";
+  if (got != (ssize_t)strlen(shortcuts) || memcmp(buf, shortcuts, strlen(shortcuts)) != 0) {
+    fprintf(stderr, "shortcut bytes failed got=%zd expected=%zu\n", got, strlen(shortcuts));
+    for (ssize_t i = 0; i < got; i++) fprintf(stderr, "%02x%s", (unsigned char)buf[i], i + 1 == got ? "\n" : " ");
     return 1;
   }
 
