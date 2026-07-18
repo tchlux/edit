@@ -87,6 +87,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define REPLACE_QUERY 3
 #define PANE_MAX 8
 #define LAYOUT_MAX (PANE_MAX * 2 - 1)
+#define COMMENT_MAX 64
+#define CHANGE_SGR "38;2;130;230;150;48;2;38;68;45"
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
@@ -101,6 +103,12 @@ typedef struct {
   char * text;
   unsigned group;
 } history;
+
+typedef struct {
+  size_t start;
+  size_t end;
+  char * text;
+} edit_comment;
 
 typedef struct {
   char * data;
@@ -122,6 +130,12 @@ typedef struct {
   bool dirty;
   bool read_only;
   int kind;
+  char * base;
+  size_t base_len;
+  edit_comment comments[COMMENT_MAX];
+  int n_comments;
+  bool suggested;
+  bool comments_visible;
 } buffer;
 
 typedef struct {
@@ -142,6 +156,10 @@ typedef struct {
   size_t len;
   size_t cap;
 } output;
+
+static void out_add(output * o, const char * s, size_t n);
+static void out_s(output * o, const char * s);
+static void out_f(output * o, const char * fmt, ...);
 
 typedef struct edit_state edit_state;
 typedef int (*command_fn)(edit_state * e, int key);
@@ -230,6 +248,12 @@ struct edit_state {
   char goto_line[STATUS_SIZE];
   size_t goto_len;
   size_t goto_pos;
+  bool comment_prompt;
+  char comment[STATUS_SIZE];
+  size_t comment_len;
+  size_t comment_pos;
+  size_t comment_start;
+  size_t comment_end;
   char status[STATUS_SIZE];
   long long status_ms;
   char footer[STATUS_SIZE];
@@ -405,6 +429,8 @@ static void history_free_buffer(buffer * b) {
 
 static void buffer_free(buffer * b) {
   history_free_buffer(b);
+  for (int i = 0; i < b->n_comments; i++) free(b->comments[i].text);
+  free(b->base);
   free(b->data);
   free(b->path);
   memset(b, 0, sizeof(*b));
@@ -414,7 +440,7 @@ static void buffers_free(edit_state * e) {
   for (int i = 0; i < 8; i++) buffer_free(&e->buffers[i]);
 }
 
-static int buffer_save(buffer * b) {
+static int buffer_save_source(buffer * b) {
   if (b->kind != BUFFER_FILE) return -1;
   size_t n = strlen(b->path) + 12;
   char * tmp = malloc(n);
@@ -461,6 +487,71 @@ static int buffer_save(buffer * b) {
   b->clean_at = b->undo_at;
   b->dirty = false;
   return 0;
+}
+
+static char * buffer_text(buffer * b, size_t * n) {
+  *n = buffer_len(b);
+  char * s = malloc(*n ? *n : 1);
+  if (s == NULL) return NULL;
+  for (size_t i = 0; i < *n; i++) s[i] = buffer_at(b, i);
+  return s;
+}
+
+static int write_atomic(const char * path, const char * data, size_t len) {
+  size_t n = strlen(path) + 12;
+  char * tmp = malloc(n);
+  if (tmp == NULL) return -1;
+  snprintf(tmp, n, "%s.tmp.XXXXXX", path);
+  int fd = mkstemp(tmp);
+  if (fd < 0) return free(tmp), -1;
+  FILE * f = fdopen(fd, "wb");
+  int rc = f == NULL;
+  if (f == NULL) close(fd);
+  else {
+    if (fwrite(data, 1, len, f) != len) rc = 1;
+    if (fclose(f) != 0) rc = 1;
+  }
+  if (! rc && rename(tmp, path) != 0) rc = 1;
+  if (rc) unlink(tmp);
+  free(tmp);
+  return rc ? -1 : 0;
+}
+
+static int edits_path(buffer * b, char * path, size_t n) {
+  return snprintf(path, n, "%s.edits", b->path) < (int) n ? 0 : -1;
+}
+
+static int buffer_save_edits(buffer * b) {
+  output o = {0};
+  size_t proposed_len;
+  char * proposed = buffer_text(b, &proposed_len);
+  char path[DEBUG_PATH_SIZE + 8];
+  if (proposed == NULL || edits_path(b, path, sizeof(path)) != 0)
+    return free(proposed), -1;
+  out_f(&o, "EDIT-SUGGESTIONS 1\nbase %zu\n", b->base_len);
+  out_add(&o, b->base, b->base_len);
+  out_f(&o, "\nproposed %zu\n", proposed_len);
+  out_add(&o, proposed, proposed_len);
+  out_f(&o, "\ncomments %d\n", b->n_comments);
+  for (int i = 0; i < b->n_comments; i++) {
+    edit_comment * c = &b->comments[i];
+    size_t len = strlen(c->text);
+    out_f(&o, "comment %zu %zu %zu\n", c->start, c->end, len);
+    out_add(&o, c->text, len);
+    out_s(&o, "\n");
+  }
+  int rc = write_atomic(path, o.data, o.len);
+  free(proposed);
+  free(o.data);
+  if (rc == 0) {
+    b->clean_at = b->undo_at;
+    b->dirty = false;
+  }
+  return rc;
+}
+
+static int buffer_save(buffer * b) {
+  return b->suggested ? buffer_save_edits(b) : buffer_save_source(b);
 }
 
 static int buffer_gap(buffer * b, size_t need) {
@@ -515,6 +606,92 @@ static void buffer_delete(buffer * b, size_t start, size_t end) {
   buffer_move_gap(b, start);
   b->gap_b += end - start;
   b->dirty = true;
+}
+
+static int parse_size_line(char ** p, char * end, const char * label, size_t * value) {
+  int used = 0;
+  if (*p >= end || sscanf(*p, label, value, &used) != 1 || used <= 0 || *p + used > end)
+    return -1;
+  *p += used;
+  return 0;
+}
+
+static int buffer_resume_edits(buffer * b) {
+  char path[DEBUG_PATH_SIZE + 8];
+  if (edits_path(b, path, sizeof(path)) != 0) return -1;
+  FILE * f = fopen(path, "rb");
+  if (f == NULL) return errno == ENOENT ? 0 : -1;
+  if (fseek(f, 0, SEEK_END) != 0) return fclose(f), -1;
+  long file_len = ftell(f);
+  if (file_len < 0) return fclose(f), -1;
+  rewind(f);
+  char * data = malloc((size_t) file_len + 1);
+  if (data == NULL) return fclose(f), -1;
+  if (fread(data, 1, (size_t) file_len, f) != (size_t) file_len)
+    return fclose(f), free(data), -1;
+  fclose(f);
+  data[file_len] = '\0';
+
+  char * p = data;
+  char * end = data + file_len;
+  const char * header = "EDIT-SUGGESTIONS 1\n";
+  if ((size_t) file_len < strlen(header) || memcmp(p, header, strlen(header)) != 0)
+    return free(data), -1;
+  p += strlen(header);
+  size_t base_len = 0;
+  size_t proposed_len = 0;
+  if (parse_size_line(&p, end, "base %zu\n%n", &base_len) != 0 ||
+      base_len > (size_t) (end - p)) return free(data), -1;
+  char * base = p;
+  p += base_len;
+  if (p >= end || *p++ != '\n' ||
+      parse_size_line(&p, end, "proposed %zu\n%n", &proposed_len) != 0 ||
+      proposed_len > (size_t) (end - p)) return free(data), -1;
+  char * proposed = p;
+  p += proposed_len;
+  if (p >= end || *p++ != '\n') return free(data), -1;
+  int n_comments = 0;
+  int used = 0;
+  if (sscanf(p, "comments %d\n%n", &n_comments, &used) != 1 || used <= 0 ||
+      n_comments < 0 || n_comments > COMMENT_MAX) return free(data), -1;
+  p += used;
+
+  size_t current_len;
+  char * current = buffer_text(b, &current_len);
+  if (current == NULL) return free(data), -1;
+  if (current_len != base_len || memcmp(current, base, base_len) != 0)
+    return free(current), free(data), 1;
+  free(current);
+
+  b->base = malloc(base_len ? base_len : 1);
+  if (b->base == NULL) return free(data), -1;
+  memcpy(b->base, base, base_len);
+  b->base_len = base_len;
+  buffer_delete(b, 0, buffer_len(b));
+  if (buffer_insert(b, 0, proposed, proposed_len) != 0) return free(data), -1;
+  history_free_buffer(b);
+  b->dirty = false;
+  b->suggested = true;
+  b->comments_visible = true;
+
+  for (int i = 0; i < n_comments; i++) {
+    size_t text_len = 0;
+    edit_comment * c = &b->comments[i];
+    used = 0;
+    if (sscanf(p, "comment %zu %zu %zu\n%n", &c->start, &c->end,
+               &text_len, &used) != 3 || used <= 0 || p + used > end ||
+        text_len > (size_t) (end - (p + used))) return free(data), -1;
+    p += used;
+    c->text = malloc(text_len + 1);
+    if (c->text == NULL) return free(data), -1;
+    memcpy(c->text, p, text_len);
+    c->text[text_len] = '\0';
+    p += text_len;
+    if (p >= end || *p++ != '\n') return free(data), -1;
+    b->n_comments++;
+  }
+  free(data);
+  return 2;
 }
 
 static int smart_match(const char * regex, const char * text, size_t len,
@@ -967,6 +1144,10 @@ static int edit_insert_raw(edit_state * e, size_t pos, const char * text, size_t
   int bnum = active_pane(e)->buffer;
   buffer * b = active_buffer(e);
   if (buffer_insert(b, pos, text, len) != 0) return -1;
+  if (b->suggested) for (int i = 0; i < b->n_comments; i++) {
+    if (b->comments[i].start >= pos) b->comments[i].start += len;
+    if (b->comments[i].end >= pos) b->comments[i].end += len;
+  }
   for (int i = 0; i < e->n_panes; i++) {
     if (e->panes[i].buffer != bnum) continue;
     if (e->panes[i].mark_active && e->panes[i].mark >= pos) e->panes[i].mark += len;
@@ -1000,6 +1181,12 @@ static int edit_delete_raw(edit_state * e, size_t start, size_t end) {
   int bnum = active_pane(e)->buffer;
   size_t n = end - start;
   buffer_delete(b, start, end);
+  if (b->suggested) for (int i = 0; i < b->n_comments; i++) {
+    edit_comment * c = &b->comments[i];
+    c->start = c->start <= start ? c->start : c->start >= end ? c->start - n : start;
+    c->end = c->end <= start ? c->end : c->end >= end ? c->end - n : start;
+    if (c->end < c->start) c->end = c->start;
+  }
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
     if (p->buffer != bnum) continue;
@@ -1207,6 +1394,7 @@ static int switch_to_path(edit_state * e, const char * path) {
   if (buffer_load(&e->buffers[e->n_buffers], path) != 0)
     return set_status(e, "open failed"), 0;
   i = e->n_buffers++;
+  int resumed = buffer_resume_edits(&e->buffers[i]);
   active_pane(e)->buffer = i;
   active_pane(e)->cursor = 0;
   active_pane(e)->top = 0;
@@ -1215,7 +1403,9 @@ static int switch_to_path(edit_state * e, const char * path) {
   active_pane(e)->mark_active = false;
   recent_save(path);
   refresh_buffer_list(e);
-  set_status(e, "%s %s", exists ? "opened" : "new file", file_name(path));
+  if (resumed == 1) set_status(e, "edits conflict: source changed");
+  else if (resumed == 2) set_status(e, "resumed suggested changes");
+  else set_status(e, "%s %s", exists ? "opened" : "new file", file_name(path));
   return 0;
 }
 
@@ -2062,6 +2252,18 @@ static bool region_byte(pane * p, size_t pos) {
   return region_range(p, &start, &end) && pos >= start && pos < end;
 }
 
+static bool suggested_byte(buffer * b, size_t pos) {
+  if (! b->suggested || b->base == NULL) return false;
+  size_t len = buffer_len(b);
+  size_t prefix = 0;
+  while (prefix < len && prefix < b->base_len &&
+         buffer_at(b, prefix) == b->base[prefix]) prefix++;
+  size_t suffix = 0;
+  while (suffix < len - prefix && suffix < b->base_len - prefix &&
+         buffer_at(b, len - suffix - 1) == b->base[b->base_len - suffix - 1]) suffix++;
+  return pos >= prefix && pos < len - suffix;
+}
+
 static char triple_quote_before(buffer * b, size_t end) {
   char quote = '\0';
   for (size_t i = 0; i + 2 < end; i++) {
@@ -2177,6 +2379,7 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
     int new_attr = 0;
     if (region_byte(p, start + i)) sgr = REGION_SGR;
     else if (search_sgrs[i] != NULL) sgr = search_sgrs[i];
+    else if (suggested_byte(b, start + i)) sgr = CHANGE_SGR;
     else if (span < n_spans && i >= spans[span].start) {
       sgr = spans[span].sgr;
       new_attr = spans[span].attr;
@@ -2289,6 +2492,11 @@ static const char * file_name(const char * path) {
 }
 
 static bool active_prompt_slot(edit_state * e, prompt_slot * s) {
+  if (e->comment_prompt) {
+    *s = (prompt_slot){"comment: ", e->comment, &e->comment_len,
+                       &e->comment_pos, sizeof(e->comment)};
+    return true;
+  }
   if (e->debug_note_prompt) {
     *s = (prompt_slot){"debug note: ", e->debug_note, &e->debug_note_len,
                        &e->debug_note_pos, sizeof(e->debug_note)};
@@ -2390,6 +2598,7 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   out_clip(o, file_name(b->path), &used, status_cols);
   modeline_pos(o, b, p, &used, status_cols);
   if (b->dirty) out_clip(o, " *", &used, status_cols);
+  if (b->suggested) out_clip(o, " Suggested", &used, status_cols);
   if (read_only_buffer(b)) out_clip(o, " RO", &used, status_cols);
   if (p->wrap) out_clip(o, " Wrap", &used, status_cols);
   if (active && e->n_panes > 1) out_clip(o, " >", &used, status_cols);
@@ -2407,6 +2616,27 @@ static void render_layout_dividers(edit_state * e, output * o, int node, pane_re
       out_f(o, "\x1b[%d;%dH%s", row + 1, a.col + a.cols, PANE_DIVIDER);
   render_layout_dividers(e, o, n->first, a);
   render_layout_dividers(e, o, n->second, b);
+}
+
+static edit_comment * comment_on_line(buffer * b, size_t line, size_t cursor) {
+  edit_comment * found = NULL;
+  size_t distance = SIZE_MAX;
+  for (int i = 0; i < b->n_comments; i++) {
+    edit_comment * c = &b->comments[i];
+    if (line_start(b, c->start) != line) continue;
+    size_t d = c->start > cursor ? c->start - cursor : cursor - c->start;
+    if (d < distance) found = c, distance = d;
+  }
+  return found;
+}
+
+static void render_comment(output * o, edit_comment * c, size_t limit) {
+  size_t used = 0;
+  if (c != NULL) for (const char * p = c->text; *p && *p != '\n' && used < limit; p++) {
+    out_add(o, p, 1);
+    used++;
+  }
+  while (used++ < limit) out_s(o, " ");
 }
 
 static void render(edit_state * e) {
@@ -2429,11 +2659,21 @@ static void render(edit_state * e) {
     size_t cursor_col = pane_cursor_col(e, p);
     size_t pos = p->top;
 
+    bool comments = b->suggested && b->comments_visible && e->cols >= 20;
+    int document_cols = comments ? e->cols / 2 : e->cols;
     for (int row = 0; row < body_rows; row++) {
+      size_t row_pos = pos;
       out_s(&o, "\x1b[K");
+      size_t shown = 0;
       if (pos < buffer_len(b))
-        render_buffer_line(e, &o, b, p, &pos, p->left_col,
-                           (e->cols > 1) ? (size_t) e->cols - 1 : 1);
+        shown = render_buffer_line(e, &o, b, p, &pos, p->left_col,
+                                   (document_cols > 1) ? (size_t) document_cols - 1 : 1);
+      if (comments) {
+        while (shown++ < (size_t) document_cols - 1) out_s(&o, " ");
+        out_s(&o, PANE_DIVIDER);
+        render_comment(&o, comment_on_line(b, line_start(b, row_pos), p->cursor),
+                       (size_t) (e->cols - document_cols - 1));
+      }
       out_s(&o, "\r\n");
     }
     out_s(&o, "\x1b[7m");
@@ -2443,7 +2683,8 @@ static void render(edit_state * e) {
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
     if (prompt_footer_cursor(e))
       out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, prompt_footer_cursor_col(e, e->cols) + 1);
-    else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
+    else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1,
+               cursor_col < (size_t) document_cols - 1 ? cursor_col + 1 : (size_t) document_cols - 1);
     debug_log_render(e, &o);
     write(STDOUT_FILENO, o.data, o.len);
     free(o.data);
@@ -2834,6 +3075,7 @@ static int cli_render(const char * size, const char * path) {
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  buffer_resume_edits(&e.buffers[0]);
   render_snapshot(&e);
   buffers_free(&e);
   return 0;
@@ -2852,6 +3094,7 @@ static int cli_render_color(const char * size, const char * path) {
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  buffer_resume_edits(&e.buffers[0]);
   render_color_snapshot(&e);
   buffers_free(&e);
   return 0;
@@ -2869,6 +3112,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  buffer_resume_edits(&e.buffers[0]);
 
   size_t pos;
   if (parse_point(point, &pos, &e.buffers[0]) != 0) {
@@ -2909,6 +3153,7 @@ static int key_name(char c) {
   if (c == '<') return KEY_META('<');
   if (c == '>') return KEY_META('>');
   if (c == 'x') return KEY_CTRL('x');
+  if (c == 'C') return KEY_CTRL('c');
   if (c == '/') return KEY_CTRL('_');
   if (c == '_') return KEY_CTRL('_');
   return (unsigned char) c;
@@ -2926,8 +3171,10 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  buffer_resume_edits(&e.buffers[0]);
 
-  for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
+  for (size_t i = 0; keys[i] != '\0'; i++)
+    dispatch(&e, e.prefix == KEY_CTRL('c') ? (unsigned char) keys[i] : key_name(keys[i]));
   render_snapshot(&e);
   kill_ring_free(&e);
   buffers_free(&e);
@@ -2947,8 +3194,10 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  buffer_resume_edits(&e.buffers[0]);
 
-  for (size_t i = 0; keys[i] != '\0'; i++) dispatch(&e, key_name(keys[i]));
+  for (size_t i = 0; keys[i] != '\0'; i++)
+    dispatch(&e, e.prefix == KEY_CTRL('c') ? (unsigned char) keys[i] : key_name(keys[i]));
   render_color_snapshot(&e);
   kill_ring_free(&e);
   buffers_free(&e);
@@ -3843,6 +4092,156 @@ static int cmd_toggle_wrap(edit_state * e, int key) {
   return 0;
 }
 
+static int buffer_replace_text(buffer * b, const char * text, size_t len) {
+  char * data = malloc(len + GAP_SIZE);
+  if (data == NULL) return -1;
+  memcpy(data + GAP_SIZE, text, len);
+  free(b->data);
+  b->data = data;
+  b->cap = len + GAP_SIZE;
+  b->gap_a = 0;
+  b->gap_b = GAP_SIZE;
+  history_free_buffer(b);
+  b->dirty = false;
+  return 0;
+}
+
+static void review_clear(buffer * b) {
+  for (int i = 0; i < b->n_comments; i++) free(b->comments[i].text);
+  memset(b->comments, 0, sizeof(b->comments));
+  b->n_comments = 0;
+  free(b->base);
+  b->base = NULL;
+  b->base_len = 0;
+  b->suggested = false;
+  b->comments_visible = false;
+}
+
+static int cmd_suggested(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  (void) key;
+  if (b->kind != BUFFER_FILE) return set_status(e, "suggestions need a file"), 0;
+  if (b->suggested) return set_status(e, "suggested changes already on"), 0;
+  if (b->dirty) return set_status(e, "save before starting suggestions"), 0;
+  b->base = buffer_text(b, &b->base_len);
+  if (b->base == NULL) return set_status(e, "cannot start suggestions"), 0;
+  b->suggested = true;
+  b->comments_visible = true;
+  set_status(e, "suggested changes on");
+  return 0;
+}
+
+static int nearest_comment(buffer * b, size_t pos) {
+  int found = -1;
+  size_t distance = SIZE_MAX;
+  for (int i = 0; i < b->n_comments; i++) {
+    size_t at = b->comments[i].start;
+    size_t d = at > pos ? at - pos : pos - at;
+    if (d < distance) found = i, distance = d;
+  }
+  return found;
+}
+
+static int cmd_comment(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  (void) key;
+  if (! b->suggested) return set_status(e, "start suggested changes first"), 0;
+  if (b->n_comments >= COMMENT_MAX) return set_status(e, "too many comments"), 0;
+  if (! region_range(p, &e->comment_start, &e->comment_end)) {
+    e->comment_start = line_start(b, p->cursor);
+    e->comment_end = line_end(b, p->cursor);
+  }
+  e->comment[0] = '\0';
+  e->comment_len = e->comment_pos = 0;
+  e->comment_prompt = true;
+  clear_prompt_mark(e);
+  set_status(e, "comment: ");
+  return 0;
+}
+
+static int comment_submit(edit_state * e) {
+  buffer * b = active_buffer(e);
+  e->comment_prompt = false;
+  if (e->comment_len == 0) return set_status(e, "empty comment"), 0;
+  edit_comment * c = &b->comments[b->n_comments++];
+  c->start = e->comment_start;
+  c->end = e->comment_end;
+  c->text = _dup(e->comment);
+  if (c->text == NULL) return b->n_comments--, set_status(e, "comment failed"), 0;
+  b->dirty = true;
+  b->comments_visible = true;
+  set_status(e, "comment added");
+  return 0;
+}
+
+static int comment_dispatch(edit_state * e, int key) {
+  if (key == KEY_ENTER) return clear_prompt_mark(e), comment_submit(e);
+  prompt_slot s = {"comment: ", e->comment, &e->comment_len,
+                   &e->comment_pos, sizeof(e->comment)};
+  prompt_edit(e, &s, key);
+  set_status(e, "comment: %s", e->comment);
+  return 0;
+}
+
+static int cmd_delete_comment(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  int i = nearest_comment(b, active_pane(e)->cursor);
+  (void) key;
+  if (i < 0) return set_status(e, "no comment"), 0;
+  free(b->comments[i].text);
+  memmove(&b->comments[i], &b->comments[i + 1],
+          (size_t) (b->n_comments - i - 1) * sizeof(edit_comment));
+  b->n_comments--;
+  b->dirty = true;
+  set_status(e, "comment deleted");
+  return 0;
+}
+
+static int cmd_comments(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  (void) key;
+  if (! b->suggested) return set_status(e, "no suggested changes"), 0;
+  b->comments_visible = ! b->comments_visible;
+  set_status(e, "comments %s", b->comments_visible ? "shown" : "hidden");
+  return 0;
+}
+
+static int cmd_accept_all(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  char path[DEBUG_PATH_SIZE + 8];
+  (void) key;
+  if (! b->suggested) return set_status(e, "no suggested changes"), 0;
+  b->suggested = false;
+  if (buffer_save_source(b) != 0) {
+    b->suggested = true;
+    return set_status(e, "accept failed"), 0;
+  }
+  edits_path(b, path, sizeof(path));
+  unlink(path);
+  review_clear(b);
+  set_status(e, "accepted all changes");
+  return 0;
+}
+
+static int cmd_reject_all(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  char path[DEBUG_PATH_SIZE + 8];
+  (void) key;
+  if (! b->suggested) return set_status(e, "no suggested changes"), 0;
+  char * base = b->base;
+  size_t base_len = b->base_len;
+  if (buffer_replace_text(b, base, base_len) != 0) return set_status(e, "reject failed"), 0;
+  free(base);
+  edits_path(b, path, sizeof(path));
+  unlink(path);
+  b->base = NULL;
+  review_clear(b);
+  clamp_panes(e, active_pane(e)->buffer);
+  set_status(e, "rejected all changes");
+  return 0;
+}
+
 static int cmd_save(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   if (b->kind == BUFFER_SCRATCH) set_status(e, "scratch not saved");
@@ -4106,6 +4505,11 @@ static int cmd_find_file(edit_state * e, int key) {
     if (slash != NULL)
       snprintf(e->find_path, sizeof(e->find_path), "%.*s",
                (int) (slash - current + 1), current);
+  } else if (active_buffer(e)->kind == BUFFER_SCRATCH &&
+             getcwd(current, sizeof(current)) != NULL) {
+    size_t n = strlen(current);
+    snprintf(e->find_path, sizeof(e->find_path), "%s%s", current,
+             n > 0 && current[n - 1] == '/' ? "" : "/");
   }
   e->find_len = strlen(e->find_path);
   e->find_pos = e->find_len;
@@ -4387,6 +4791,7 @@ static int goto_submit(edit_state * e) {
   p->cursor = goto_line_pos(active_buffer(e), line);
   p->preferred_col = SIZE_MAX;
   e->goto_prompt = false;
+  e->comment_prompt = false;
   set_status(e, "goto line %zu", line);
   return 0;
 }
@@ -4589,6 +4994,10 @@ static const char HELP_TEXT[] =
   "  C-c x                             run shell command\n"
   "  C-c C-r                           toggle read only\n"
   "  C-c C-w                           toggle visual wrap\n"
+  "  C-c e                             start suggested changes\n"
+  "  C-c c, C-c d                      create and delete comment\n"
+  "  C-c ]                             show or hide comments\n"
+  "  C-c a, C-c r                      accept or reject all changes\n"
   "\n"
   "Search\n"
   "  C-s, C-r                          search forward and reverse\n"
@@ -4699,6 +5108,12 @@ static binding bindings[] = {
   {{KEY_CTRL('r'), 0}, 1, cmd_reverse_search},
   {{KEY_CTRL('s'), 0}, 1, cmd_search},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo},
+  {{KEY_CTRL('c'), 'e'}, 2, cmd_suggested},
+  {{KEY_CTRL('c'), 'c'}, 2, cmd_comment},
+  {{KEY_CTRL('c'), 'd'}, 2, cmd_delete_comment},
+  {{KEY_CTRL('c'), ']'}, 2, cmd_comments},
+  {{KEY_CTRL('c'), 'a'}, 2, cmd_accept_all},
+  {{KEY_CTRL('c'), 'r'}, 2, cmd_reject_all},
   {{KEY_CTRL('c'), KEY_CTRL('r')}, 2, cmd_toggle_read_only},
   {{KEY_CTRL('c'), KEY_CTRL('w')}, 2, cmd_toggle_wrap},
   {{KEY_CTRL('c'), 'x'}, 2, cmd_run},
@@ -4857,6 +5272,7 @@ static int dispatch(edit_state * e, int key) {
     return action_other(e), find_dispatch(e, key);
   if (e->run_prompt) return action_other(e), run_dispatch(e, key);
   if (e->goto_prompt) return action_other(e), goto_dispatch(e, key);
+  if (e->comment_prompt) return action_other(e), comment_dispatch(e, key);
   if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
@@ -4898,6 +5314,7 @@ static int dispatch(edit_state * e, int key) {
 static int tui(const char * path) {
   edit_state e;
   char open_path[DEBUG_PATH_SIZE];
+  bool scratch = path == NULL;
   init_state(&e);
   e.n_buffers = 1;
   e.n_panes = 1;
@@ -4905,15 +5322,35 @@ static int tui(const char * path) {
   e.panes[0].cursor = 0;
   e.panes[0].preferred_col = SIZE_MAX;
   set_status(&e, "%s", DEFAULT_STATUS);
-  if (path_absolute(path, open_path, sizeof(open_path)) != 0)
-    snprintf(open_path, sizeof(open_path), "%s", path);
+
+  if (! scratch) {
+    if (path_absolute(path, open_path, sizeof(open_path)) != 0)
+      snprintf(open_path, sizeof(open_path), "%s", path);
+    if (directory_path(open_path)) {
+      if (chdir(open_path) != 0) {
+        fprintf(stderr, "edit: cannot open %s\n", path);
+        return 1;
+      }
+      scratch = true;
+    }
+  }
 
   load_grammar(&e);
-  if (buffer_load(&e.buffers[0], open_path) != 0) {
+  if (scratch) {
+    if (buffer_scratch(&e.buffers[0]) != 0) {
+      fprintf(stderr, "edit: cannot open scratch\n");
+      buffers_free(&e);
+      return 1;
+    }
+  } else if (buffer_load(&e.buffers[0], open_path) != 0) {
     fprintf(stderr, "edit: cannot open %s\n", path);
     return 1;
+  } else {
+    int resumed = buffer_resume_edits(&e.buffers[0]);
+    if (resumed == 1) set_status(&e, "edits conflict: source changed");
+    else if (resumed == 2) set_status(&e, "resumed suggested changes");
+    recent_save(open_path);
   }
-  recent_save(open_path);
   if (raw_on(&e) != 0) {
     fprintf(stderr, "edit: raw mode failed\n");
     buffers_free(&e);
@@ -4972,7 +5409,7 @@ static int tui(const char * path) {
       set_status(&e, "Esc");
       action = "esc-prefix";
     } else if (key == KEY_META('r')) {
-      if (e.debug_log == NULL && debug_start(&e, path) == 0) {
+      if (e.debug_log == NULL && debug_start(&e, path ? path : "*scratch*") == 0) {
         debug_log_key(&e, &ev, "before");
         debug_log_state(&e, "before");
         action = "debug-start";
@@ -5110,7 +5547,7 @@ static int cli_change(const char * op, const char * point_or_range,
 static void usage(void) {
   fprintf(stderr,
     "usage:\n"
-    "  edit file\n"
+    "  edit [file|directory]\n"
     "  edit --print range file\n"
     "  edit --insert line:col text file\n"
     "  edit --delete range file\n"
@@ -5124,6 +5561,7 @@ static void usage(void) {
 }
 
 int main(int argc, char ** argv) {
+  if (argc == 1) return tui(NULL);
   if (argc == 2) return tui(argv[1]);
   if (argc == 4 && strcmp(argv[1], "--render") == 0)
     return cli_render(argv[2], argv[3]);

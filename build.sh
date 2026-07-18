@@ -40,6 +40,7 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
       <array>
         <string>public.text</string>
         <string>public.source-code</string>
+        <string>public.folder</string>
       </array>
     </dict>
   </array>

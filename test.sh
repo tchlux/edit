@@ -1174,6 +1174,18 @@ python3 ./tui_view.py 5:200 '^x^f' "$dir/a" > "$out"
 grep -Fq "find.file:.$dir/" "$out"
 grep -q 'cursor:5:' "$out"
 
+cwd=$(pwd -P)
+python3 ./tui_view.py 5:120 '^x^f' > "$out"
+grep -q '\*scratch\*' "$out"
+grep -Fq "find.file:.$cwd/" "$out"
+
+printf '' > "$recent"
+launch_dir=$(cd "$dir" && pwd -P)
+python3 ./tui_view.py 5:120 '^x^f' "$dir" > "$out"
+grep -q '\*scratch\*' "$out"
+grep -Fq "find.file:.$launch_dir/" "$out"
+test ! -s "$recent"
+
 python3 ./tui_view.py 5:80 '^x^f^a^kfoo bar^a<m-f>' "$dir/a" > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:5:15\n' > "$tmp.expected"
@@ -1413,5 +1425,26 @@ cmp -s "$tmp.expected" "$tmp.head"
 python3 ./tui_view.py 12:28 '<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
 tail -n 1 "$out" > "$tmp.head"
 cmp -s "$tmp.expected" "$tmp.head"
+
+review="$dir/review.txt"
+printf 'alpha\nbeta\n' > "$review"
+./edit --render-keys 7:60 'CeXCcok
+xs' "$review" > "$out"
+printf 'alpha\nbeta\n' | cmp -s - "$review"
+grep -q '^EDIT-SUGGESTIONS 1$' "$review.edits"
+grep -q '^proposed 12$' "$review.edits"
+grep -q '^comment 0 6 2$' "$review.edits"
+grep -q '^ok$' "$review.edits"
+./edit --render 7:60 "$review" > "$out"
+grep -q 'Xalpha' "$out"
+./edit --render-keys 7:60 'Ca' "$review" > "$out"
+printf 'Xalpha\nbeta\n' | cmp -s - "$review"
+test ! -e "$review.edits"
+
+./edit --render-keys 7:60 'CeYxs' "$review" > "$out"
+printf 'Xalpha\nbeta\n' | cmp -s - "$review"
+./edit --render-keys 7:60 'Cr' "$review" > "$out"
+printf 'Xalpha\nbeta\n' | cmp -s - "$review"
+test ! -e "$review.edits"
 
 printf 'ok\n'

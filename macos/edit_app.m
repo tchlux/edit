@@ -264,7 +264,8 @@ static bool cell_same_text(cell *a, cell *b) {
   if (child == 0) {
     setenv("TERM", "xterm-256color", 1);
     setenv("EDIT_BATCH_ARROWS", "1", 1);
-    execl(edit.fileSystemRepresentation, "edit", path.fileSystemRepresentation, NULL);
+    if (path) execl(edit.fileSystemRepresentation, "edit", path.fileSystemRepresentation, NULL);
+    else execl(edit.fileSystemRepresentation, "edit", NULL);
     _exit(127);
   }
   if (child < 0) return;
@@ -607,6 +608,28 @@ static bool cell_same_text(cell *a, cell *b) {
   [self sendMouseClickRow:row col:col];
 }
 
+- (NSMenuItem *)contextItem:(NSString *)title bytes:(const char *)bytes length:(NSUInteger)length {
+  NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:@selector(sendCommand:) keyEquivalent:@""];
+  item.target = self;
+  item.representedObject = [NSData dataWithBytes:bytes length:length];
+  return item;
+}
+
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+  NSSize cell = [self cellSize];
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  [self sendMouseClickRow:(int)((self.bounds.size.height - p.y) / cell.height)
+                       col:(int)(p.x / cell.width)];
+  NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Suggested Changes"];
+  [menu addItem:[self contextItem:@"Create Comment" bytes:"\003c" length:2]];
+  [menu addItem:[self contextItem:@"Delete Comment" bytes:"\003d" length:2]];
+  [menu addItem:[self contextItem:@"Show/Hide Comments" bytes:"\003]" length:2]];
+  [menu addItem:[NSMenuItem separatorItem]];
+  [menu addItem:[self contextItem:@"Accept All Changes" bytes:"\003a" length:2]];
+  [menu addItem:[self contextItem:@"Reject All Changes" bytes:"\003r" length:2]];
+  return menu;
+}
+
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise {
   NSSize cell = [self cellSize];
   CGFloat ax = fabs(dx), ay = fabs(dy);
@@ -668,15 +691,6 @@ static bool cell_same_text(cell *a, cell *b) {
 
 @implementation EditAppDelegate
 
-- (NSString *)scratchPath {
-  NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@".edit"];
-  [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-  NSString *path = [dir stringByAppendingPathComponent:@"scratch.txt"];
-  if (![[NSFileManager defaultManager] fileExistsAtPath:path])
-    [[NSData data] writeToFile:path atomically:YES];
-  return path;
-}
-
 - (void)openPath:(NSString *)path {
   EditTerminalView *view = [[EditTerminalView alloc] initWithPath:path];
   NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 900, 520)
@@ -691,7 +705,7 @@ static bool cell_same_text(cell *a, cell *b) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   [self buildMenus];
   dispatch_async(dispatch_get_main_queue(), ^{
-    if (!self.openedFiles && NSApp.windows.count == 0) [self openPath:[self scratchPath]];
+    if (!self.openedFiles && NSApp.windows.count == 0) [self openPath:nil];
   });
 }
 
@@ -705,12 +719,12 @@ static bool cell_same_text(cell *a, cell *b) {
   return YES;
 }
 
-- (void)newDocument:(id)sender { [self openPath:[self scratchPath]]; }
+- (void)newDocument:(id)sender { [self openPath:nil]; }
 
 - (void)openDocument:(id)sender {
   NSOpenPanel *panel = [NSOpenPanel openPanel];
   panel.canChooseFiles = YES;
-  panel.canChooseDirectories = NO;
+  panel.canChooseDirectories = YES;
   panel.allowsMultipleSelection = YES;
   if ([panel runModal] != NSModalResponseOK) return;
   for (NSURL *url in panel.URLs) [self openPath:url.path];
@@ -792,6 +806,12 @@ static bool cell_same_text(cell *a, cell *b) {
   [commands addItem:[NSMenuItem separatorItem]];
 
   [self addCommand:@"Run Command    C-c x" bytes:"\003x" length:2 to:commands];
+  [self addCommand:@"Start Suggested Changes    C-c e" bytes:"\003e" length:2 to:commands];
+  [self addCommand:@"Create Comment    C-c c" bytes:"\003c" length:2 to:commands];
+  [self addCommand:@"Delete Nearest Comment    C-c d" bytes:"\003d" length:2 to:commands];
+  [self addCommand:@"Show/Hide Comments    C-c ]" bytes:"\003]" length:2 to:commands];
+  [self addCommand:@"Accept All Changes    C-c a" bytes:"\003a" length:2 to:commands];
+  [self addCommand:@"Reject All Changes    C-c r" bytes:"\003r" length:2 to:commands];
   [self addCommand:@"Toggle Read-Only    C-c C-r" bytes:"\003\022" length:2 to:commands];
   [self addCommand:@"Toggle Visual Wrap    C-c C-w" bytes:"\003\027" length:2 to:commands];
   [self addCommand:@"Help    C-h" bytes:"\010" length:1 to:commands];

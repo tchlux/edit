@@ -237,7 +237,7 @@ def keys(s):
 def read_tui(path, rows, cols, key_text):
     pid, fd = pty.fork()
     if pid == 0:
-        os.execv("./edit", ["./edit", path])
+        os.execv("./edit", ["./edit"] + ([path] if path is not None else []))
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     out = b""
@@ -253,8 +253,9 @@ def read_tui(path, rows, cols, key_text):
         if c == 255:
             time.sleep(0.05)
         elif c == 254:
-            with open(path, "wb") as f:
-                f.write(b"external reload\n")
+            if path is not None:
+                with open(path, "wb") as f:
+                    f.write(b"external reload\n")
             time.sleep(0.1)
         elif c == 253:
             time.sleep(3.2)
@@ -364,13 +365,14 @@ def decode(out, rows, cols):
 
 
 def main():
-    if len(sys.argv) != 4:
-        print("usage: tui_view.py rows:cols keys file", file=sys.stderr)
+    if len(sys.argv) not in (3, 4):
+        print("usage: tui_view.py rows:cols keys [file]", file=sys.stderr)
         return 2
     rows, cols = [int(x) for x in sys.argv[1].split(":")]
     raw = sys.argv[2].startswith("<raw>")
     key_text = sys.argv[2][5:] if raw else sys.argv[2]
-    out = read_tui(sys.argv[3], rows, cols, key_text)
+    path = sys.argv[3] if len(sys.argv) == 4 else None
+    out = read_tui(path, rows, cols, key_text)
     if raw:
         sys.stdout.buffer.write(out)
         return 0

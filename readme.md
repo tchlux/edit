@@ -43,9 +43,10 @@ Open the macOS app:
 open Edit.app
 ```
 
-Opening `Edit.app` without a document edits `~/.edit/scratch.txt`. You can drag
-files onto the app or use `File > Open...` to open documents in app-owned
-windows. The app is an AppKit shell with its own Dock icon and menu bar, but
+Opening `Edit.app` without a document starts an unsaved `*scratch*` buffer in
+the current directory. You can drag files or directories onto the app, or use
+`File > Open...` to open them in app-owned windows. The app is an AppKit shell
+with its own Dock icon and menu bar, but
 the editor itself still runs in an embedded pseudo-terminal.
 
 The modeline shows the file name and current `line:column`. The row below it
@@ -121,6 +122,20 @@ buffers auto-reload when the file changes on disk.
 - `C-c C-r` toggles read-only mode.
 - `C-c C-w` toggles visual wrap.
 - `C-c x` runs a remembered shell command for the current file.
+
+### Suggested Changes
+
+- `C-c e` starts Suggested Changes mode. The original file is left untouched.
+- `C-x C-s` saves the proposed document and comments to `file.edits`.
+- `C-c c` comments on the selection, or the current line without a selection.
+- `C-c d` deletes the comment nearest the cursor.
+- `C-c ]` shows or hides the equal-height comments panel on the right.
+- `C-c a` accepts all changes and writes the proposal to the original file.
+- `C-c r` rejects all changes and restores the original file.
+
+An existing `file.edits` resumes automatically when its recorded base exactly
+matches the original. If the original changed externally, the sidecar is kept
+untouched and the editor reports a conflict instead of applying it.
 
 
 ## BATCH USE
