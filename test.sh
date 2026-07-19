@@ -1488,6 +1488,16 @@ printf 'alpha\n' > "$comment_mark"
 ./edit --render-keys 8:50 $'Ce@ffCcok\n\027xs' "$comment_mark" > "$out"
 grep -q '^proposed 6$' "$comment_mark.edits"
 
+comment_align="$dir/comment-align.txt"
+printf 'one\ntwo\nthree\n' > "$comment_align"
+./edit --render-keys 12:60 'Ce@ffCcfirst
+nn@ffCcsecond
+xs' "$comment_align" > "$out"
+python3 ./tui_view.py 12:60 '^n^n' "$comment_align" > "$out"
+sed -n '3p' "$out" | grep -q '##.2..Comment'
+python3 ./tui_view.py 12:60 '' "$comment_align" > "$out"
+sed -n '1p' "$out" | grep -q '##.1..Comment'
+
 find_home="$dir/find-home"
 mkdir "$find_home"
 printf 'home file\n' > "$find_home/home.txt"

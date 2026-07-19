@@ -2720,27 +2720,32 @@ static void render_line(edit_state * e, output * o, size_t * pos) {
                      active_pane(e)->left_col, limit);
 }
 
-static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
+static int pane_position_row(edit_state * e, pane * p, size_t target, int body_rows) {
   buffer * b = pane_buffer(e, p);
   size_t row_pos = p->top;
   int cy = 0;
+  if (target < row_pos) return 0;
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    while (row_pos < p->cursor && cy < body_rows) {
+    while (row_pos < target && cy < body_rows) {
       bool full;
       bool newline;
       size_t next = visual_row_end(e, b, row_pos, width, &full, &newline);
-      if (next <= row_pos || ! visual_row_before_cursor(next, p->cursor, full, newline)) break;
+      if (next <= row_pos || ! visual_row_before_cursor(next, target, full, newline)) break;
       row_pos = next;
       cy++;
     }
     return (cy >= body_rows) ? body_rows - 1 : cy;
   }
-  while (row_pos < p->cursor && cy < body_rows) {
+  while (row_pos < target && cy < body_rows) {
     if (buffer_at(b, row_pos) == '\n') cy++;
     row_pos++;
   }
   return (cy >= body_rows) ? body_rows - 1 : cy;
+}
+
+static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
+  return pane_position_row(e, p, p->cursor, body_rows);
 }
 
 static size_t pane_cursor_col(edit_state * e, pane * p) {
@@ -2952,7 +2957,8 @@ static void render_comment(output * o, edit_comment * c, size_t limit) {
   while (used++ < limit) out_s(o, " ");
 }
 
-enum { REVIEW_PLAIN, REVIEW_HEAD, REVIEW_META, REVIEW_ADD, REVIEW_DELETE, REVIEW_COMMENT };
+enum { REVIEW_PLAIN, REVIEW_HEAD, REVIEW_COMMENT_HEAD, REVIEW_META,
+       REVIEW_ADD, REVIEW_DELETE, REVIEW_COMMENT };
 
 typedef struct {
   char text[256];
@@ -3078,7 +3084,7 @@ static int build_review(buffer * b, review_row rows[256]) {
     text_line_col(b->base, b->base_len, original_end, &ol2, &oc2);
     pos_line_col(b, c->start, &pl1, &pc1);
     pos_line_col(b, c->end, &pl2, &pc2);
-    review_add_row(rows, &n, REVIEW_HEAD, c->start, "## %d. Comment", ++section);
+    review_add_row(rows, &n, REVIEW_COMMENT_HEAD, c->start, "## %d. Comment", ++section);
     review_add_row(rows, &n, REVIEW_META, c->start,
                    "- Original: %zu:%zu–%zu:%zu", ol1, oc1, ol2, oc2);
     review_add_row(rows, &n, REVIEW_META, c->start,
@@ -3115,7 +3121,8 @@ static size_t review_row_height(review_row * row, size_t width) {
 
 static void render_review_row(output * o, review_row * row, size_t offset,
                               size_t limit, bool active) {
-  const char * sgr = row->style == REVIEW_HEAD ? "38;2;120;210;245" :
+  const char * sgr = (row->style == REVIEW_HEAD || row->style == REVIEW_COMMENT_HEAD) ?
+    "38;2;120;210;245" :
     row->style == REVIEW_META ? "38;2;150;155;165" :
     row->style == REVIEW_ADD ? "38;2;145;225;160" :
     row->style == REVIEW_DELETE ? "9;38;2;235;145;145" :
@@ -3164,13 +3171,21 @@ static void render(edit_state * e) {
     for (int i = 0; i < n_review; i++) {
       size_t d = review[i].anchor > p->cursor ? review[i].anchor - p->cursor :
         p->cursor - review[i].anchor;
+      if (review[i].style == REVIEW_COMMENT_HEAD && d <= distance)
+        active_review = i, distance = d;
+    }
+    if (distance == SIZE_MAX) for (int i = 0; i < n_review; i++) {
+      size_t d = review[i].anchor > p->cursor ? review[i].anchor - p->cursor :
+        p->cursor - review[i].anchor;
       if (review[i].style == REVIEW_HEAD && d <= distance)
         active_review = i, distance = d;
     }
     size_t active_row = 0;
     for (int i = 0; i < active_review; i++)
       active_row += review_row_height(&review[i], review_width);
-    size_t review_top = active_row > 1 ? active_row - 1 : 0;
+    int source_row = pane_position_row(e, p, review[active_review].anchor, body_rows);
+    size_t review_top = active_row > (size_t) source_row ?
+      active_row - (size_t) source_row : 0;
     for (int row = 0; row < body_rows; row++) {
       out_s(&o, "\x1b[K");
       size_t shown = 0;
