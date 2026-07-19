@@ -89,8 +89,12 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define LAYOUT_MAX (PANE_MAX * 2 - 1)
 #define COMMENT_MAX 64
 #define CHANGE_SGR "38;2;130;230;150;48;2;38;68;45"
+#define DELETE_SGR "9;38;2;235;145;145;48;2;62;38;38"
+#define COMMENT_SGR "48;2;54;50;34"
+#define COMMENT_ACTIVE_SGR "48;2;76;66;35"
 
 enum { HIST_INSERT, HIST_DELETE };
+enum { TRACK_SAME, TRACK_INSERT, TRACK_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
 enum { LAYOUT_LEAF = -1 };
 enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN, BUFFER_FIND };
@@ -103,6 +107,12 @@ typedef struct {
   char * text;
   unsigned group;
 } history;
+
+typedef struct {
+  int kind;
+  char * text;
+  size_t len;
+} track_atom;
 
 typedef struct {
   size_t start;
@@ -127,6 +137,10 @@ typedef struct {
   int redo_end;
   int clean_at;
   unsigned history_group;
+  int suggested_history_start;
+  track_atom * atoms;
+  int n_atoms;
+  int atoms_cap;
   bool dirty;
   bool read_only;
   int kind;
@@ -163,6 +177,7 @@ static void out_f(output * o, const char * fmt, ...);
 
 typedef struct edit_state edit_state;
 typedef int (*command_fn)(edit_state * e, int key);
+static void track_rebuild(buffer * b);
 
 typedef struct {
   int keys[2];
@@ -231,6 +246,7 @@ struct edit_state {
   size_t replace_start;
   size_t replace_end;
   bool find_prompt;
+  bool find_home;
   char find_path[DEBUG_PATH_SIZE];
   size_t find_len;
   size_t find_pos;
@@ -427,8 +443,16 @@ static void history_free_buffer(buffer * b) {
   b->clean_at = 0;
 }
 
+static void track_clear(buffer * b) {
+  for (int i = 0; i < b->n_atoms; i++) free(b->atoms[i].text);
+  free(b->atoms);
+  b->atoms = NULL;
+  b->n_atoms = b->atoms_cap = 0;
+}
+
 static void buffer_free(buffer * b) {
   history_free_buffer(b);
+  track_clear(b);
   for (int i = 0; i < b->n_comments; i++) free(b->comments[i].text);
   free(b->base);
   free(b->data);
@@ -528,16 +552,31 @@ static int buffer_save_edits(buffer * b) {
   char path[DEBUG_PATH_SIZE + 8];
   if (proposed == NULL || edits_path(b, path, sizeof(path)) != 0)
     return free(proposed), -1;
-  out_f(&o, "EDIT-SUGGESTIONS 1\nbase %zu\n", b->base_len);
+  out_f(&o, "EDIT-SUGGESTIONS 2\nbase %zu\n", b->base_len);
   out_add(&o, b->base, b->base_len);
   out_f(&o, "\nproposed %zu\n", proposed_len);
   out_add(&o, proposed, proposed_len);
-  out_f(&o, "\ncomments %d\n", b->n_comments);
+  int changes = b->undo_at - b->suggested_history_start;
+  if (changes < 0) changes = 0;
+  out_f(&o, "\nchanges %d\n", changes);
+  for (int i = b->suggested_history_start; i < b->undo_at; i++) {
+    history * h = &b->history[i];
+    out_f(&o, "%s %zu %zu %u\n", h->kind == HIST_INSERT ? "insert" : "delete",
+          h->pos, h->len, h->group);
+    out_add(&o, h->text, h->len);
+    out_s(&o, "\n");
+  }
+  out_f(&o, "comments %d\n", b->n_comments);
   for (int i = 0; i < b->n_comments; i++) {
     edit_comment * c = &b->comments[i];
     size_t len = strlen(c->text);
+    size_t start = c->start < proposed_len ? c->start : proposed_len;
+    size_t end = c->end < proposed_len ? c->end : proposed_len;
+    if (end < start) end = start;
     out_f(&o, "comment %zu %zu %zu\n", c->start, c->end, len);
     out_add(&o, c->text, len);
+    out_f(&o, "\nselected %zu\n", end - start);
+    out_add(&o, proposed + start, end - start);
     out_s(&o, "\n");
   }
   int rc = write_atomic(path, o.data, o.len);
@@ -634,7 +673,11 @@ static int buffer_resume_edits(buffer * b) {
 
   char * p = data;
   char * end = data + file_len;
-  const char * header = "EDIT-SUGGESTIONS 1\n";
+  const char * header1 = "EDIT-SUGGESTIONS 1\n";
+  const char * header2 = "EDIT-SUGGESTIONS 2\n";
+  bool v2 = (size_t) file_len >= strlen(header2) &&
+    memcmp(p, header2, strlen(header2)) == 0;
+  const char * header = v2 ? header2 : header1;
   if ((size_t) file_len < strlen(header) || memcmp(p, header, strlen(header)) != 0)
     return free(data), -1;
   p += strlen(header);
@@ -650,6 +693,35 @@ static int buffer_resume_edits(buffer * b) {
   char * proposed = p;
   p += proposed_len;
   if (p >= end || *p++ != '\n') return free(data), -1;
+  history * loaded = NULL;
+  int n_loaded = 0;
+  if (v2) {
+    int used = 0;
+    if (sscanf(p, "changes %d\n%n", &n_loaded, &used) != 1 || used <= 0 ||
+        n_loaded < 0 || n_loaded > 100000) return free(data), -1;
+    p += used;
+    loaded = calloc((size_t) n_loaded, sizeof(history));
+    if (n_loaded && loaded == NULL) return free(data), -1;
+    for (int i = 0; i < n_loaded; i++) {
+      char kind[8];
+      unsigned group;
+      used = 0;
+      if (sscanf(p, "%7s %zu %zu %u\n%n", kind, &loaded[i].pos,
+                 &loaded[i].len, &group, &used) != 4 || used <= 0 ||
+          loaded[i].len > (size_t) (end - (p + used)))
+        return free(loaded), free(data), -1;
+      p += used;
+      loaded[i].kind = strcmp(kind, "insert") == 0 ? HIST_INSERT :
+        strcmp(kind, "delete") == 0 ? HIST_DELETE : -1;
+      if (loaded[i].kind < 0) return free(loaded), free(data), -1;
+      loaded[i].group = group;
+      loaded[i].text = malloc(loaded[i].len ? loaded[i].len : 1);
+      if (loaded[i].text == NULL) return free(loaded), free(data), -1;
+      memcpy(loaded[i].text, p, loaded[i].len);
+      p += loaded[i].len;
+      if (p >= end || *p++ != '\n') return free(loaded), free(data), -1;
+    }
+  }
   int n_comments = 0;
   int used = 0;
   if (sscanf(p, "comments %d\n%n", &n_comments, &used) != 1 || used <= 0 ||
@@ -663,6 +735,29 @@ static int buffer_resume_edits(buffer * b) {
     return free(current), free(data), 1;
   free(current);
 
+  if (! v2) {
+    size_t prefix = 0;
+    while (prefix < base_len && prefix < proposed_len && base[prefix] == proposed[prefix]) prefix++;
+    size_t suffix = 0;
+    while (suffix < base_len - prefix && suffix < proposed_len - prefix &&
+           base[base_len - suffix - 1] == proposed[proposed_len - suffix - 1]) suffix++;
+    size_t deleted = base_len - prefix - suffix;
+    size_t inserted = proposed_len - prefix - suffix;
+    n_loaded = (deleted ? 1 : 0) + (inserted ? 1 : 0);
+    loaded = calloc((size_t) n_loaded, sizeof(history));
+    int at = 0;
+    if (deleted) {
+      loaded[at] = (history){HIST_DELETE, prefix, deleted, NULL, 1};
+      loaded[at].text = malloc(deleted);
+      memcpy(loaded[at++].text, base + prefix, deleted);
+    }
+    if (inserted) {
+      loaded[at] = (history){HIST_INSERT, prefix, inserted, NULL, 1};
+      loaded[at].text = malloc(inserted);
+      memcpy(loaded[at].text, proposed + prefix, inserted);
+    }
+  }
+
   b->base = malloc(base_len ? base_len : 1);
   if (b->base == NULL) return free(data), -1;
   memcpy(b->base, base, base_len);
@@ -670,6 +765,9 @@ static int buffer_resume_edits(buffer * b) {
   buffer_delete(b, 0, buffer_len(b));
   if (buffer_insert(b, 0, proposed, proposed_len) != 0) return free(data), -1;
   history_free_buffer(b);
+  b->history = loaded;
+  b->n_history = b->history_cap = b->undo_at = b->redo_end = n_loaded;
+  b->suggested_history_start = 0;
   b->dirty = false;
   b->suggested = true;
   b->comments_visible = true;
@@ -688,8 +786,16 @@ static int buffer_resume_edits(buffer * b) {
     c->text[text_len] = '\0';
     p += text_len;
     if (p >= end || *p++ != '\n') return free(data), -1;
+    if (end - p >= 9 && memcmp(p, "selected ", 9) == 0) {
+      size_t selected_len = 0;
+      if (parse_size_line(&p, end, "selected %zu\n%n", &selected_len) != 0 ||
+          selected_len > (size_t) (end - p)) return free(data), -1;
+      p += selected_len;
+      if (p >= end || *p++ != '\n') return free(data), -1;
+    }
     b->n_comments++;
   }
+  track_rebuild(b);
   free(data);
   return 2;
 }
@@ -1139,6 +1245,112 @@ static int history_add(buffer * b, int kind, size_t pos,
   return 0;
 }
 
+static int track_grow(buffer * b, int need) {
+  if (b->n_atoms + need <= b->atoms_cap) return 0;
+  int cap = b->atoms_cap ? b->atoms_cap * 2 : 16;
+  while (cap < b->n_atoms + need) cap *= 2;
+  track_atom * atoms = realloc(b->atoms, (size_t) cap * sizeof(track_atom));
+  if (atoms == NULL) return -1;
+  b->atoms = atoms;
+  b->atoms_cap = cap;
+  return 0;
+}
+
+static int track_add(buffer * b, int at, int kind, const char * text, size_t len) {
+  if (len == 0) return 0;
+  if (track_grow(b, 1) != 0) return -1;
+  memmove(&b->atoms[at + 1], &b->atoms[at],
+          (size_t) (b->n_atoms - at) * sizeof(track_atom));
+  b->atoms[at].text = malloc(len);
+  if (b->atoms[at].text == NULL) return -1;
+  memcpy(b->atoms[at].text, text, len);
+  b->atoms[at].kind = kind;
+  b->atoms[at].len = len;
+  b->n_atoms++;
+  return 0;
+}
+
+static int track_split(buffer * b, int i, size_t at) {
+  track_atom * a = &b->atoms[i];
+  if (at == 0 || at >= a->len) return 0;
+  size_t tail = a->len - at;
+  if (track_add(b, i + 1, a->kind, a->text + at, tail) != 0) return -1;
+  b->atoms[i].len = at;
+  return 0;
+}
+
+static int track_boundary(buffer * b, size_t pos) {
+  size_t visible = 0;
+  for (int i = 0; i < b->n_atoms; i++) {
+    track_atom * a = &b->atoms[i];
+    if (a->kind == TRACK_DELETE) continue;
+    if (visible + a->len > pos) {
+      size_t at = pos - visible;
+      if (at > 0 && track_split(b, i, at) == 0) return i + 1;
+      return i;
+    }
+    visible += a->len;
+  }
+  return b->n_atoms;
+}
+
+static void track_remove(buffer * b, int i) {
+  free(b->atoms[i].text);
+  memmove(&b->atoms[i], &b->atoms[i + 1],
+          (size_t) (b->n_atoms - i - 1) * sizeof(track_atom));
+  b->n_atoms--;
+}
+
+static void track_merge(buffer * b) {
+  for (int i = 1; i < b->n_atoms;) {
+    track_atom * a = &b->atoms[i - 1];
+    track_atom * z = &b->atoms[i];
+    if (a->kind != z->kind) {
+      i++;
+      continue;
+    }
+    char * text = realloc(a->text, a->len + z->len);
+    if (text == NULL) return;
+    memcpy(text + a->len, z->text, z->len);
+    a->text = text;
+    a->len += z->len;
+    track_remove(b, i);
+  }
+}
+
+static void track_insert(buffer * b, size_t pos, const char * text, size_t len) {
+  int at = track_boundary(b, pos);
+  track_add(b, at, TRACK_INSERT, text, len);
+  track_merge(b);
+}
+
+static void track_delete(buffer * b, size_t pos, size_t len) {
+  while (len > 0) {
+    int i = track_boundary(b, pos);
+    while (i < b->n_atoms && b->atoms[i].kind == TRACK_DELETE) i++;
+    if (i >= b->n_atoms) break;
+    track_atom * a = &b->atoms[i];
+    size_t n = a->len < len ? a->len : len;
+    track_split(b, i, n);
+    if (b->atoms[i].kind == TRACK_INSERT) track_remove(b, i);
+    else b->atoms[i].kind = TRACK_DELETE;
+    len -= n;
+  }
+  track_merge(b);
+}
+
+static void track_rebuild(buffer * b) {
+  track_clear(b);
+  if (! b->suggested || b->base == NULL) return;
+  track_add(b, 0, TRACK_SAME, b->base, b->base_len);
+  int end = b->undo_at < b->n_history ? b->undo_at : b->n_history;
+  for (int i = b->suggested_history_start; i < end; i++) {
+    history * h = &b->history[i];
+    if (h->kind == HIST_INSERT) track_insert(b, h->pos, h->text, h->len);
+    else track_delete(b, h->pos, h->len);
+  }
+}
+
 static int edit_insert_raw(edit_state * e, size_t pos, const char * text, size_t len) {
   if (len == 0) return 0;
   int bnum = active_pane(e)->buffer;
@@ -1168,6 +1380,7 @@ static int edit_insert(edit_state * e, size_t pos, const char * text,
   if (reset_undo) b->undo_at = b->n_history;
   if (reset_undo) b->redo_end = b->undo_at;
   if (reset_undo) buffer_refresh_dirty(b);
+  if (reset_undo) track_rebuild(b);
   return 0;
 }
 
@@ -1222,10 +1435,16 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (reset_undo) b->undo_at = b->n_history;
   if (reset_undo) b->redo_end = b->undo_at;
   if (reset_undo) buffer_refresh_dirty(b);
+  if (reset_undo) track_rebuild(b);
   return 0;
 }
 
 static int path_absolute(const char * path, char * out, size_t n) {
+  if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
+    const char * home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') return -1;
+    return snprintf(out, n, "%s%s", home, path + 1) < (int) n ? 0 : -1;
+  }
   if (path[0] == '/') return snprintf(out, n, "%s", path) < (int) n ? 0 : -1;
   char cwd[DEBUG_PATH_SIZE];
   if (getcwd(cwd, sizeof(cwd)) == NULL) return -1;
@@ -1246,6 +1465,7 @@ static bool prompt_footer_cursor(edit_state * e);
 static bool prompt_region_range(edit_state * e, prompt_slot * s,
                                 size_t * start, size_t * end);
 static const char * file_name(const char * path);
+static void track_rebuild(buffer * b);
 
 static int save_current_file(edit_state * e) {
   buffer * b = active_buffer(e);
@@ -1603,7 +1823,11 @@ static int mkdir_p(const char * path) {
 }
 
 static void find_set(edit_state * e, const char * path) {
-  snprintf(e->find_path, sizeof(e->find_path), "%s", path);
+  const char * home = getenv("HOME");
+  size_t n = home ? strlen(home) : 0;
+  if (n && strncmp(path, home, n) == 0 && (path[n] == '\0' || path[n] == '/'))
+    snprintf(e->find_path, sizeof(e->find_path), "~%s", path + n);
+  else snprintf(e->find_path, sizeof(e->find_path), "%s", path);
   e->find_len = strlen(e->find_path);
   e->find_pos = e->find_len;
 }
@@ -1714,7 +1938,10 @@ static int find_complete(edit_state * e) {
   output file_paths = {0};
   int n = 0;
 
-  path_parts(e->find_path, dir, prefix, base);
+  char expanded[DEBUG_PATH_SIZE];
+  if (path_absolute(e->find_path, expanded, sizeof(expanded)) != 0)
+    return set_status(e, "bad path"), 0;
+  path_parts(expanded, dir, prefix, base);
   bool regex = regex_path(base);
   DIR * d = opendir(dir);
   if (d == NULL) return set_status(e, "no such directory"), 0;
@@ -2012,7 +2239,8 @@ static void layout_rects_rec(edit_state * e, int node, pane_rect r, pane_rect re
 
 static void pane_rects(edit_state * e, pane_rect rects[PANE_MAX]) {
   memset(rects, 0, sizeof(pane_rect) * PANE_MAX);
-  pane_rect root = {0, 0, (e->rows > 1) ? e->rows - 1 : 1, e->cols};
+  int prompt_rows = e->comment_prompt ? 2 : 1;
+  pane_rect root = {0, 0, (e->rows > prompt_rows) ? e->rows - prompt_rows : 1, e->cols};
   layout_rects_rec(e, e->layout_root, root, rects);
 }
 
@@ -2031,8 +2259,15 @@ static int pane_cols(edit_state * e, int i) {
   return pane_area(e, i).cols;
 }
 
-static size_t pane_wrap_width(edit_state * e, pane * p) {
+static int pane_document_cols(edit_state * e, pane * p) {
   int cols = pane_cols(e, (int) (p - e->panes));
+  buffer * b = pane_buffer(e, p);
+  if (e->n_panes == 1 && b->suggested && b->comments_visible && cols >= 20) cols /= 2;
+  return cols;
+}
+
+static size_t pane_wrap_width(edit_state * e, pane * p) {
+  int cols = pane_document_cols(e, p);
   return (cols > 1) ? (size_t) cols - 1 : 1;
 }
 
@@ -2073,11 +2308,34 @@ static size_t visual_row_prev(edit_state * e, buffer * b, size_t pos, size_t wid
   size_t prev = 0;
   for (size_t row = 0; row < pos;) {
     size_t next = visual_row_next(e, b, row, width);
-    if (next >= pos || next <= row) return prev;
+    if (next >= pos) return row;
+    if (next <= row) return prev;
     prev = row;
     row = next;
   }
   return prev;
+}
+
+static size_t visual_row_at_cursor(edit_state * e, buffer * b, size_t cursor, size_t width) {
+  size_t row = line_start(b, cursor);
+  while (row < cursor) {
+    bool full;
+    bool newline;
+    size_t next = visual_row_end(e, b, row, width, &full, &newline);
+    if (next <= row || ! visual_row_before_cursor(next, cursor, full, newline)) break;
+    row = next;
+  }
+  return row;
+}
+
+static size_t visual_row_column(edit_state * e, buffer * b, size_t row, size_t pos) {
+  return visual_col(e, b, line_start(b, pos), pos) -
+    visual_col(e, b, line_start(b, row), row);
+}
+
+static size_t visual_row_column_pos(edit_state * e, buffer * b, size_t row, size_t col) {
+  return visual_column_pos(e, b, line_start(b, row),
+                           visual_col(e, b, line_start(b, row), row) + col);
 }
 
 static int file_rows_from(buffer * b, size_t top) {
@@ -2147,7 +2405,7 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
   while (p->top > 0 && file_rows_from(b, p->top) < body_rows)
     p->top = prev_line(b, p->top);
 
-  int cols = pane_cols(e, (int) (p - e->panes));
+  int cols = pane_document_cols(e, p);
   size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
   size_t col = visual_col(e, b, line_start(b, cursor), cursor);
   if (col < p->left_col) p->left_col = col;
@@ -2253,15 +2511,42 @@ static bool region_byte(pane * p, size_t pos) {
 }
 
 static bool suggested_byte(buffer * b, size_t pos) {
-  if (! b->suggested || b->base == NULL) return false;
-  size_t len = buffer_len(b);
-  size_t prefix = 0;
-  while (prefix < len && prefix < b->base_len &&
-         buffer_at(b, prefix) == b->base[prefix]) prefix++;
-  size_t suffix = 0;
-  while (suffix < len - prefix && suffix < b->base_len - prefix &&
-         buffer_at(b, len - suffix - 1) == b->base[b->base_len - suffix - 1]) suffix++;
-  return pos >= prefix && pos < len - suffix;
+  size_t visible = 0;
+  if (! b->suggested) return false;
+  for (int i = 0; i < b->n_atoms; i++) {
+    track_atom * a = &b->atoms[i];
+    if (a->kind == TRACK_DELETE) continue;
+    if (pos < visible + a->len) return a->kind == TRACK_INSERT;
+    visible += a->len;
+  }
+  return false;
+}
+
+static int comment_byte(buffer * b, size_t pos, size_t cursor) {
+  int found = -1;
+  size_t best = SIZE_MAX;
+  for (int i = 0; i < b->n_comments; i++) {
+    edit_comment * c = &b->comments[i];
+    size_t d = c->start > cursor ? c->start - cursor :
+      cursor > c->end ? cursor - c->end : 0;
+    if (d < best) found = i, best = d;
+  }
+  for (int i = 0; i < b->n_comments; i++)
+    if (pos >= b->comments[i].start && pos < b->comments[i].end)
+      return i == found ? 2 : 1;
+  return 0;
+}
+
+static track_atom * deleted_at(buffer * b, size_t pos) {
+  size_t visible = 0;
+  for (int i = 0; i < b->n_atoms; i++) {
+    track_atom * a = &b->atoms[i];
+    if (a->kind == TRACK_DELETE) {
+      if (visible == pos) return a;
+    } else visible += a->len;
+    if (visible > pos) break;
+  }
+  return NULL;
 }
 
 static char triple_quote_before(buffer * b, size_t end) {
@@ -2365,6 +2650,15 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
   size_t i = row_start - start;
   if (p->wrap) col = visual_col(e, b, start, row_start);
   for (; i < n && shown < limit;) {
+    track_atom * deleted = deleted_at(b, start + i);
+    if (deleted != NULL) {
+      render_span_sgr(e, o, DELETE_SGR, 0);
+      size_t ghost_limit = p->wrap && limit > 0 ? limit - 1 : limit;
+      for (size_t d = 0; d < deleted->len && shown < ghost_limit; d++, shown++)
+        out_add(o, deleted->text + d, 1);
+      render_base_sgr(e, o);
+      if (shown >= limit) break;
+    }
     while (span < n_spans && i >= spans[span].end)
       span++;
     char c = line[i];
@@ -2380,6 +2674,8 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
     if (region_byte(p, start + i)) sgr = REGION_SGR;
     else if (search_sgrs[i] != NULL) sgr = search_sgrs[i];
     else if (suggested_byte(b, start + i)) sgr = CHANGE_SGR;
+    else if (comment_byte(b, start + i, p->cursor) == 2) sgr = COMMENT_ACTIVE_SGR;
+    else if (comment_byte(b, start + i, p->cursor) == 1) sgr = COMMENT_SGR;
     else if (span < n_spans && i >= spans[span].start) {
       sgr = spans[span].sgr;
       new_attr = spans[span].attr;
@@ -2450,19 +2746,12 @@ static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
 static size_t pane_cursor_col(edit_state * e, pane * p) {
   buffer * b = pane_buffer(e, p);
   size_t cx = visual_col(e, b, line_start(b, p->cursor), p->cursor);
-  int cols = pane_cols(e, (int) (p - e->panes));
+  int cols = pane_document_cols(e, p);
   size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
   if (p->wrap) {
-    size_t row = line_start(b, p->cursor);
     size_t width = pane_wrap_width(e, p);
-    while (row < p->cursor) {
-      bool full;
-      bool newline;
-      size_t next = visual_row_end(e, b, row, width, &full, &newline);
-      if (next <= row || ! visual_row_before_cursor(next, p->cursor, full, newline)) break;
-      row = next;
-    }
-    cx -= visual_col(e, b, line_start(b, p->cursor), row);
+    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    cx = visual_row_column(e, b, row, p->cursor);
     return (cx > limit) ? limit : cx;
   }
   if (cx < p->left_col) return 0;
@@ -2484,6 +2773,42 @@ static void footer_line(edit_state * e, output * o, int cols);
 
 static void render_footer(edit_state * e, output * o, int cols) {
   footer_line(e, o, cols);
+}
+
+static void comment_prompt_position(edit_state * e, int cols, size_t * first,
+                                    int * row, size_t * col) {
+  size_t width = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t cursor = strlen("comment: ") + e->comment_pos;
+  size_t cursor_row = cursor / width;
+  *first = cursor_row > 0 ? cursor_row - 1 : 0;
+  *row = (int) (cursor_row - *first);
+  *col = cursor % width;
+}
+
+static void render_comment_prompt(edit_state * e, output * o, int cols, bool snapshot) {
+  const char * label = "comment: ";
+  size_t label_len = strlen(label);
+  size_t width = (cols > 1) ? (size_t) cols - 1 : 1;
+  size_t first;
+  int cursor_row;
+  size_t cursor_col;
+  comment_prompt_position(e, cols, &first, &cursor_row, &cursor_col);
+  size_t start = first * width;
+  size_t total = label_len + e->comment_len;
+  for (int row = 0; row < 2; row++) {
+    size_t used = 0;
+    while (used < width && start + used < total) {
+      size_t at = start + used;
+      if (snapshot && row == cursor_row && used == cursor_col) out_s(o, "|");
+      if (at < label_len) out_add(o, label + at, 1);
+      else out_add(o, e->comment + at - label_len, 1);
+      used++;
+    }
+    if (snapshot && row == cursor_row && used == cursor_col) out_s(o, "|");
+    if (! snapshot) while (used++ < width) out_s(o, " ");
+    if (row == 0) out_s(o, "\r\n");
+    start += width;
+  }
 }
 
 static const char * file_name(const char * path) {
@@ -2618,24 +2943,194 @@ static void render_layout_dividers(edit_state * e, output * o, int node, pane_re
   render_layout_dividers(e, o, n->second, b);
 }
 
-static edit_comment * comment_on_line(buffer * b, size_t line, size_t cursor) {
-  edit_comment * found = NULL;
-  size_t distance = SIZE_MAX;
-  for (int i = 0; i < b->n_comments; i++) {
-    edit_comment * c = &b->comments[i];
-    if (line_start(b, c->start) != line) continue;
-    size_t d = c->start > cursor ? c->start - cursor : cursor - c->start;
-    if (d < distance) found = c, distance = d;
-  }
-  return found;
-}
-
 static void render_comment(output * o, edit_comment * c, size_t limit) {
   size_t used = 0;
   if (c != NULL) for (const char * p = c->text; *p && *p != '\n' && used < limit; p++) {
     out_add(o, p, 1);
     used++;
   }
+  while (used++ < limit) out_s(o, " ");
+}
+
+enum { REVIEW_PLAIN, REVIEW_HEAD, REVIEW_META, REVIEW_ADD, REVIEW_DELETE, REVIEW_COMMENT };
+
+typedef struct {
+  char text[256];
+  int style;
+  size_t anchor;
+} review_row;
+
+static void text_line_col(const char * text, size_t len, size_t pos,
+                          size_t * line, size_t * col) {
+  *line = *col = 1;
+  for (size_t i = 0; i < pos && i < len; i++) {
+    if (text[i] == '\n') (*line)++, *col = 1;
+    else (*col)++;
+  }
+}
+
+static void review_add_row(review_row * rows, int * n, int style, size_t anchor,
+                           const char * fmt, ...) {
+  if (*n >= 256) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(rows[*n].text, sizeof(rows[*n].text), fmt, ap);
+  va_end(ap);
+  rows[*n].style = style;
+  rows[*n].anchor = anchor;
+  (*n)++;
+}
+
+static void review_text_rows(review_row * rows, int * n, int style, size_t anchor,
+                             const char * prefix, output * text) {
+  if (text->len == 0) return;
+  size_t start = 0;
+  while (start <= text->len) {
+    size_t end = start;
+    while (end < text->len && text->data[end] != '\n') end++;
+    review_add_row(rows, n, style, anchor, "%s%.*s", prefix,
+                   (int) (end - start), text->data + start);
+    if (end == text->len) break;
+    start = end + 1;
+  }
+}
+
+static size_t track_original_pos(buffer * b, size_t target) {
+  size_t original = 0;
+  size_t visible = 0;
+  for (int i = 0; i < b->n_atoms; i++) {
+    track_atom * a = &b->atoms[i];
+    if (a->kind == TRACK_DELETE) {
+      original += a->len;
+      continue;
+    }
+    if (target <= visible + a->len)
+      return original + (a->kind == TRACK_SAME ? target - visible : 0);
+    visible += a->len;
+    if (a->kind == TRACK_SAME) original += a->len;
+  }
+  return original;
+}
+
+static int build_review(buffer * b, review_row rows[256]) {
+  int n = 0;
+  int section = 0;
+  size_t original = 0;
+  size_t proposed = 0;
+  review_add_row(rows, &n, REVIEW_HEAD, 0, "# Suggested Changes — %s", file_name(b->path));
+  review_add_row(rows, &n, REVIEW_PLAIN, 0, "");
+  for (int i = 0; i < b->n_atoms;) {
+    track_atom * a = &b->atoms[i];
+    if (a->kind == TRACK_SAME) {
+      original += a->len;
+      proposed += a->len;
+      i++;
+      continue;
+    }
+    size_t original_start = original;
+    size_t proposed_start = proposed;
+    output deleted = {0};
+    output added = {0};
+    while (i < b->n_atoms && b->atoms[i].kind != TRACK_SAME) {
+      a = &b->atoms[i++];
+      if (a->kind == TRACK_DELETE) out_add(&deleted, a->text, a->len), original += a->len;
+      else out_add(&added, a->text, a->len), proposed += a->len;
+    }
+    size_t ol1, oc1, ol2, oc2, pl1, pc1, pl2, pc2;
+    text_line_col(b->base, b->base_len, original_start, &ol1, &oc1);
+    text_line_col(b->base, b->base_len, original, &ol2, &oc2);
+    char * current = buffer_text(b, &(size_t){0});
+    size_t current_len = buffer_len(b);
+    text_line_col(current, current_len, proposed_start, &pl1, &pc1);
+    text_line_col(current, current_len, proposed, &pl2, &pc2);
+    free(current);
+    const char * kind = deleted.len && added.len ? "Replace" : deleted.len ? "Delete" : "Add";
+    review_add_row(rows, &n, REVIEW_HEAD, proposed_start, "## %d. %s", ++section, kind);
+    review_add_row(rows, &n, REVIEW_META, proposed_start,
+                   "- Original: %zu:%zu–%zu:%zu", ol1, oc1, ol2, oc2);
+    review_add_row(rows, &n, REVIEW_META, proposed_start,
+                   "- Proposed: %zu:%zu–%zu:%zu", pl1, pc1, pl2, pc2);
+    if (deleted.len) {
+      review_add_row(rows, &n, REVIEW_DELETE, proposed_start, "### Deleted");
+      review_text_rows(rows, &n, REVIEW_DELETE, proposed_start, "- ", &deleted);
+    }
+    if (added.len) {
+      review_add_row(rows, &n, REVIEW_ADD, proposed_start, "### Added");
+      review_text_rows(rows, &n, REVIEW_ADD, proposed_start, "+ ", &added);
+    }
+    review_add_row(rows, &n, REVIEW_PLAIN, proposed_start, "");
+    free(deleted.data);
+    free(added.data);
+  }
+  for (int i = 0; i < b->n_comments; i++) {
+    edit_comment * c = &b->comments[i];
+    output selected = {0};
+    size_t selected_end = c->end < buffer_len(b) ? c->end : buffer_len(b);
+    for (size_t pos = c->start; pos < selected_end; pos++) {
+      char byte = buffer_at(b, pos);
+      out_add(&selected, &byte, 1);
+    }
+    size_t pl1, pc1, pl2, pc2;
+    size_t original_start = track_original_pos(b, c->start);
+    size_t original_end = track_original_pos(b, c->end);
+    size_t ol1, oc1, ol2, oc2;
+    text_line_col(b->base, b->base_len, original_start, &ol1, &oc1);
+    text_line_col(b->base, b->base_len, original_end, &ol2, &oc2);
+    pos_line_col(b, c->start, &pl1, &pc1);
+    pos_line_col(b, c->end, &pl2, &pc2);
+    review_add_row(rows, &n, REVIEW_HEAD, c->start, "## %d. Comment", ++section);
+    review_add_row(rows, &n, REVIEW_META, c->start,
+                   "- Original: %zu:%zu–%zu:%zu", ol1, oc1, ol2, oc2);
+    review_add_row(rows, &n, REVIEW_META, c->start,
+                   "- Proposed: %zu:%zu–%zu:%zu", pl1, pc1, pl2, pc2);
+    review_add_row(rows, &n, REVIEW_COMMENT, c->start, "### Selected");
+    review_text_rows(rows, &n, REVIEW_COMMENT, c->start, "> ", &selected);
+    review_add_row(rows, &n, REVIEW_COMMENT, c->start, "### Comment");
+    review_add_row(rows, &n, REVIEW_COMMENT, c->start, "> %s", c->text);
+    review_add_row(rows, &n, REVIEW_PLAIN, c->start, "");
+    free(selected.data);
+  }
+  return n;
+}
+
+static size_t review_row_offset(review_row * row, size_t width, size_t visual) {
+  size_t offset = 0;
+  while (visual-- > 0 && row->text[offset]) {
+    size_t columns = 0;
+    while (row->text[offset] && columns++ < width) {
+      offset++;
+      while (((unsigned char) row->text[offset] & 0xc0) == 0x80) offset++;
+    }
+  }
+  return offset;
+}
+
+static size_t review_row_height(review_row * row, size_t width) {
+  if (! row->text[0]) return 1;
+  size_t height = 0;
+  for (size_t offset = 0; row->text[offset]; height++)
+    offset = review_row_offset(row, width, height + 1);
+  return height;
+}
+
+static void render_review_row(output * o, review_row * row, size_t offset,
+                              size_t limit, bool active) {
+  const char * sgr = row->style == REVIEW_HEAD ? "38;2;120;210;245" :
+    row->style == REVIEW_META ? "38;2;150;155;165" :
+    row->style == REVIEW_ADD ? "38;2;145;225;160" :
+    row->style == REVIEW_DELETE ? "9;38;2;235;145;145" :
+    row->style == REVIEW_COMMENT ? "38;2;235;205;120" : NULL;
+  if (active) out_s(o, "\x1b[48;2;48;48;52m");
+  if (sgr) out_f(o, "\x1b[%sm", sgr);
+  size_t end = offset;
+  size_t used = 0;
+  while (row->text[end] && used < limit) {
+    used++;
+    end++;
+    while (((unsigned char) row->text[end] & 0xc0) == 0x80) end++;
+  }
+  out_add(o, row->text + offset, end - offset);
+  if (sgr || active) out_f(o, "\x1b[0;%sm", BASE_SGR);
   while (used++ < limit) out_s(o, " ");
 }
 
@@ -2661,8 +3156,22 @@ static void render(edit_state * e) {
 
     bool comments = b->suggested && b->comments_visible && e->cols >= 20;
     int document_cols = comments ? e->cols / 2 : e->cols;
+    review_row review[256];
+    int n_review = comments ? build_review(b, review) : 0;
+    size_t review_width = (size_t) (e->cols - document_cols - 1);
+    int active_review = 0;
+    size_t distance = SIZE_MAX;
+    for (int i = 0; i < n_review; i++) {
+      size_t d = review[i].anchor > p->cursor ? review[i].anchor - p->cursor :
+        p->cursor - review[i].anchor;
+      if (review[i].style == REVIEW_HEAD && d <= distance)
+        active_review = i, distance = d;
+    }
+    size_t active_row = 0;
+    for (int i = 0; i < active_review; i++)
+      active_row += review_row_height(&review[i], review_width);
+    size_t review_top = active_row > 1 ? active_row - 1 : 0;
     for (int row = 0; row < body_rows; row++) {
-      size_t row_pos = pos;
       out_s(&o, "\x1b[K");
       size_t shown = 0;
       if (pos < buffer_len(b))
@@ -2671,17 +3180,35 @@ static void render(edit_state * e) {
       if (comments) {
         while (shown++ < (size_t) document_cols - 1) out_s(&o, " ");
         out_s(&o, PANE_DIVIDER);
-        render_comment(&o, comment_on_line(b, line_start(b, row_pos), p->cursor),
-                       (size_t) (e->cols - document_cols - 1));
+        size_t visual = review_top + (size_t) row;
+        int review_i = 0;
+        while (review_i < n_review) {
+          size_t height = review_row_height(&review[review_i], review_width);
+          if (visual < height) break;
+          visual -= height;
+          review_i++;
+        }
+        if (review_i < n_review)
+          render_review_row(&o, &review[review_i],
+                            review_row_offset(&review[review_i], review_width, visual),
+                            review_width, review_i == active_review);
+        else render_comment(&o, NULL, review_width);
       }
       out_s(&o, "\r\n");
     }
     out_s(&o, "\x1b[7m");
     render_modeline(e, &o, p, false, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm\r\n\x1b[90m", BASE_SGR);
-    render_footer(e, &o, e->cols);
+    if (e->comment_prompt) render_comment_prompt(e, &o, e->cols, false);
+    else render_footer(e, &o, e->cols);
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-    if (prompt_footer_cursor(e))
+    if (e->comment_prompt) {
+      size_t first;
+      int row;
+      size_t col;
+      comment_prompt_position(e, e->cols, &first, &row, &col);
+      out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows - 1 + row, col + 1);
+    } else if (prompt_footer_cursor(e))
       out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, prompt_footer_cursor_col(e, e->cols) + 1);
     else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1,
                cursor_col < (size_t) document_cols - 1 ? cursor_col + 1 : (size_t) document_cols - 1);
@@ -2719,12 +3246,20 @@ static void render(edit_state * e) {
     out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
   }
 
-  pane_rect root = {0, 0, (e->rows > 1) ? e->rows - 1 : 1, e->cols};
+  int prompt_rows = e->comment_prompt ? 2 : 1;
+  pane_rect root = {0, 0, (e->rows > prompt_rows) ? e->rows - prompt_rows : 1, e->cols};
   render_layout_dividers(e, &o, e->layout_root, root);
-  out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows);
-  render_footer(e, &o, e->cols);
+  out_f(&o, "\x1b[%d;1H\x1b[K\x1b[90m", e->rows - prompt_rows + 1);
+  if (e->comment_prompt) render_comment_prompt(e, &o, e->cols, false);
+  else render_footer(e, &o, e->cols);
   out_f(&o, "\x1b[0m\x1b[%sm", BASE_SGR);
-  if (prompt_footer_cursor(e))
+  if (e->comment_prompt) {
+    size_t first;
+    int row;
+    size_t col;
+    comment_prompt_position(e, e->cols, &first, &row, &col);
+    out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows - 1 + row, col + 1);
+  } else if (prompt_footer_cursor(e))
     out_f(&o, "\x1b[%d;%zuH\x1b[?25h", e->rows, prompt_footer_cursor_col(e, e->cols) + 1);
   else out_f(&o, "\x1b[%d;%zuH\x1b[?25h", cursor_row + 1, cursor_col + 1);
 
@@ -2825,6 +3360,10 @@ static void snapshot_modeline(edit_state * e, output * o, pane * p,
 }
 
 static void snapshot_keymap(edit_state * e, output * o) {
+  if (e->comment_prompt) {
+    render_comment_prompt(e, o, e->cols, true);
+    return;
+  }
   footer_line(e, o, e->cols);
   out_s(o, "\n");
 }
@@ -2856,7 +3395,8 @@ static void build_snapshot(edit_state * e, output * o) {
   size_t pos[PANE_MAX];
   int cy[PANE_MAX];
   size_t cx[PANE_MAX];
-  int area_rows = (e->rows > 1) ? e->rows - 1 : 1;
+  int prompt_rows = e->comment_prompt ? 2 : 1;
+  int area_rows = (e->rows > prompt_rows) ? e->rows - prompt_rows : 1;
   pane_rect root = {0, 0, area_rows, e->cols};
 
   pane_rects(e, rects);
@@ -3128,6 +3668,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
 static int key_name(char c) {
   if (c == '\n') return KEY_ENTER;
   if (c == '\t') return KEY_CTRL('i');
+  if (c == '@') return KEY_CTRL(' ');
   if (c == 'b') return KEY_CTRL('b');
   if (c == 'f') return KEY_CTRL('f');
   if (c == 'p') return KEY_CTRL('p');
@@ -3225,6 +3766,17 @@ static int cmd_right(edit_state * e, int key) {
 static int cmd_up(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
+  if (p->wrap) {
+    size_t width = pane_wrap_width(e, p);
+    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    if (p->preferred_col == SIZE_MAX)
+      p->preferred_col = visual_row_column(e, b, row, p->cursor);
+    p->cursor = visual_row_column_pos(e, b, visual_row_prev(e, b, row, width),
+                                      p->preferred_col);
+    scroll_line_move(e, -1);
+    (void) key;
+    return 0;
+  }
   size_t current = line_start(b, p->cursor);
   if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t prev = prev_line(b, p->cursor);
@@ -3237,6 +3789,17 @@ static int cmd_up(edit_state * e, int key) {
 static int cmd_down(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
+  if (p->wrap) {
+    size_t width = pane_wrap_width(e, p);
+    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    if (p->preferred_col == SIZE_MAX)
+      p->preferred_col = visual_row_column(e, b, row, p->cursor);
+    size_t next = visual_row_next(e, b, row, width);
+    if (next > row) p->cursor = visual_row_column_pos(e, b, next, p->preferred_col);
+    scroll_line_move(e, 1);
+    (void) key;
+    return 0;
+  }
   size_t current = line_start(b, p->cursor);
   if (p->preferred_col == SIZE_MAX) p->preferred_col = visual_col(e, b, current, p->cursor);
   size_t next = next_line(b, p->cursor);
@@ -3905,7 +4468,7 @@ static int cmd_literal(edit_state * e, int key) {
 static int cmd_undo(edit_state * e, int key) {
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
   buffer * b = active_buffer(e);
-  if (b->undo_at <= 0) {
+  if (b->undo_at <= (b->suggested ? b->suggested_history_start : 0)) {
     set_status(e, "no undo");
     (void) key;
     return 0;
@@ -3932,6 +4495,7 @@ static int cmd_undo(edit_state * e, int key) {
   if (b->redo_end < end) b->redo_end = end;
   b->undo_at = start;
   buffer_refresh_dirty(b);
+  track_rebuild(b);
   set_status(e, "undo");
   (void) key;
   return 0;
@@ -3965,6 +4529,7 @@ static int cmd_redo(edit_state * e, int key) {
   p->preferred_col = SIZE_MAX;
   b->undo_at = end;
   buffer_refresh_dirty(b);
+  track_rebuild(b);
   set_status(e, "redo");
   (void) key;
   return 0;
@@ -4113,6 +4678,7 @@ static void review_clear(buffer * b) {
   free(b->base);
   b->base = NULL;
   b->base_len = 0;
+  track_clear(b);
   b->suggested = false;
   b->comments_visible = false;
 }
@@ -4126,7 +4692,9 @@ static int cmd_suggested(edit_state * e, int key) {
   b->base = buffer_text(b, &b->base_len);
   if (b->base == NULL) return set_status(e, "cannot start suggestions"), 0;
   b->suggested = true;
+  b->suggested_history_start = b->undo_at;
   b->comments_visible = true;
+  track_rebuild(b);
   set_status(e, "suggested changes on");
   return 0;
 }
@@ -4171,6 +4739,7 @@ static int comment_submit(edit_state * e) {
   if (c->text == NULL) return b->n_comments--, set_status(e, "comment failed"), 0;
   b->dirty = true;
   b->comments_visible = true;
+  clear_mark(e);
   set_status(e, "comment added");
   return 0;
 }
@@ -4505,6 +5074,9 @@ static int cmd_find_file(edit_state * e, int key) {
     if (slash != NULL)
       snprintf(e->find_path, sizeof(e->find_path), "%.*s",
                (int) (slash - current + 1), current);
+  } else if (active_buffer(e)->kind == BUFFER_SCRATCH && e->find_home &&
+             getenv("HOME") != NULL && getenv("HOME")[0] != '\0') {
+    snprintf(e->find_path, sizeof(e->find_path), "~/");
   } else if (active_buffer(e)->kind == BUFFER_SCRATCH &&
              getcwd(current, sizeof(current)) != NULL) {
     size_t n = strlen(current);
@@ -4819,6 +5391,7 @@ static int cmd_cancel(edit_state * e, int key) {
   if (find) find_close_created_pane(e);
   e->run_prompt = false;
   e->goto_prompt = false;
+  e->comment_prompt = false;
   e->quit_confirm = false;
   clear_mark(e);
   clear_prompt_mark(e);
@@ -5316,6 +5889,7 @@ static int tui(const char * path) {
   char open_path[DEBUG_PATH_SIZE];
   bool scratch = path == NULL;
   init_state(&e);
+  e.find_home = path == NULL;
   e.n_buffers = 1;
   e.n_panes = 1;
   e.panes[0].buffer = 0;

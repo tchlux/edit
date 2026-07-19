@@ -1174,10 +1174,9 @@ python3 ./tui_view.py 5:200 '^x^f' "$dir/a" > "$out"
 grep -Fq "find.file:.$dir/" "$out"
 grep -q 'cursor:5:' "$out"
 
-cwd=$(pwd -P)
 python3 ./tui_view.py 5:120 '^x^f' > "$out"
 grep -q '\*scratch\*' "$out"
-grep -Fq "find.file:.$cwd/" "$out"
+grep -Fq "find.file:.~/" "$out"
 
 printf '' > "$recent"
 launch_dir=$(cd "$dir" && pwd -P)
@@ -1431,10 +1430,14 @@ printf 'alpha\nbeta\n' > "$review"
 ./edit --render-keys 7:60 'CeXCcok
 xs' "$review" > "$out"
 printf 'alpha\nbeta\n' | cmp -s - "$review"
-grep -q '^EDIT-SUGGESTIONS 1$' "$review.edits"
+grep -q '^EDIT-SUGGESTIONS 2$' "$review.edits"
 grep -q '^proposed 12$' "$review.edits"
+grep -q '^changes 1$' "$review.edits"
+grep -q '^insert 0 1 ' "$review.edits"
 grep -q '^comment 0 6 2$' "$review.edits"
 grep -q '^ok$' "$review.edits"
+grep -q '^selected 6$' "$review.edits"
+grep -q '^Xalpha$' "$review.edits"
 ./edit --render 7:60 "$review" > "$out"
 grep -q 'Xalpha' "$out"
 ./edit --render-keys 7:60 'Ca' "$review" > "$out"
@@ -1446,5 +1449,52 @@ printf 'Xalpha\nbeta\n' | cmp -s - "$review"
 ./edit --render-keys 7:60 'Cr' "$review" > "$out"
 printf 'Xalpha\nbeta\n' | cmp -s - "$review"
 test ! -e "$review.edits"
+
+wrap_move="$dir/wrap-move"
+printf 'abcdefghijklmnopqrstuvwxyz12345\n\nZYXWVUTSRQPONMLKJIHGFEDCBA98765\n' > "$wrap_move"
+python3 ./tui_view.py 8:25 '<c-c>^w^n' "$wrap_move" > "$out"
+grep -q '1:25.Wrap' "$out"
+python3 ./tui_view.py 8:25 '<c-c>^w^n^n' "$wrap_move" > "$out"
+grep -q '2:1.Wrap' "$out"
+python3 ./tui_view.py 8:25 '<c-c>^w^n^n^n' "$wrap_move" > "$out"
+grep -q '3:1.Wrap' "$out"
+python3 ./tui_view.py 8:25 '<c-c>^w^n^n^n^n^p^p^p' "$wrap_move" > "$out"
+grep -q '1:25.Wrap' "$out"
+
+compose="$dir/comment-compose.txt"
+printf 'alpha\n' > "$compose"
+./edit --render-keys 7:24 'CeCcijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyz' "$compose" > "$out"
+grep -q '^otuwyzijkmotuwyzijkmotu' "$out"
+grep -q '^wyzijkmotuwyz|$' "$out"
+
+printf 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\n' > "$review"
+./edit --render-keys 20:30 'CeXCcok
+xs' "$review" > "$out"
+python3 ./tui_view.py 20:30 '<c-c>^w' "$review" > "$out"
+test "$(grep -c 'ok' "$out")" = 1
+grep -q 'Selected' "$out"
+
+review_wrap="$dir/review-wrap.txt"
+printf 'alpha\n' > "$review_wrap"
+./edit --render-keys 14:30 'CeXCcijkmotuwyzijkmotuwyzijkmotuwyz
+xs' "$review_wrap" > "$out"
+python3 ./tui_view.py 14:30 '<c-c>^w' "$review_wrap" > "$out"
+grep -q 'ijkmotuwyzij' "$out"
+grep -q 'kmotuwyzijkmot' "$out"
+grep -q 'uwyz' "$out"
+
+comment_mark="$dir/comment-mark.txt"
+printf 'alpha\n' > "$comment_mark"
+./edit --render-keys 8:50 $'Ce@ffCcok\n\027xs' "$comment_mark" > "$out"
+grep -q '^proposed 6$' "$comment_mark.edits"
+
+find_home="$dir/find-home"
+mkdir "$find_home"
+printf 'home file\n' > "$find_home/home.txt"
+env HOME="$find_home" python3 ./tui_view.py 5:50 '^x^f' > "$out"
+grep -q 'find.file:.~/' "$out"
+env HOME="$find_home" python3 ./tui_view.py 5:50 '^x^fhome.txt
+' > "$out"
+grep -q 'home.file' "$out"
 
 printf 'ok\n'

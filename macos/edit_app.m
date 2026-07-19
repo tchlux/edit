@@ -35,6 +35,7 @@ typedef struct {
   int bg[3];
   bool bold;
   bool italic;
+  bool strike;
   bool reverse;
 } cell;
 
@@ -43,6 +44,7 @@ typedef struct {
   int bg[3];
   bool bold;
   bool italic;
+  bool strike;
   bool reverse;
 } attr;
 
@@ -53,12 +55,15 @@ typedef struct {
 @property int cols;
 @property int row;
 @property int col;
+@property bool wrapPending;
 @property bool cursorVisible;
 @property attr current;
 @property cell *cells;
 @property NSMutableData *utf8;
+@property NSMutableData *pendingWrite;
 @property NSMutableString *csi;
 @property NSFileHandle *handle;
+@property dispatch_source_t writeSource;
 @property int ansiState;
 @property CGFloat scrollX;
 @property CGFloat scrollY;
@@ -82,6 +87,7 @@ typedef struct {
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise;
 - (void)panicCancel;
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
+- (void)flushWrites;
 - (void)sendKey:(const char *)bytes;
 - (void)sendCommand:(id)sender;
 - (void)pasteString:(NSString *)s;
@@ -95,6 +101,7 @@ static void attr_default(attr *a) {
   a->bg[0] = 32; a->bg[1] = 32; a->bg[2] = 32;
   a->bold = false;
   a->italic = false;
+  a->strike = false;
   a->reverse = false;
 }
 
@@ -105,6 +112,7 @@ static cell blank_cell(attr a) {
   memcpy(c.bg, a.bg, sizeof(c.bg));
   c.bold = a.bold;
   c.italic = a.italic;
+  c.strike = a.strike;
   c.reverse = a.reverse;
   return c;
 }
@@ -112,7 +120,7 @@ static cell blank_cell(attr a) {
 static bool cell_equal(cell a, cell b) {
   return a.ch == b.ch && memcmp(a.fg, b.fg, sizeof(a.fg)) == 0 &&
     memcmp(a.bg, b.bg, sizeof(a.bg)) == 0 && a.bold == b.bold &&
-    a.italic == b.italic && a.reverse == b.reverse;
+    a.italic == b.italic && a.strike == b.strike && a.reverse == b.reverse;
 }
 
 static int rgb_key(const int *rgb) {
@@ -132,7 +140,7 @@ static bool cell_same_bg(cell *a, cell *b) {
 
 static bool cell_same_text(cell *a, cell *b) {
   return rgb_equal(cell_fg(a), cell_fg(b)) && a->bold == b->bold &&
-    a->italic == b->italic;
+    a->italic == b->italic && a->strike == b->strike;
 }
 
 @implementation EditTerminalView
@@ -152,6 +160,7 @@ static bool cell_same_text(cell *a, cell *b) {
   self.cols = TERM_COLS;
   self.cursorVisible = true;
   self.utf8 = [NSMutableData data];
+  self.pendingWrite = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
   [self setupRenderCache];
@@ -170,6 +179,7 @@ static bool cell_same_text(cell *a, cell *b) {
   self.cols = TERM_COLS;
   self.cursorVisible = true;
   self.utf8 = [NSMutableData data];
+  self.pendingWrite = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
   [self setupRenderCache];
@@ -192,6 +202,7 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)dealloc {
+  if (_writeSource) dispatch_source_cancel(_writeSource);
   if (_fd > 0) close(_fd);
   if (_pid > 0) kill(_pid, SIGHUP);
   free(_cells);
@@ -202,6 +213,7 @@ static bool cell_same_text(cell *a, cell *b) {
   for (int i = 0; i < _rows * _cols; i++) _cells[i] = blank_cell(_current);
   _row = 0;
   _col = 0;
+  _wrapPending = false;
   _dirtyAll = YES;
 }
 
@@ -309,7 +321,32 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length {
-  if (_fd > 0 && length > 0) write(_fd, bytes, length);
+  if (_fd <= 0 || length == 0) return;
+  [_pendingWrite appendBytes:bytes length:length];
+  [self flushWrites];
+}
+
+- (void)flushWrites {
+  while (_fd > 0 && _pendingWrite.length > 0) {
+    ssize_t n = write(_fd, _pendingWrite.bytes, _pendingWrite.length);
+    if (n > 0) {
+      [_pendingWrite replaceBytesInRange:NSMakeRange(0, (NSUInteger)n) withBytes:NULL length:0];
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !_writeSource) {
+      __weak EditTerminalView *weakSelf = self;
+      _writeSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_WRITE, (uintptr_t)_fd, 0,
+                                             dispatch_get_main_queue());
+      dispatch_source_set_event_handler(_writeSource, ^{ [weakSelf flushWrites]; });
+      dispatch_resume(_writeSource);
+    }
+    return;
+  }
+  if (_writeSource) {
+    dispatch_source_cancel(_writeSource);
+    _writeSource = nil;
+  }
 }
 
 - (void)drainPtyOutput {
@@ -325,6 +362,11 @@ static bool cell_same_text(cell *a, cell *b) {
   _readGeneration++;
   _readPending = false;
   if (_handle) _handle.readabilityHandler = nil;
+  [_pendingWrite setLength:0];
+  if (_writeSource) {
+    dispatch_source_cancel(_writeSource);
+    _writeSource = nil;
+  }
   if (_fd > 0) {
     tcflush(_fd, TCIOFLUSH);
     [self drainPtyOutput];
@@ -346,6 +388,11 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)putChar:(unichar)ch {
+  if (_wrapPending) {
+    _col = 0;
+    if (_row + 1 < _rows) _row++;
+    _wrapPending = false;
+  }
   if (_row < 0 || _row >= _rows || _col < 0 || _col >= _cols) return;
   cell c = blank_cell(_current);
   c.ch = ch;
@@ -354,10 +401,8 @@ static bool cell_same_text(cell *a, cell *b) {
     _cells[at] = c;
     [self markCellDirtyRow:_row col:_col];
   }
-  if (++_col >= _cols) {
-    _col = 0;
-    if (_row + 1 < _rows) _row++;
-  }
+  if (_col + 1 < _cols) _col++;
+  else _wrapPending = true;
 }
 
 - (void)clearLine {
@@ -394,6 +439,8 @@ static bool cell_same_text(cell *a, cell *b) {
     if (p == 0) attr_default(&_current);
     else if (p == 1) _current.bold = true;
     else if (p == 3) _current.italic = true;
+    else if (p == 9) _current.strike = true;
+    else if (p == 29) _current.strike = false;
     else if (p == 7) _current.reverse = true;
     else if (p == 27) _current.reverse = false;
     else if ((p == 38 || p == 48) && i + 4 < parts.count && [self csiInt:parts at:i + 1 fallback:0] == 2) {
@@ -413,6 +460,7 @@ static bool cell_same_text(cell *a, cell *b) {
     [self markCursorDirty];
     _row = MAX(0, MIN(_rows - 1, [self csiInt:parts at:0 fallback:1] - 1));
     _col = MAX(0, MIN(_cols - 1, [self csiInt:parts at:1 fallback:1] - 1));
+    _wrapPending = false;
     [self markCursorDirty];
   } else if (final == 'K') {
     [self clearLine];
@@ -462,10 +510,13 @@ static bool cell_same_text(cell *a, cell *b) {
       _ansiState = AnsiEsc;
     } else if (b == '\r') {
       _col = 0;
+      _wrapPending = false;
     } else if (b == '\n') {
       if (_row + 1 < _rows) _row++;
+      _wrapPending = false;
     } else if (b == '\b') {
       if (_col > 0) _col--;
+      _wrapPending = false;
     } else if (b >= 32) {
       if (b < 128) [self putChar:b];
       else {
@@ -501,14 +552,16 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (NSDictionary *)attrsForCell:(cell *)x {
-  NSUInteger key = ((NSUInteger)rgb_key(cell_fg(x)) << 2) | (x->italic ? 1 : 0) | (x->bold ? 2 : 0);
+  NSUInteger key = ((NSUInteger)rgb_key(cell_fg(x)) << 3) | (x->italic ? 1 : 0) |
+    (x->bold ? 2 : 0) | (x->strike ? 4 : 0);
   NSNumber *boxed = @(key);
   NSDictionary *attrs = _attrCache[boxed];
   if (!attrs) {
     attrs = @{
       NSFontAttributeName: x->bold ? _boldFont : _font,
       NSForegroundColorAttributeName: [self color:cell_fg(x)],
-      NSObliquenessAttributeName: x->italic ? @0.18 : @0
+      NSObliquenessAttributeName: x->italic ? @0.18 : @0,
+      NSStrikethroughStyleAttributeName: x->strike ? @1 : @0
     };
     _attrCache[boxed] = attrs;
   }
@@ -669,10 +722,11 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)pasteString:(NSString *)s {
-  [self sendKey:"\x1b[200~"];
   NSData *data = [s dataUsingEncoding:NSUTF8StringEncoding];
-  [self sendBytes:data.bytes length:data.length];
-  [self sendKey:"\x1b[201~"];
+  NSMutableData *paste = [NSMutableData dataWithBytes:"\x1b[200~" length:6];
+  [paste appendData:data];
+  [paste appendBytes:"\x1b[201~" length:6];
+  [self sendBytes:paste.bytes length:paste.length];
 }
 
 - (void)copy:(id)sender {
@@ -890,6 +944,24 @@ static int ansi_self_test(void) {
     return 1;
   }
 
+  EditTerminalView *strikeView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  ansi_feed(strikeView, "\033[9mdeleted\033[29m kept");
+  if (!strikeView.cells[0].strike || strikeView.cells[8].strike) {
+    fprintf(stderr, "ansi strikethrough failed\n");
+    return 1;
+  }
+
+  EditTerminalView *wrapView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  char fullRow[TERM_COLS + 1];
+  memset(fullRow, 'a', TERM_COLS);
+  fullRow[TERM_COLS] = '\0';
+  ansi_feed(wrapView, fullRow);
+  ansi_feed(wrapView, "\r\nX");
+  if (wrapView.cells[TERM_COLS].ch != 'X') {
+    fprintf(stderr, "ansi full-row wrap failed\n");
+    return 1;
+  }
+
   EditTerminalView *csiView = [[EditTerminalView alloc] initForAnsiSelfTest];
   char longCsi[CSI_MAX + 2];
   memset(longCsi, '1', sizeof(longCsi));
@@ -951,6 +1023,32 @@ static int ansi_self_test(void) {
   if (got != (ssize_t)strlen(shortcuts) || memcmp(buf, shortcuts, strlen(shortcuts)) != 0) {
     fprintf(stderr, "shortcut bytes failed got=%zd expected=%zu\n", got, strlen(shortcuts));
     for (ssize_t i = 0; i < got; i++) fprintf(stderr, "%02x%s", (unsigned char)buf[i], i + 1 == got ? "\n" : " ");
+    return 1;
+  }
+
+  if (pipe(p) != 0) return 1;
+  fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL, 0) | O_NONBLOCK);
+  fcntl(p[1], F_SETFL, fcntl(p[1], F_GETFL, 0) | O_NONBLOCK);
+  EditTerminalView *largeView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  largeView.fd = p[1];
+  NSMutableString *large = [NSMutableString string];
+  for (int i = 0; i < 20000; i++) [large appendString:@"paste-data-"];
+  [largeView pasteString:large];
+  NSMutableData *received = [NSMutableData data];
+  while (largeView.pendingWrite.length > 0) {
+    while ((got = read(p[0], buf, sizeof(buf))) > 0) [received appendBytes:buf length:(NSUInteger)got];
+    [largeView flushWrites];
+  }
+  while ((got = read(p[0], buf, sizeof(buf))) > 0) [received appendBytes:buf length:(NSUInteger)got];
+  close(p[1]);
+  largeView.fd = -1;
+  close(p[0]);
+  NSMutableData *expectedPaste = [NSMutableData dataWithBytes:"\033[200~" length:6];
+  [expectedPaste appendData:[large dataUsingEncoding:NSUTF8StringEncoding]];
+  [expectedPaste appendBytes:"\033[201~" length:6];
+  if (![received isEqualToData:expectedPaste]) {
+    fprintf(stderr, "large paste queue failed: got=%zu expected=%zu\n",
+            received.length, expectedPaste.length);
     return 1;
   }
 
