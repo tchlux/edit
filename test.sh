@@ -28,6 +28,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A resize just before waiting must redraw before consuming queued input.
+cat > "$dir/resize-check.c" <<EOF
+#define main edit_program_main
+#include "$PWD/edit.c"
+#undef main
+#include <assert.h>
+int main(void) {
+  edit_state e;
+  init_state(&e);
+  out_s(&e.input, "X");
+  window_resized(SIGWINCH);
+  assert(read_key_event(&e, -1).key == -1 && e.input.len == 1);
+  window_changed = 0;
+  assert(read_key_event(&e, -1).key == 'X' && e.input.len == 0);
+  free(e.input.data);
+  return 0;
+}
+EOF
+cc -std=c11 -Wall -Wextra -pedantic -O2 -o "$dir/resize-check" "$dir/resize-check.c" grammar.c regex.c
+"$dir/resize-check"
+
 foot() {
   width=$1
   msg=$2
@@ -1408,6 +1429,26 @@ python3 ./tui_view.py 8:60 "^x^flong_completion<tab>^g^xb" "$dir/a" > "$out"
 grep -q '\*find.completions\*' "$out"
 
 # Completion keeps prompt focus, filters on edits, and preserves candidate selection.
+# Long prompts scroll with the cursor in the real terminal footer.
+python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789' "$dir/a" > "$out"
+grep -q 'find.file:.rstuvwxyz0123456789.C-h.help' "$out"
+grep -q '^cursor:5:31$' "$out"
+python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789^b^b^b' "$dir/a" > "$out"
+grep -q 'find.file:.opqrstuvwxyz01234567C-h.help' "$out"
+python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789^a' "$dir/a" > "$out"
+grep -q 'find.file:.abcdefghijklmnopqrstC-h.help' "$out"
+grep -q '^cursor:5:12$' "$out"
+
+# Open a completion whose full path exceeds the old 512-byte buffer.
+long_dir="$dir/$(printf '%0200d' 1)/$(printf '%0200d' 2)"
+long_name="$(printf '%0200d' 3).txt"
+mkdir -p "$long_dir"
+printf 'source\n' > "$long_dir/source"
+printf 'complete long path\n' > "$long_dir/$long_name"
+python3 ./tui_view.py 8:60 '^x^f<tab><c-x>o
+' "$long_dir/source" > "$out"
+grep -q 'complete.long.path' "$out"
+
 find_dir="$dir/find-filter"
 mkdir -p "$find_dir/alps" "$find_dir/zebra"
 printf 'source\n' > "$find_dir/source"
@@ -1678,6 +1719,50 @@ sed -n '3p' "$out" | grep -q '##.2..Comment'
 python3 ./tui_view.py 12:60 '' "$comment_align" > "$out"
 sed -n '1p' "$out" | grep -q '##.1..Comment'
 
+# The nearest selected character controls both sidebar and source highlighting.
+comment_nearest="$dir/comment-nearest.txt"
+printf 'abcdefghijklmnopqrst----123456789\n' > "$comment_nearest"
+./edit --render-keys 12:100 "Ce@$(printf 'f%.0s' $(seq 1 20))Cc111
+$(printf 'f%.0s' $(seq 1 4))@$(printf 'f%.0s' $(seq 1 9))Cc222
+xs" "$comment_nearest" > "$out"
+python3 ./tui_view.py 12:100 "$(printf '^f%.0s' $(seq 1 21))" "$comment_nearest" > "$out"
+sed -n '1p' "$out" | grep -q '##.1..Comment'
+./edit --render-keys-color 5:100 "$(printf 'f%.0s' $(seq 1 21))" "$comment_nearest" > "$out"
+grep -Fq "$(printf '%s[48;2;76;66;35mabcdefghijklmnopqrst' "$esc")" "$out"
+python3 ./tui_view.py 12:100 "$(printf '^f%.0s' $(seq 1 22))" "$comment_nearest" > "$out"
+grep -q '##.2..Comment' "$out"
+./edit --render-keys-color 5:100 "$(printf 'f%.0s' $(seq 1 22))" "$comment_nearest" > "$out"
+grep -Fq "$(printf '%s[48;2;76;66;35m123456789' "$esc")" "$out"
+
+# The review is a normal read-only buffer; its search drives document selection.
+cp "$comment_nearest" "$tmp.expected"
+cp "$comment_nearest.edits" "$dir/review-expected.edits"
+python3 ./tui_view.py 12:100 '^xo^s222
+' "$comment_nearest" > "$out"
+grep -q 'comment-nearest.txt.1:25.Suggested' "$out"
+grep -q '\*Suggested.Changes\*.*RO.Wrap.>' "$out"
+grep -q 'match.222' "$out"
+python3 ./tui_view.py 12:100 '^xo^s222
+^r111
+' "$comment_nearest" > "$out"
+grep -q 'comment-nearest.txt.1:1.Suggested' "$out"
+python3 ./tui_view.py 12:100 '^xo^s222
+X' "$comment_nearest" > "$out"
+grep -q 'read.only' "$out"
+cmp -s "$tmp.expected" "$comment_nearest"
+cmp -s "$dir/review-expected.edits" "$comment_nearest.edits"
+python3 ./tui_view.py 12:100 '^xo^x0' "$comment_nearest" > "$out"
+if grep -q '\*Suggested.Changes\*' "$out"; then exit 1; fi
+python3 ./tui_view.py 12:100 '^xo<c-c>]' "$comment_nearest" > "$out"
+if grep -q '\*Suggested.Changes\*' "$out"; then exit 1; fi
+comment_overlap="$dir/comment-overlap.txt"
+printf 'abcdefghijklmnopqrst----123456789\n' > "$comment_overlap"
+./edit --render-keys 12:100 "Ce@$(printf 'f%.0s' $(seq 1 10))Cc111
+$(printf 'b%.0s' $(seq 1 5))@$(printf 'f%.0s' $(seq 1 15))Cc222
+xs" "$comment_overlap" > "$out"
+./edit --render-keys-color 5:100 "$(printf 'f%.0s' $(seq 1 23))" "$comment_overlap" > "$out"
+grep -Fq "$(printf '%s[48;2;76;66;35mfghijklmnopqrst' "$esc")" "$out"
+
 find_home="$dir/find-home"
 mkdir "$find_home"
 printf 'home file\n' > "$find_home/home.txt"
@@ -1686,5 +1771,86 @@ grep -q 'find.file:.~/' "$out"
 env HOME="$find_home" python3 ./tui_view.py 5:50 '^x^fhome.txt
 ' > "$out"
 grep -q 'home.file' "$out"
+
+# Rendering reaches past the old line and syntax-span limits.
+printf '%09000dTAIL\n' 0 > "$dir/long-line.txt"
+./edit --render-keys-color 5:80 e "$dir/long-line.txt" > "$out"
+grep -q 'TAIL' "$out"
+printf 'style keyword 33\nword keyword int\n' > "$tmp.grammar"
+printf '%s\n' "$(printf 'int %.0s' $(seq 1 300))" > "$dir/many-spans.c"
+EDIT_GRAMMAR="$tmp.grammar" ./edit --render-keys-color 5:80 e "$dir/many-spans.c" > "$out"
+grep -Fq "$(printf '%s[33mint' "$esc")" "$out"
+
+# A long grammar record loads as one record; oversized fields fail explicitly.
+printf 'style keyword 33\nword keyword %s TAIL\n' "$(printf 'word %.0s' $(seq 1 120))" > "$tmp.grammar"
+printf 'TAIL\n' > "$dir/grammar-tail.txt"
+EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$dir/grammar-tail.txt" > "$out"
+grep -Fq "$(printf '%s[33mTAIL' "$esc")" "$out"
+printf 'style keyword 33\nrule keyword %0300d\n' 0 > "$tmp.grammar"
+EDIT_GRAMMAR="$tmp.grammar" ./edit --render-color 3:80 "$dir/grammar-tail.txt" > "$out" 2> "$tmp.head"
+grep -q 'invalid or unreadable grammar' "$tmp.head"
+
+# Paste rejection is atomic, including when a prompt selection is active.
+oversized=$(printf '%0200d' 0)
+python3 ./tui_view.py 5:60 "^skeep^a<c-space>^e<paste>$oversized</paste>" "$dir/a" > "$out"
+grep -q 'input.too.long' "$out"
+python3 ./tui_view.py 5:60 "^skeep<paste>$oversized</paste>
+" "$dir/a" > "$out"
+grep -q 'input.too.long' "$out"
+python3 ./tui_view.py 5:60 "^skeep<paste>$oversized</paste><left>$(printf '\177')
+" "$dir/a" > "$out"
+if grep -q 'input.too.long' "$out"; then exit 1; fi
+python3 ./tui_view.py 5:60 "^skeep^a<c-space>^e<paste>$oversized</paste>^b" "$dir/a" > "$out"
+grep -q 'search:.keep' "$out"
+python3 ./tui_view.py 5:50 '^s<paste>éééééééééééééééééééééééééééééééé</paste>' "$dir/a" > "$out"
+grep -q '^cursor:5:41$' "$out"
+
+# Long saved records cannot become shortened commands or extra recent paths.
+audit_home="$dir/audit-home"
+mkdir -p "$audit_home/.edit"
+printf 'run\t%s\tprintf unsafe%01100d\n' "$dir/a" 0 > "$audit_home/.edit/config"
+env HOME="$audit_home" python3 ./tui_view.py 5:60 '<c-c>x' "$dir/a" > "$out"
+grep -q 'saved.command.too.long' "$out"
+printf 'custom\t%03000d\n' 0 > "$tmp.expected"
+cp "$tmp.expected" "$audit_home/.edit/config"
+env HOME="$audit_home" SHELL=/bin/zsh python3 ./tui_view.py 8:80 '<c-c>xprintf safe
+' "$dir/a" > "$out"
+head -n 1 "$audit_home/.edit/config" > "$tmp.head"
+cmp -s "$tmp.expected" "$tmp.head"
+printf '%02000d\n%s\n' 0 "$dir/b" > "$recent"
+python3 ./tui_view.py 5:60 '' "$dir/a" > "$out"
+printf '%s\n%s\n' "$dir/a" "$dir/b" > "$tmp.expected"
+cmp -s "$tmp.expected" "$recent"
+
+# Reviews retain long text and sections after the old 256-row limit.
+printf 'alpha\n' > "$dir/long-review.txt"
+review_text="$(printf '%0350d' 0)REVIEWTAIL"
+python3 ./tui_view.py 20:120 "<c-c>e<paste>$review_text</paste>^x^s" "$dir/long-review.txt" > "$out"
+python3 ./tui_view.py 20:120 '' "$dir/long-review.txt" > "$out"
+grep -q 'VIEWTAIL' "$out"
+review_keys=Ce
+review_move=
+i=0
+: > "$dir/many-reviews.txt"
+while [ "$i" -lt 60 ]; do
+  printf 'alpha\n' >> "$dir/many-reviews.txt"
+  review_keys="${review_keys}Xn"
+  review_move="${review_move}^n"
+  i=$((i + 1))
+done
+printf 'last\n' >> "$dir/many-reviews.txt"
+./edit --render-keys 8:60 "${review_keys}Cc987654321
+xs" "$dir/many-reviews.txt" > "$out"
+python3 ./tui_view.py 20:120 "${review_move}^l" "$dir/many-reviews.txt" > "$out"
+grep -q '##.61..Comment' "$out"
+# Review search scrolls the document to a distant section; document navigation returns it.
+python3 ./tui_view.py 12:100 '^xo^s987654321
+' "$dir/many-reviews.txt" > "$out"
+grep -q 'many-reviews.txt.61:1.Suggested' "$out"
+grep -q '##.61..Comment' "$out"
+python3 ./tui_view.py 12:100 '^xo^s987654321
+^xo<esc><' "$dir/many-reviews.txt" > "$out"
+grep -q 'many-reviews.txt.1:1.Suggested' "$out"
+grep -q '##.1..Add' "$out"
 
 printf 'ok\n'

@@ -169,6 +169,7 @@ static bool cell_same_text(cell *a, cell *b) {
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
   _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
   [self clearScreen];
+  [self resizeGrid];
   [self startEdit:path];
   return self;
 }
@@ -250,13 +251,23 @@ static bool cell_same_text(cell *a, cell *b) {
   int cols = MAX(20, (int)(self.bounds.size.width / size.width));
   int rows = MAX(8, (int)(self.bounds.size.height / size.height));
   if (cols == _cols && rows == _rows) return;
+  // Keep the previous frame visible while the editor redraws at the new size.
+  cell *cells = calloc((size_t)rows * (size_t)cols, sizeof(cell));
+  for (int r = 0; r < rows; r++)
+    for (int c = 0; c < cols; c++)
+      cells[r * cols + c] = r < _rows && c < _cols ?
+        _cells[r * _cols + c] : blank_cell(_current);
+  free(_cells);
+  _cells = cells;
   _cols = cols;
   _rows = rows;
-  free(_cells);
+  _row = MIN(_row, rows - 1);
+  _col = MIN(_col, cols - 1);
+  _wrapPending = false;
   free(_dirtyRows);
-  _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
   _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
-  [self clearScreen];
+  _dirtyAll = YES;
+  [self flushDirty];
   struct winsize ws = { .ws_row = (unsigned short)_rows, .ws_col = (unsigned short)_cols };
   if (_fd > 0) ioctl(_fd, TIOCSWINSZ, &ws);
   if (_pid > 0) kill(_pid, SIGWINCH);
@@ -265,6 +276,14 @@ static bool cell_same_text(cell *a, cell *b) {
 - (void)setFrameSize:(NSSize)newSize {
   [super setFrameSize:newSize];
   [self resizeGrid];
+  [self setNeedsDisplay:YES];
+}
+
+- (void)viewDidEndLiveResize {
+  [super viewDidEndLiveResize];
+  [self resizeGrid];
+  if (_pid > 0) kill(_pid, SIGWINCH);
+  [self setNeedsDisplay:YES];
 }
 
 - (void)startEdit:(NSString *)path {
@@ -306,7 +325,8 @@ static bool cell_same_text(cell *a, cell *b) {
       });
       return;
     }
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // Deliver output during AppKit's resize tracking loop as well as normal input.
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
       EditTerminalView *view = weakSelf;
       if (!view) return;
       if (view.readGeneration != generation) {
@@ -319,6 +339,7 @@ static bool cell_same_text(cell *a, cell *b) {
       view.readPending = false;
       [view installReadHandler];
     });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
   };
 }
 
@@ -540,7 +561,8 @@ static bool cell_same_text(cell *a, cell *b) {
       }
     }
   }
-  [self flushDirty];
+  // The editor hides its cursor at frame start and shows it after the full redraw.
+  if (_cursorVisible) [self flushDirty];
 }
 
 - (NSUInteger)csiLength { return _csi.length; }
@@ -580,7 +602,6 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
-  [self resizeGrid];
   NSSize size = [self cellSize];
   [[NSColor colorWithCalibratedRed:32 / 255.0 green:32 / 255.0 blue:32 / 255.0 alpha:1] setFill];
   NSRectFill(dirtyRect);
@@ -629,6 +650,7 @@ static bool cell_same_text(cell *a, cell *b) {
     if ([plain isEqualToString:@"c"]) return [self copy:nil];
     if ([plain isEqualToString:@"v"]) return [self paste:nil];
     if ([plain isEqualToString:@"s"]) return [self saveDocument:nil];
+    if ([plain isEqualToString:@"q"]) return [self quitDocument:nil];
     return;
   }
   if (flags & NSEventModifierFlagControl) {
@@ -860,7 +882,7 @@ static bool cell_same_text(cell *a, cell *b) {
   [self addCommand:@"Next Buffer    C-x b" bytes:"\030b" length:2 to:commands];
   [self addCommand:@"List Buffers    C-x C-b" bytes:"\030\002" length:2 to:commands];
   [self addCommand:@"Kill Buffer    C-x k" bytes:"\030k" length:2 to:commands];
-  [self addCommand:@"Quit    C-x C-c" bytes:"\030\003" length:2 to:commands];
+  [commands addItemWithTitle:@"Quit    C-x C-c" action:@selector(quitDocument:) keyEquivalent:@"q"];
   [commands addItem:[NSMenuItem separatorItem]];
 
   [self addCommand:@"Split Below    C-x 2" bytes:"\0302" length:2 to:commands];
@@ -944,6 +966,28 @@ static int ansi_self_test(void) {
       [text containsString:@"["] ||
       [text containsString:@"m"]) {
     fprintf(stderr, "ansi self-test failed: %s\n", text.UTF8String);
+    return 1;
+  }
+
+  // Resizing keeps the previous frame intact until replacement output arrives.
+  [view resizeGrid];
+  NSSize resized = NSMakeSize(view.bounds.size.width + 100, view.bounds.size.height + 100);
+  [view setFrameSize:resized];
+  if (![[view lineText:7] isEqualToString:@"funcarg"]) {
+    fprintf(stderr, "resize preservation failed\n");
+    return 1;
+  }
+
+  // A redraw split across reads is committed only after its final cursor command.
+  [view flushDirty];
+  ansi_feed(view, "\033[?25l\033[HZ");
+  if (!view.hasDirty || view.cursorVisible) {
+    fprintf(stderr, "partial frame was flushed\n");
+    return 1;
+  }
+  ansi_feed(view, "\033[?25h");
+  if (view.hasDirty || !view.cursorVisible) {
+    fprintf(stderr, "complete frame was not flushed\n");
     return 1;
   }
 
@@ -1046,14 +1090,14 @@ static int ansi_self_test(void) {
   [shortcutView cut:nil];
   [shortcutView copy:nil];
   [shortcutView pasteString:@"PASTE"];
-  NSArray<NSString *> *keyChars = @[@"x", @"p", @"U", @"x", @"+", @"x", @"_", @"x", @")", @"/", @"t"];
+  NSArray<NSString *> *keyChars = @[@"x", @"p", @"U", @"x", @"+", @"x", @"_", @"x", @")", @"/", @"t", @"q"];
   NSEventModifierFlags keyFlags[] = {
     NSEventModifierFlagControl, NSEventModifierFlagControl,
     NSEventModifierFlagOption | NSEventModifierFlagShift,
     NSEventModifierFlagControl, NSEventModifierFlagShift,
     NSEventModifierFlagControl, NSEventModifierFlagShift,
     NSEventModifierFlagControl, NSEventModifierFlagShift,
-    NSEventModifierFlagControl, NSEventModifierFlagControl
+    NSEventModifierFlagControl, NSEventModifierFlagControl, NSEventModifierFlagCommand
   };
   for (NSUInteger i = 0; i < keyChars.count; i++) {
     NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
@@ -1065,7 +1109,7 @@ static int ansi_self_test(void) {
   shortcutView.fd = -1;
   got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  const char shortcuts[] = "\027\033w\033[200~PASTE\033[201~\030\020\033U\030+\030_\030)\037\024";
+  const char shortcuts[] = "\027\033w\033[200~PASTE\033[201~\030\020\033U\030+\030_\030)\037\024\030\003";
   if (got != (ssize_t)strlen(shortcuts) || memcmp(buf, shortcuts, strlen(shortcuts)) != 0) {
     fprintf(stderr, "shortcut bytes failed got=%zd expected=%zu\n", got, strlen(shortcuts));
     for (ssize_t i = 0; i < got; i++) fprintf(stderr, "%02x%s", (unsigned char)buf[i], i + 1 == got ? "\n" : " ");
@@ -1124,6 +1168,48 @@ static int ansi_self_test(void) {
   close(p[0]);
   if (afterCancel != 0) {
     fprintf(stderr, "scroll cancel failed: sent=%d\n", afterCancel);
+    return 1;
+  }
+
+  // A real editor must deliver complete new-size frames during resize tracking.
+  CFRunLoopAddCommonMode(CFRunLoopGetMain(), (__bridge CFStringRef)NSEventTrackingRunLoopMode);
+  NSTimer *keepAlive = [NSTimer timerWithTimeInterval:60 repeats:YES block:^(NSTimer *timer) {
+    (void)timer;
+  }];
+  [NSRunLoop.mainRunLoop addTimer:keepAlive forMode:NSRunLoopCommonModes];
+  EditTerminalView *live = [[EditTerminalView alloc] initWithPath:nil];
+  BOOL complete = NO;
+  for (int pass = 0; pass < 3; pass++) {
+    for (int step = 0; step < 20; step++)
+      [live setFrameSize:NSMakeSize((pass == 2 ? 600 : 700 + pass * 100) + step * 3,
+                                    (pass == 2 ? 360 : 400 + pass * 80) + step * 2)];
+    complete = NO;
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 3;
+    while (CFAbsoluteTimeGetCurrent() < deadline && !complete) {
+      CFRunLoopRunInMode((__bridge CFStringRef)NSEventTrackingRunLoopMode, 0.01, false);
+      int footer = (live.rows - 1) * live.cols + live.cols - 9;
+      int modeline = (live.rows - 2) * live.cols;
+      complete = live.cursorVisible && live.cells[modeline].ch == '*' &&
+        live.cells[footer].ch == 'C' && live.cells[footer + 7].ch == 'p';
+      if (pass > 0) complete = complete && live.cells[(live.rows / 2 - 1) * live.cols].ch == '*';
+      for (int row = 0; complete && row < live.rows; row++) {
+        int edge = row * live.cols + live.cols - 1;
+        complete = live.cells[edge].ch == ' ' && !live.cells[edge].reverse;
+      }
+    }
+    if (!complete) break;
+    if (pass == 0) [live sendKey:"\0302"];
+  }
+  [keepAlive invalidate];
+  live.handle.readabilityHandler = nil;
+  if (live.pid > 0) {
+    kill(live.pid, SIGHUP);
+    waitpid(live.pid, NULL, 0);
+  } else complete = NO;
+  live.pid = 0;
+  if (!complete) {
+    fprintf(stderr, "live resize failed without input: rows=%d cols=%d cursor=%d:%d first=%s\n",
+            live.rows, live.cols, live.row, live.col, [live lineText:20].UTF8String);
     return 1;
   }
   return 0;

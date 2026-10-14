@@ -17,6 +17,16 @@ insert, replace, and test files without opening a terminal UI.
 
 ## INSTALLATION
 
+Install or update the macOS app in `~/Applications`:
+
+```sh
+curl -fsSL https://github.com/tchlux/edit/raw/HEAD/install.sh | sh
+```
+
+This builds in a temporary directory, replaces `~/Applications/Edit.app`, and
+opens it. If prompted to install Apple's Command Line Tools, finish that
+installation and run the command again.
+
 Build the terminal editor and the macOS app bundle:
 
 ```sh
@@ -147,7 +157,9 @@ buffers auto-reload when the file changes on disk.
 - `C-x C-s` saves the proposed document and comments to `file.edits`.
 - `C-c c` comments on the selection, or the current line without a selection.
 - `C-c d` deletes the comment nearest the cursor.
-- `C-c ]` shows or hides the equal-height comments panel on the right.
+- `C-c ]` shows or hides the read-only Suggested Changes buffer on the right.
+- `C-x o` focuses it for normal navigation and search. The focused pane controls
+  the other pane's scroll position and active change/comment highlight.
 - `C-c a` accepts all changes and writes the proposal to the original file.
 - `C-c r` rejects all changes and restores the original file.
 

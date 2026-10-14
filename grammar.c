@@ -12,6 +12,7 @@
 #include "grammar.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +26,6 @@ static char * _space(char * s) {
   *s++ = '\0';
   while (isspace((unsigned char) *s)) s++;
   return s;
-}
-
-static void _copy(char * dst, size_t n, const char * src) {
-  if (n == 0) return;
-  snprintf(dst, n, "%s", src);
 }
 
 static char * _trim(char * s) {
@@ -46,36 +42,41 @@ static const char * _sgr(grammar * g, const char * scope) {
   return "0";
 }
 
-static void _style(grammar * g, const char * scope, const char * sgr) {
-  if (g->n_styles >= GRAMMAR_MAX_STYLES) return;
-  _copy(g->styles[g->n_styles].scope, GRAMMAR_SCOPE_SIZE, scope);
-  _copy(g->styles[g->n_styles].sgr, GRAMMAR_SGR_SIZE, sgr);
+static int _style(grammar * g, const char * scope, const char * sgr) {
+  if (g->n_styles >= GRAMMAR_MAX_STYLES || strlen(scope) >= GRAMMAR_SCOPE_SIZE ||
+      strlen(sgr) >= GRAMMAR_SGR_SIZE) return -1;
+  strcpy(g->styles[g->n_styles].scope, scope);
+  strcpy(g->styles[g->n_styles].sgr, sgr);
   g->n_styles++;
+  return 0;
 }
 
-static void _rule(grammar * g, const char * scope, const char * value, int word) {
-  if (g->n_rules >= GRAMMAR_MAX_RULES) return;
-  _copy(g->rules[g->n_rules].scope, GRAMMAR_SCOPE_SIZE, scope);
-  _copy(g->rules[g->n_rules].regex, GRAMMAR_REGEX_SIZE, value);
+static int _rule(grammar * g, const char * scope, const char * value, int word) {
+  if (g->n_rules >= GRAMMAR_MAX_RULES || strlen(scope) >= GRAMMAR_SCOPE_SIZE ||
+      strlen(value) >= GRAMMAR_REGEX_SIZE) return -1;
+  strcpy(g->rules[g->n_rules].scope, scope);
+  strcpy(g->rules[g->n_rules].regex, value);
   g->rules[g->n_rules].word = word;
   g->n_rules++;
+  return 0;
 }
 
-static void _parse(grammar * g, char * line) {
+static int _parse(grammar * g, char * line) {
   char * kind = _trim(line);
-  if ((*kind == '\0') || (*kind == '#')) return;
+  if ((*kind == '\0') || (*kind == '#')) return 0;
   char * scope = _space(kind);
   char * value = _space(scope);
 
-  if (strcmp(kind, "style") == 0) _style(g, scope, value);
-  else if (strcmp(kind, "rule") == 0) _rule(g, scope, value, 0);
+  if (strcmp(kind, "style") == 0) return _style(g, scope, value);
+  else if (strcmp(kind, "rule") == 0) return _rule(g, scope, value, 0);
   else if (strcmp(kind, "word") == 0) {
     while (*value != '\0') {
       char * next = _space(value);
-      _rule(g, scope, value, 1);
+      if (_rule(g, scope, value, 1) != 0) return -1;
       value = next;
     }
   }
+  return 0;
 }
 
 void grammar_load_default(grammar * g) {
@@ -105,13 +106,20 @@ int grammar_load(grammar * g, const char * path) {
   FILE * f = fopen(path, "r");
   if (f == NULL) return -1;
 
-  char line[512];
-  while (fgets(line, sizeof(line), f) != NULL) {
-    _parse(g, line);
+  char * line = NULL;
+  size_t cap = 0;
+  int rc = 0;
+  while (getline(&line, &cap, f) >= 0) {
+    if (_parse(g, line) != 0) {
+      rc = -1;
+      break;
+    }
   }
-
+  if (ferror(f)) rc = -1;
+  free(line);
   fclose(f);
-  return 0;
+  if (rc != 0) memset(g, 0, sizeof(*g));
+  return rc;
 }
 
 static int _boundary(char c) {
@@ -812,7 +820,7 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
     if (g->rules[i].word) {
       _word(sgrs, line, len, g->rules[i].regex, sgr);
     } else {
-      int n = GRAMMAR_MAX_SPANS;
+      int n = len < INT_MAX ? (int) len + 1 : INT_MAX;
       int * starts = NULL;
       int * ends = NULL;
       matcha(g->rules[i].regex, text, &n, &starts, &ends);

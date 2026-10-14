@@ -251,7 +251,15 @@ def read_tui(path, rows, cols, key_text):
                 break
     for c in keys(key_text):
         if c == 255:
-            time.sleep(0.05)
+            # Drain frames during the pause so output cannot block Escape handling.
+            pause_end = time.time() + 0.05
+            while time.time() < pause_end:
+                ready, _, _ = select.select([fd], [], [], max(0, pause_end - time.time()))
+                if fd in ready:
+                    try:
+                        out += os.read(fd, 4096)
+                    except OSError:
+                        break
         elif c == 254:
             if path is not None:
                 with open(path, "wb") as f:
