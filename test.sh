@@ -914,7 +914,7 @@ while [ "$i" -lt 8 ]; do
   : > "$dir/aa_completion_$i"
   i=$((i + 1))
 done
-python3 ./tui_view.py 6:24 "<c-x>^f^a^k$dir/aa_completion_<tab><c-space><right><right>^w" "$tmp" > "$out"
+python3 ./tui_view.py 6:24 "<c-x>^f^a^k$dir/aa_completion_<tab><c-x>o<c-space><right><right>^w" "$tmp" > "$out"
 grep -q 'copied' "$out"
 grep -q '\*find.compl' "$out"
 rm -f "$dir"/aa_completion_*
@@ -965,6 +965,18 @@ grep -q 'C-x.C-c' "$out"
 ./edit --render-keys 4:20 hX "$tmp" > "$out"
 printf '|edit.help\n\n*help* RO 1:1\n%s\n' "$(foot 20 "read only")" | cmp -s - "$out"
 
+# Cancel leaves active help and restores the buffer and cursor it replaced.
+for help_cancel in '^g' '<esc>'; do
+  python3 ./tui_view.py 8:40 "<right>^h${help_cancel}" "$tmp" > "$out"
+  grep -q 'cursor:1:2' "$out"
+  if grep -q '\*help\*' "$out"; then exit 1; fi
+done
+python3 ./tui_view.py 8:40 '<right>^h^h^g' "$tmp" > "$out"
+grep -q 'cursor:1:2' "$out"
+python3 ./tui_view.py 8:40 '^h<c-x>3<c-x>o^g' "$tmp" > "$out"
+[ "$(grep -c '\*help\*' "$out")" = 1 ]
+grep -q 'cursor:1:21' "$out"
+
 ./edit --render-keys 4:20 fhxk "$tmp" > "$out"
 printf 'a|bc\n\n%s 1:2\n%s\n' "$base" "$(foot 20 "killed")" | cmp -s - "$out"
 
@@ -990,9 +1002,79 @@ python3 ./tui_view.py 5:12 '<c-c>^w' "$wrap" > "$out"
 grep -q '02:lmnopqrstuv' "$out"
 grep -q '04:w.1:1.Wrap' "$out"
 
-python3 ./tui_view.py 5:12 '<c-c>^w<c-c>^w' "$wrap" > "$out"
+python3 ./tui_view.py 5:12 '<c-c>^w<c-c>^w<c-c>^w' "$wrap" > "$out"
 grep -q '01:abcdefghijk' "$out"
 if grep -q 'Wrap' "$out"; then exit 1; fi
+
+# Word wrapping preserves text and keeps movement on the displayed rows.
+word_wrap="$dir/word-wrap"
+printf 'one two three four five\n' > "$word_wrap"
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w' "$word_wrap" > "$out"
+grep -q '01:one.two' "$out"
+grep -q '02:three.four' "$out"
+grep -q '03:five' "$out"
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w^n' "$word_wrap" > "$out"
+grep -q 'cursor:2:1' "$out"
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<opt-gt><left>^e^p' "$word_wrap" > "$out"
+grep -q 'cursor:2:5' "$out"
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<click:11:1>' "$word_wrap" > "$out"
+grep -q 'cursor:1:8' "$out"
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<right><right><right><right><right><right><right><right><right><right><right><right><right><right><right><right><right>^n^p' "$word_wrap" > "$out"
+grep -q 'cursor:2:10' "$out"
+
+# Selection covers the whole buffer; uppercase is one undo group.
+command_file="$dir/new-commands"
+printf 'hello camelCase world\nsecond line\n' > "$command_file"
+python3 ./tui_view.py 8:40 '<right><c-x>^p^w<c-x>^s' "$command_file" > "$out"
+[ ! -s "$command_file" ]
+printf 'hello camelCase world\n' > "$command_file"
+python3 ./tui_view.py 8:40 '<right><esc>U<c-x>^s' "$command_file" > "$out"
+printf 'hELLO camelCase world\n' | cmp -s - "$command_file"
+python3 ./tui_view.py 8:40 '<right><right><right><right><right><right><esc>U<c-x>^s' "$command_file" > "$out"
+printf 'hELLO CAMELCASE world\n' | cmp -s - "$command_file"
+printf 'hello world\n' > "$command_file"
+python3 ./tui_view.py 8:40 '<esc>U<c-x>u<c-x>^s' "$command_file" > "$out"
+printf 'hello world\n' | cmp -s - "$command_file"
+python3 ./tui_view.py 8:40 '<c-c>^r<esc>U' "$command_file" > "$out"
+grep -q 'hello.world' "$out"
+
+# Transposition handles point, line ends, UTF-8, undo, and read-only buffers.
+transpose_file="$dir/transpose"
+printf 'abcd\n' > "$transpose_file"
+python3 ./tui_view.py 8:40 '<right>^t<c-x>^s' "$transpose_file" > "$out"
+printf 'bacd\n' | cmp -s - "$transpose_file"
+python3 ./tui_view.py 8:40 '^e^t<c-x>^s' "$transpose_file" > "$out"
+printf 'badc\n' | cmp -s - "$transpose_file"
+printf 'éλx' > "$transpose_file"
+python3 ./tui_view.py 8:40 '<right>^t<c-x>^s' "$transpose_file" > "$out"
+printf 'λéx' | cmp -s - "$transpose_file"
+printf 'abcd\n' > "$transpose_file"
+python3 ./tui_view.py 8:40 '<right>^t<c-slash><c-x>^s' "$transpose_file" > "$out"
+printf 'abcd\n' | cmp -s - "$transpose_file"
+python3 ./tui_view.py 8:40 '<right>^t<c-slash><c-x>r<c-x>^s' "$transpose_file" > "$out"
+printf 'bacd\n' | cmp -s - "$transpose_file"
+python3 ./tui_view.py 8:40 '<c-c>^r<right>^t' "$transpose_file" > "$out"
+grep -q 'bacd' "$out"
+printf 'x' > "$transpose_file"
+python3 ./tui_view.py 8:40 '^e^t<c-x>^s' "$transpose_file" > "$out"
+printf 'x' | cmp -s - "$transpose_file"
+
+# Wrapped line edges stay on the current display row in both wrap modes.
+for wrap_keys in '<c-c>^w' '<c-c>^w<c-c>^w'; do
+  python3 ./tui_view.py 8:12 "${wrap_keys}^n^e" "$word_wrap" > "$out"
+  grep -q 'cursor:2:11' "$out"
+  python3 ./tui_view.py 8:12 "${wrap_keys}^n^e^a" "$word_wrap" > "$out"
+  grep -q 'cursor:2:1' "$out"
+done
+python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<opt-gt>^e' "$word_wrap" > "$out"
+grep -q 'cursor:4:1' "$out"
+
+# Font bindings emit the app command without modifying the document.
+EDIT_APP=1 ./edit --render-keys 8:40 'x+x-x)' "$command_file" > "$out"
+head -c 24 "$out" > "$tmp.head"
+printf '\033[777;1t\033[777;2t\033[777;0t' | cmp -s - "$tmp.head"
+./edit --render-keys 8:60 'x+' "$command_file" > "$out"
+grep -q 'font.sizing.requires.Edit.app' "$out"
 
 rights='<right><right><right><right><right><right><right><right><right><right><right><right><right>'
 python3 ./tui_view.py 5:12 "<c-c>^w$rights" "$wrap" > "$out"
@@ -1311,7 +1393,7 @@ python3 ./tui_view.py 5:50 "^x^fsu<tab>child
 sed -n '1p' "$out" > "$tmp.head"
 case "$(cat "$tmp.head")" in *child*) ;; *) exit 1;; esac
 
-python3 ./tui_view.py 5:70 "^x^f<tab>" "$dir/a" > "$out"
+python3 ./tui_view.py 12:100 "^x^f<tab>" "$dir/a" > "$out"
 grep -q 'gamma' "$out"
 grep -q 'sub/' "$out"
 
@@ -1319,11 +1401,109 @@ for n in 1 2 3 4; do printf 'long-open\n' > "$dir/long_completion_name_$n"; done
 python3 ./tui_view.py 8:60 "^x^flong_completion<tab>" "$dir/a" > "$out"
 grep -q '\*find.completions\*' "$out"
 grep -q 'long_completion_name_' "$out"
-python3 ./tui_view.py 8:60 "^x^flong_completion<tab>
+python3 ./tui_view.py 8:60 "^x^flong_completion<tab><c-x>o
 " "$dir/a" > "$out"
 grep -q 'long-open' "$out"
 python3 ./tui_view.py 8:60 "^x^flong_completion<tab>^g^xb" "$dir/a" > "$out"
 grep -q '\*find.completions\*' "$out"
+
+# Completion keeps prompt focus, filters on edits, and preserves candidate selection.
+find_dir="$dir/find-filter"
+mkdir -p "$find_dir/alps" "$find_dir/zebra"
+printf 'source\n' > "$find_dir/source"
+printf 'alpha content\n' > "$find_dir/alpha.txt"
+printf 'alpine content\n' > "$find_dir/alpine.txt"
+: > "$find_dir/beta.txt"
+# Narrow panes stack candidates; wider panes use two or four columns.
+python3 ./tui_view.py 12:30 '^x^f<tab>' "$find_dir/source" > "$out"
+grep -q '01:.*alps/' "$out"
+grep -q '02:.*zebra/' "$out"
+python3 ./tui_view.py 12:60 '^x^f<tab>' "$find_dir/source" > "$out"
+grep -q '01:.*alps/.*alpha.txt' "$out"
+grep -q '02:.*zebra/.*alpine.txt' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab>' "$find_dir/source" > "$out"
+grep -q '01:.*alps/.*zebra/.*alpha.txt.*beta.txt' "$out"
+grep -q '02:.*alpine.txt.*source' "$out"
+# First click focuses the list; a focused click opens the correct file column.
+python3 ./tui_view.py 12:100 '^x^f<tab><click:67:1><click:67:1>' "$find_dir/source" > "$out"
+grep -q 'alpha.content' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o<click:79:1>' "$find_dir/source" > "$out"
+grep -q 'opened.beta.txt' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o^e
+' "$find_dir/source" > "$out"
+grep -q 'opened.beta.txt' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o^e^n^a^p^a' "$find_dir/source" > "$out"
+grep -q 'alps/' "$out"
+grep -q 'alpha.txt' "$out"
+
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o<c-x>oal' "$find_dir/source" > "$out"
+grep -q 'cursor:12:' "$out"
+
+python3 ./tui_view.py 12:100 '^x^f<tab>al' "$find_dir/source" > "$out"
+grep -q 'alps/' "$out"
+grep -q 'alpha.txt' "$out"
+grep -q 'alpine.txt' "$out"
+if grep -q 'beta.txt\|zebra/\|read.only' "$out"; then exit 1; fi
+grep -q 'cursor:12:' "$out"
+# Paths appear only in the prompt, never beside candidate names.
+if grep -q 'alpha.txt.*find-filter' "$out"; then exit 1; fi
+python3 ./tui_view.py 12:100 '^x^f<tab>alpha.txt' "$find_dir/source" > "$out"
+grep -q 'alpha.txt' "$out"
+if grep -q 'alpine.txt\|alps/' "$out"; then exit 1; fi
+python3 ./tui_view.py 12:100 '^x^f<tab>none' "$find_dir/source" > "$out"
+if grep -q 'alpha.txt\|beta.txt\|zebra/' "$out"; then exit 1; fi
+find_backspace=$(printf '\177')
+python3 ./tui_view.py 12:100 "^x^f<tab>none${find_backspace}${find_backspace}${find_backspace}${find_backspace}" "$find_dir/source" > "$out"
+grep -q 'beta.txt' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab>alpha.txt
+' "$find_dir/source" > "$out"
+grep -q 'alpha.content' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab>alpha<c-x>o
+' "$find_dir/source" > "$out"
+grep -q 'alpha.content' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>oal' "$find_dir/source" > "$out"
+grep -q 'cursor:12:' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab>al^g' "$find_dir/source" > "$out"
+if grep -q '\*find.completions\*' "$out"; then exit 1; fi
+
+# Directory selection refreshes the same pane and keeps its keyboard focus.
+browse_dir="$dir/browse"
+mkdir -p "$browse_dir/nested/deeper"
+printf 'browse source\n' > "$browse_dir/source"
+printf 'child content\n' > "$browse_dir/nested/child.txt"
+printf 'leaf content\n' > "$browse_dir/nested/deeper/leaf.txt"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o
+' "$browse_dir/source" > "$out"
+grep -q 'child.txt' "$out"
+grep -q 'deeper/' "$out"
+grep -q 'cursor:1:51' "$out"
+[ "$(grep -c '\*find.completions\*' "$out")" = 1 ]
+python3 ./tui_view.py 12:100 '^x^f<tab><click:51:1><click:51:1>' "$browse_dir/source" > "$out"
+grep -q 'child.txt' "$out"
+grep -q 'cursor:1:51' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o
+
+' "$browse_dir/source" > "$out"
+grep -q 'leaf.txt' "$out"
+grep -q 'cursor:1:51' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o
+
+
+' "$browse_dir/source" > "$out"
+grep -q 'leaf.content' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><click:51:1><click:51:1><click:51:1><click:51:1>' "$browse_dir/source" > "$out"
+grep -q 'leaf.content' "$out"
+# Empty directories retain the candidate pane too.
+mkdir "$browse_dir/nested/deeper/empty"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o
+
+
+' "$browse_dir/source" > "$out"
+grep -q '\*find.completions\*' "$out"
+grep -q 'cursor:1:51' "$out"
+python3 ./tui_view.py 12:100 '^x^f<tab><c-x>o
+^g' "$browse_dir/source" > "$out"
+if grep -q '\*find.completions\*' "$out"; then exit 1; fi
 
 printf '%s\n' "$dir/b" > "$recent"
 printf 'alpha\n' > "$dir/a"

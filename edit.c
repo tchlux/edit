@@ -144,6 +144,9 @@ typedef struct {
   bool dirty;
   bool read_only;
   int kind;
+  int find_group_columns;
+  int find_dir_width;
+  int find_file_width;
   char * base;
   size_t base_len;
   edit_comment comments[COMMENT_MAX];
@@ -161,8 +164,9 @@ typedef struct {
   size_t preferred_col;
   size_t mark;
   int recenter;
+  int help_return_buffer;
   bool mark_active;
-  bool wrap;
+  int wrap; // 0: overflow, 1: characters, 2: words
 } pane;
 
 typedef struct {
@@ -863,7 +867,9 @@ static size_t line_start(buffer * b, size_t pos) {
 
 static size_t line_end(buffer * b, size_t pos) {
   size_t len = buffer_len(b);
-  while ((pos < len) && (buffer_at(b, pos) != '\n')) pos++;
+  if (b->kind == BUFFER_FIND) pos = line_start(b, pos);
+  while (pos < len && buffer_at(b, pos) != '\n' &&
+         (b->kind != BUFFER_FIND || buffer_at(b, pos) != '\t')) pos++;
   return pos;
 }
 
@@ -1460,6 +1466,7 @@ static int selected_buffer(edit_state * e);
 static pane_rect pane_area(edit_state * e, int i);
 static int split_pane(edit_state * e, int layout);
 static int cmd_close_pane(edit_state * e, int key);
+static int cmd_insert(edit_state * e, int key);
 static void refresh_buffer_list(edit_state * e);
 static bool prompt_footer_cursor(edit_state * e);
 static bool prompt_region_range(edit_state * e, prompt_slot * s,
@@ -1592,6 +1599,8 @@ static int switch_to_buffer(edit_state * e, int i) {
   save_pane_state(e);
   if (buffer_changed(&e->buffers[i]) && reload_buffer(&e->buffers[i]) != 0)
     return set_status(e, "open failed"), 0;
+  if (e->buffers[i].kind == BUFFER_HELP && active_buffer(e)->kind != BUFFER_HELP)
+    active_pane(e)->help_return_buffer = active_pane(e)->buffer;
   active_pane(e)->buffer = i;
   active_pane(e)->cursor = e->buffers[i].cursor;
   active_pane(e)->top = e->buffers[i].top;
@@ -1879,28 +1888,114 @@ static int largest_other_pane(edit_state * e) {
   return best;
 }
 
+// Group directories first, then sort candidate names alphabetically.
+static int find_candidate_order(const void * a, const void * b) {
+  const char * left = *(const char * const *) a;
+  const char * right = *(const char * const *) b;
+  const char * lt = strchr(left, '\t');
+  const char * rt = strchr(right, '\t');
+  bool ld = lt && lt > left && lt[-1] == '/';
+  bool rd = rt && rt > right && rt[-1] == '/';
+  return ld != rd ? (ld ? -1 : 1) : strcmp(left, right);
+}
+
+// Count displayed characters in a candidate label, excluding its stored path.
+static int find_label_width(const char * line) {
+  int width = 0;
+  for (; *line && *line != '\t'; line++)
+    if (((unsigned char) *line & 0xc0) != 0x80) width++;
+  return width;
+}
+
 static int show_find_completions(edit_state * e, output * paths) {
   int bnum = find_buffer(e);
   if (bnum < 0) {
     if (e->n_buffers >= 8) return set_status(e, "too many buffers"), 0;
     bnum = e->n_buffers++;
   }
-  if (buffer_set_text(&e->buffers[bnum], "*find completions*", BUFFER_FIND,
-                      paths->data ? paths->data : "") != 0)
-    return set_status(e, "completion failed"), 0;
+  // Keep full paths for selection, but display only the sorted names.
+  size_t count = 0;
+  for (size_t i = 0; i < paths->len; i++) if (paths->data[i] == '\n') count++;
+  char ** lines = malloc((count ? count : 1) * sizeof(*lines));
+  if (lines == NULL) return -1;
+  char * line = paths->data;
+  size_t at = 0;
+  for (size_t i = 0; i < paths->len; i++) if (paths->data[i] == '\n') {
+    paths->data[i] = '\0';
+    lines[at++] = line;
+    line = paths->data + i + 1;
+  }
+  qsort(lines, count, sizeof(*lines), find_candidate_order);
+  output sorted = {0};
+  for (size_t i = 0; i < count; i++) out_f(&sorted, "%s\n", lines[i]);
+  int rc = buffer_set_text(&e->buffers[bnum], "*find completions*", BUFFER_FIND,
+                           sorted.data ? sorted.data : "");
+  free(sorted.data);
+  if (rc != 0) return free(lines), set_status(e, "completion failed"), 0;
   e->buffers[bnum].read_only = true;
 
-  int target = (e->find_pane >= 0 && e->find_pane < e->n_panes &&
-                e->find_pane != e->active_pane) ?
+  int target = (e->find_pane >= 0 && e->find_pane < e->n_panes) ?
     e->find_pane : largest_other_pane(e);
   if (target < 0) {
     pane_rect r = pane_area(e, e->active_pane);
     int old = e->n_panes;
     split_pane(e, r.cols >= r.rows ? LAYOUT_COLS : LAYOUT_ROWS);
-    if (e->n_panes == old) return 0;
+    if (e->n_panes == old) return free(lines), 0;
     target = e->active_pane + 1;
     e->find_created_pane = true;
   }
+
+  // Use one column per group, or two per group only when all names fit.
+  size_t dirs = 0;
+  int dir_width = 2, file_width = 2;
+  for (size_t i = 0; i < count; i++) {
+    char * tab = strchr(lines[i], '\t');
+    bool dir = tab && tab > lines[i] && tab[-1] == '/';
+    int width = find_label_width(lines[i]) + 2;
+    if (dir) {
+      dirs++;
+      if (width > dir_width) dir_width = width;
+    } else if (width > file_width) file_width = width;
+  }
+  int available = pane_area(e, target).cols - 1;
+  int group_columns = dirs && dirs < count && dir_width + file_width <= available ? 1 : 0;
+  if (group_columns && 2 * (dir_width + file_width) <= available) group_columns = 2;
+  if (group_columns) {
+    size_t dir_rows = (dirs + group_columns - 1) / group_columns;
+    size_t file_rows = (count - dirs + group_columns - 1) / group_columns;
+    size_t rows = dir_rows > file_rows ? dir_rows : file_rows;
+    output grid = {0};
+    for (size_t row = 0; row < rows; row++) {
+      const char * entries[4] = {0};
+      for (int col = 0; col < 2 * group_columns; col++) {
+        bool dir = col < group_columns;
+        size_t index = dir ? (size_t) col * dir_rows + row :
+          dirs + (size_t) (col - group_columns) * file_rows + row;
+        bool present = dir ? row < dir_rows && index < dirs : row < file_rows && index < count;
+        const char * entry = present ? lines[index] : "";
+        entries[col] = entry;
+        const char * tab = strchr(entry, '\t');
+        size_t bytes = tab ? (size_t) (tab - entry) : 0;
+        out_add(&grid, entry, bytes);
+        int width = dir ? dir_width : file_width;
+        for (int n = find_label_width(entry); n < width; n++) out_s(&grid, " ");
+      }
+      // Store a path for each displayed cell so selection cannot confuse columns.
+      for (int col = 0; col < 2 * group_columns; col++) {
+        const char * tab = strchr(entries[col], '\t');
+        out_f(&grid, "\t%s", tab ? tab + 1 : "");
+      }
+      out_s(&grid, "\n");
+    }
+    rc = buffer_set_text(&e->buffers[bnum], "*find completions*", BUFFER_FIND, grid.data);
+    free(grid.data);
+    if (rc != 0) return free(lines), -1;
+  }
+  free(lines);
+  e->buffers[bnum].read_only = true;
+  e->buffers[bnum].find_group_columns = group_columns;
+  e->buffers[bnum].find_dir_width = dir_width;
+  e->buffers[bnum].find_file_width = file_width;
 
   e->find_pane = target;
   e->panes[target].buffer = bnum;
@@ -1909,9 +2004,9 @@ static int show_find_completions(edit_state * e, output * paths) {
   e->panes[target].left_col = 0;
   e->panes[target].preferred_col = SIZE_MAX;
   e->panes[target].mark_active = false;
-  e->active_pane = target;
+  e->panes[target].wrap = 0;
   refresh_buffer_list(e);
-  set_status(e, "find completions");
+  set_status(e, "find file: %s", e->find_path);
   return 0;
 }
 
@@ -1927,15 +2022,12 @@ static bool find_start_mkdir_prompt(edit_state * e, const char * path) {
   return true;
 }
 
-static int find_complete(edit_state * e) {
+static int find_complete(edit_state * e, bool complete) {
   char dir[DEBUG_PATH_SIZE];
   char prefix[DEBUG_PATH_SIZE];
   char base[DEBUG_PATH_SIZE];
   char match[DEBUG_PATH_SIZE] = "";
-  output dir_footer = {0};
-  output file_footer = {0};
-  output dir_paths = {0};
-  output file_paths = {0};
+  output paths = {0};
   int n = 0;
 
   char expanded[DEBUG_PATH_SIZE];
@@ -1944,7 +2036,13 @@ static int find_complete(edit_state * e) {
   path_parts(expanded, dir, prefix, base);
   bool regex = regex_path(base);
   DIR * d = opendir(dir);
-  if (d == NULL) return set_status(e, "no such directory"), 0;
+  if (d == NULL) {
+    if (! complete) {
+      output empty = {0};
+      show_find_completions(e, &empty);
+    }
+    return set_footer(e, "no such directory"), 0;
+  }
 
   for (struct dirent * ent = readdir(d); ent != NULL; ent = readdir(d)) {
     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
@@ -1953,37 +2051,20 @@ static int find_complete(edit_state * e) {
     else if (! regex) common_prefix(match, ent->d_name);
     char path[DEBUG_PATH_SIZE];
     snprintf(path, sizeof(path), "%s%s", prefix, ent->d_name);
-    bool is_dir = directory_path(path);
-    output * footer = is_dir ? &dir_footer : &file_footer;
-    output * paths = is_dir ? &dir_paths : &file_paths;
-    out_f(footer, "%s%s%s", footer->len ? " " : "", ent->d_name, is_dir ? "/" : "");
-    find_complete_line(paths, ent->d_name, path);
+    find_complete_line(&paths, ent->d_name, path);
     n++;
   }
   closedir(d);
 
-  output footer = {0};
-  output paths = {0};
-  out_s(&footer, dir_footer.data ? dir_footer.data : "");
-  if (dir_footer.len && file_footer.len) out_s(&footer, " ");
-  out_s(&footer, file_footer.data ? file_footer.data : "");
-  out_s(&paths, dir_paths.data ? dir_paths.data : "");
-  out_s(&paths, file_paths.data ? file_paths.data : "");
-  free(dir_footer.data);
-  free(file_footer.data);
-  free(dir_paths.data);
-  free(file_paths.data);
-
-  if (n == 0) {
-    free(footer.data);
+  if (! complete || n == 0) {
+    int rc = 0;
+    if (! complete || e->find_pane >= 0) rc = show_find_completions(e, &paths);
+    if (n == 0) set_footer(e, "no match");
     free(paths.data);
-    return set_footer(e, "no match"), 0;
+    return rc;
   }
   if (base[0] == '\0' || (regex && n > 1)) {
-    int rc = footer.len <= footer_message_cols(e) ?
-      (set_footer(e, "%s", footer.data ? footer.data : "empty directory"), 0) :
-      show_find_completions(e, &paths);
-    free(footer.data);
+    int rc = show_find_completions(e, &paths);
     free(paths.data);
     return rc;
   }
@@ -1993,13 +2074,12 @@ static int find_complete(edit_state * e) {
   if (n == 1 && directory_path(path) && strlen(path) + 1 < sizeof(path))
     strcat(path, "/");
   if (n > 1) {
-    if (footer.len <= footer_message_cols(e)) set_footer(e, "%s", footer.data);
-    else show_find_completions(e, &paths);
+    show_find_completions(e, &paths);
   }
   find_set(e, path);
   set_status(e, "find file: %s", e->find_path);
-  free(footer.data);
   free(paths.data);
+  if (e->find_pane >= 0) return find_complete(e, false);
   return 0;
 }
 
@@ -2014,11 +2094,27 @@ static void load_grammar(edit_state * e) {
   }
 }
 
+// Interrupt input so the next frame uses the resized terminal dimensions.
+static void window_resized(int signum) {
+  (void) signum;
+}
+
 static void get_window_size(edit_state * e) {
   struct winsize ws;
   if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+    bool resized = e->cols != ws.ws_col;
+    if (resized)
+      for (int i = 0; i < e->n_panes; i++)
+        if (e->panes[i].wrap)
+          e->panes[i].top = line_start(pane_buffer(e, &e->panes[i]), e->panes[i].top);
     e->rows = ws.ws_row;
     e->cols = ws.ws_col;
+    if (resized && e->find_prompt && e->find_pane >= 0) {
+      int active = e->active_pane;
+      e->active_pane = e->find_origin_pane;
+      find_complete(e, false);
+      e->active_pane = active;
+    }
   } else {
     e->rows = 24;
     e->cols = 80;
@@ -2271,10 +2367,13 @@ static size_t pane_wrap_width(edit_state * e, pane * p) {
   return (cols > 1) ? (size_t) cols - 1 : 1;
 }
 
-static size_t visual_row_end(edit_state * e, buffer * b, size_t pos, size_t width,
+static size_t visual_row_end(edit_state * e, pane * p, size_t pos, size_t width,
                              bool * full, bool * newline) {
+  buffer * b = pane_buffer(e, p);
   size_t len = buffer_len(b);
   size_t shown = 0;
+  size_t row_start = pos;
+  size_t boundary = pos;
   size_t col = visual_col(e, b, line_start(b, pos), pos);
   *full = false;
   *newline = false;
@@ -2284,6 +2383,15 @@ static size_t visual_row_end(edit_state * e, buffer * b, size_t pos, size_t widt
     shown += (w > width - shown) ? width - shown : w;
     col += w;
     pos += bytes;
+    if (isspace((unsigned char) buffer_at(b, pos - 1))) boundary = pos;
+  }
+  // Break after whitespace when the next character continues a word.
+  if (p->wrap == 2 && pos < len && buffer_at(b, pos) != '\n' &&
+      ! isspace((unsigned char) buffer_at(b, pos)) && boundary > row_start &&
+      boundary < pos) {
+    pos = boundary;
+    *full = true;
+    return pos;
   }
   *full = shown == width;
   if (pos < len && buffer_at(b, pos) == '\n') {
@@ -2293,10 +2401,10 @@ static size_t visual_row_end(edit_state * e, buffer * b, size_t pos, size_t widt
   return pos;
 }
 
-static size_t visual_row_next(edit_state * e, buffer * b, size_t pos, size_t width) {
+static size_t visual_row_next(edit_state * e, pane * p, size_t pos, size_t width) {
   bool full;
   bool newline;
-  return visual_row_end(e, b, pos, width, &full, &newline);
+  return visual_row_end(e, p, pos, width, &full, &newline);
 }
 
 static bool visual_row_before_cursor(size_t next, size_t cursor,
@@ -2304,10 +2412,10 @@ static bool visual_row_before_cursor(size_t next, size_t cursor,
   return next < cursor || (next == cursor && (full || newline));
 }
 
-static size_t visual_row_prev(edit_state * e, buffer * b, size_t pos, size_t width) {
+static size_t visual_row_prev(edit_state * e, pane * p, size_t pos, size_t width) {
   size_t prev = 0;
   for (size_t row = 0; row < pos;) {
-    size_t next = visual_row_next(e, b, row, width);
+    size_t next = visual_row_next(e, p, row, width);
     if (next >= pos) return row;
     if (next <= row) return prev;
     prev = row;
@@ -2316,12 +2424,13 @@ static size_t visual_row_prev(edit_state * e, buffer * b, size_t pos, size_t wid
   return prev;
 }
 
-static size_t visual_row_at_cursor(edit_state * e, buffer * b, size_t cursor, size_t width) {
+static size_t visual_row_at_cursor(edit_state * e, pane * p, size_t cursor, size_t width) {
+  buffer * b = pane_buffer(e, p);
   size_t row = line_start(b, cursor);
   while (row < cursor) {
     bool full;
     bool newline;
-    size_t next = visual_row_end(e, b, row, width, &full, &newline);
+    size_t next = visual_row_end(e, p, row, width, &full, &newline);
     if (next <= row || ! visual_row_before_cursor(next, cursor, full, newline)) break;
     row = next;
   }
@@ -2333,9 +2442,16 @@ static size_t visual_row_column(edit_state * e, buffer * b, size_t row, size_t p
     visual_col(e, b, line_start(b, row), row);
 }
 
-static size_t visual_row_column_pos(edit_state * e, buffer * b, size_t row, size_t col) {
-  return visual_column_pos(e, b, line_start(b, row),
-                           visual_col(e, b, line_start(b, row), row) + col);
+static size_t visual_row_column_pos(edit_state * e, pane * p, size_t row, size_t col) {
+  buffer * b = pane_buffer(e, p);
+  size_t pos = visual_column_pos(e, b, line_start(b, row),
+                                 visual_col(e, b, line_start(b, row), row) + col);
+  if (p->wrap == 2) {
+    bool full, newline;
+    size_t end = visual_row_end(e, p, row, pane_wrap_width(e, p), &full, &newline);
+    if (pos >= end && end > row && (full || newline)) pos = utf8_prev_pos(b, end);
+  }
+  return pos;
 }
 
 static int file_rows_from(buffer * b, size_t top) {
@@ -2350,13 +2466,14 @@ static int file_rows_from(buffer * b, size_t top) {
   return rows;
 }
 
-static int visual_rows_from(edit_state * e, buffer * b, size_t top, size_t width) {
+static int visual_rows_from(edit_state * e, pane * p, size_t top, size_t width) {
+  buffer * b = pane_buffer(e, p);
   size_t len = buffer_len(b);
   int rows = 0;
   if (len == 0) return 1;
   while (top < len) {
     rows++;
-    size_t next = visual_row_next(e, b, top, width);
+    size_t next = visual_row_next(e, p, top, width);
     if (next <= top) break;
     top = next;
   }
@@ -2377,16 +2494,16 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
       while (pos < cursor && row < body_rows) {
         bool full;
         bool newline;
-        size_t next = visual_row_end(e, b, pos, width, &full, &newline);
+        size_t next = visual_row_end(e, p, pos, width, &full, &newline);
         if (next <= pos || ! visual_row_before_cursor(next, cursor, full, newline)) break;
         row++;
         pos = next;
       }
       if (row < body_rows) break;
-      p->top = visual_row_next(e, b, p->top, width);
+      p->top = visual_row_next(e, p, p->top, width);
     }
-    while (p->top > 0 && visual_rows_from(e, b, p->top, width) < body_rows)
-      p->top = visual_row_prev(e, b, p->top, width);
+    while (p->top > 0 && visual_rows_from(e, p, p->top, width) < body_rows)
+      p->top = visual_row_prev(e, p, p->top, width);
     p->left_col = 0;
     return;
   }
@@ -2425,7 +2542,7 @@ static int pane_at(edit_state * e, int row, int col, pane_rect rects[PANE_MAX]) 
 }
 
 static int mouse_click(edit_state * e, key_event * ev) {
-  if (prompt_footer_cursor(e)) return 0;
+  if (prompt_footer_cursor(e) && ! e->find_prompt) return 0;
   pane_rect rects[PANE_MAX];
   pane_rects(e, rects);
   int i = pane_at(e, ev->mouse_row, ev->mouse_col, rects);
@@ -2434,6 +2551,7 @@ static int mouse_click(edit_state * e, key_event * ev) {
   int local_row = ev->mouse_row - rects[i].row;
   if (local_row < 0 || local_row >= body_rows) return 0;
 
+  bool select = e->active_pane == i && pane_buffer(e, &e->panes[i])->kind == BUFFER_FIND;
   save_pane_state(e);
   e->active_pane = i;
   pane * p = active_pane(e);
@@ -2441,17 +2559,18 @@ static int mouse_click(edit_state * e, key_event * ev) {
   size_t pos = p->top;
   size_t width = pane_wrap_width(e, p);
   for (int row = 0; row < local_row; row++)
-    pos = p->wrap ? visual_row_next(e, b, pos, width) : next_line(b, pos);
+    pos = p->wrap ? visual_row_next(e, p, pos, width) : next_line(b, pos);
 
   size_t start = line_start(b, pos);
   size_t col = (size_t) (ev->mouse_col - rects[i].col);
   if (p->wrap) col += visual_col(e, b, start, pos);
   else col += p->left_col;
-  p->cursor = visual_column_pos(e, b, start, col);
+  p->cursor = p->wrap == 2 ? visual_row_column_pos(e, p, pos, col - visual_col(e, b, start, pos)) :
+    visual_column_pos(e, b, start, col);
   p->preferred_col = SIZE_MAX;
   p->mark_active = false;
   refresh_buffer_list(e);
-  return 0;
+  return select ? cmd_insert(e, KEY_ENTER) : 0;
 }
 
 static int pane_cursor_row(edit_state * e, pane * p, int body_rows);
@@ -2465,10 +2584,10 @@ static void scroll_line_move(edit_state * e, int direction) {
   int mid = body_rows / 2;
 
   if (direction < 0 && row < mid && p->top > 0)
-    p->top = p->wrap ? visual_row_prev(e, b, p->top, pane_wrap_width(e, p)) : prev_line(b, p->top);
+    p->top = p->wrap ? visual_row_prev(e, p, p->top, pane_wrap_width(e, p)) : prev_line(b, p->top);
   else if (direction > 0 && row > mid) {
-    size_t top = p->wrap ? visual_row_next(e, b, p->top, pane_wrap_width(e, p)) : next_line(b, p->top);
-    int rows = p->wrap ? visual_rows_from(e, b, top, pane_wrap_width(e, p)) : file_rows_from(b, top);
+    size_t top = p->wrap ? visual_row_next(e, p, p->top, pane_wrap_width(e, p)) : next_line(b, p->top);
+    int rows = p->wrap ? visual_rows_from(e, p, top, pane_wrap_width(e, p)) : file_rows_from(b, top);
     if (top != p->top && rows >= body_rows) p->top = top;
   }
 }
@@ -2624,19 +2743,26 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
   size_t row_start = *pos;
   size_t start = p->wrap ? line_start(b, row_start) : row_start;
   size_t read = start;
+  bool full, newline;
+  size_t row_end = p->wrap ? visual_row_end(e, p, row_start, limit, &full, &newline) : buffer_len(b);
 
   while ((read < buffer_len(b)) && (buffer_at(b, read) != '\n')) {
     if (n + 1 < sizeof(line)) line[n++] = buffer_at(b, read);
     read++;
   }
   line[n] = '\0';
+  if (b->kind == BUFFER_FIND) {
+    char * tab = strchr(line, '\t');
+    if (tab) n = (size_t) (tab - line);
+    line[n] = '\0';
+  }
 
   grammar_span spans[GRAMMAR_MAX_SPANS];
   if (e->has_grammar && e->grammar.is_default) {
     e->grammar.triple_quote = triple_quote_before(b, start);
     e->grammar.markdown_fence = markdown_fence_before(b, start);
   }
-  int n_spans = e->has_grammar ?
+  int n_spans = e->has_grammar && b->kind != BUFFER_FIND ?
     grammar_highlight(&e->grammar, b->path, line, n, spans, GRAMMAR_MAX_SPANS) : 0;
   int span = 0;
   const char * color = NULL;
@@ -2649,7 +2775,7 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
   size_t shown = 0;
   size_t i = row_start - start;
   if (p->wrap) col = visual_col(e, b, start, row_start);
-  for (; i < n && shown < limit;) {
+  for (; i < n && start + i < row_end && shown < limit;) {
     track_atom * deleted = deleted_at(b, start + i);
     if (deleted != NULL) {
       render_span_sgr(e, o, DELETE_SGR, 0);
@@ -2676,6 +2802,11 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
     else if (suggested_byte(b, start + i)) sgr = CHANGE_SGR;
     else if (comment_byte(b, start + i, p->cursor) == 2) sgr = COMMENT_ACTIVE_SGR;
     else if (comment_byte(b, start + i, p->cursor) == 1) sgr = COMMENT_SGR;
+    else if (b->kind == BUFFER_FIND) {
+      bool dir = b->find_group_columns ? col < (size_t) b->find_dir_width * b->find_group_columns :
+        n && line[n - 1] == '/';
+      sgr = dir ? "38;2;110;195;240" : "38;2;224;224;224";
+    }
     else if (span < n_spans && i >= spans[span].start) {
       sgr = spans[span].sgr;
       new_attr = spans[span].attr;
@@ -2705,8 +2836,7 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
   }
   if (color != NULL || attr != 0) render_base_sgr(e, o);
   if (p->wrap) {
-    *pos = start + i;
-    if (*pos < buffer_len(b) && buffer_at(b, *pos) == '\n') (*pos)++;
+    *pos = row_end;
   } else {
     *pos = read;
     if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
@@ -2730,7 +2860,7 @@ static int pane_position_row(edit_state * e, pane * p, size_t target, int body_r
     while (row_pos < target && cy < body_rows) {
       bool full;
       bool newline;
-      size_t next = visual_row_end(e, b, row_pos, width, &full, &newline);
+      size_t next = visual_row_end(e, p, row_pos, width, &full, &newline);
       if (next <= row_pos || ! visual_row_before_cursor(next, target, full, newline)) break;
       row_pos = next;
       cy++;
@@ -2755,7 +2885,7 @@ static size_t pane_cursor_col(edit_state * e, pane * p) {
   size_t limit = (cols > 1) ? (size_t) cols - 2 : 0;
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
     cx = visual_row_column(e, b, row, p->cursor);
     return (cx > limit) ? limit : cx;
   }
@@ -2930,7 +3060,7 @@ static void render_modeline(edit_state * e, output * o, pane * p,
   if (b->dirty) out_clip(o, " *", &used, status_cols);
   if (b->suggested) out_clip(o, " Suggested", &used, status_cols);
   if (read_only_buffer(b)) out_clip(o, " RO", &used, status_cols);
-  if (p->wrap) out_clip(o, " Wrap", &used, status_cols);
+  if (p->wrap) out_clip(o, p->wrap == 2 ? " WordWrap" : " Wrap", &used, status_cols);
   if (active && e->n_panes > 1) out_clip(o, " >", &used, status_cols);
   while (used++ < status_cols) out_s(o, " ");
 }
@@ -3287,9 +3417,12 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, pane * p, size
                           size_t skip, int cursor_row, size_t cursor_col, int row) {
   size_t limit = (e->cols > 1) ? (size_t) e->cols - 1 : 1;
   size_t row_start = *pos;
+  bool full, newline;
+  size_t row_end = p->wrap ? visual_row_end(e, p, row_start, limit, &full, &newline) : buffer_len(b);
   size_t col = p->wrap ? visual_col(e, b, line_start(b, row_start), row_start) : 0;
   size_t shown = 0;
-  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') &&
+  while ((*pos < row_end) && (buffer_at(b, *pos) != '\n') &&
+         (b->kind != BUFFER_FIND || buffer_at(b, *pos) != '\t') &&
          shown < limit) {
     char c = buffer_at(b, *pos);
     size_t bytes = utf8_len_at(b, *pos, buffer_len(b));
@@ -3315,7 +3448,8 @@ static void snapshot_line(edit_state * e, output * o, buffer * b, pane * p, size
   if ((row == cursor_row) && (shown == cursor_col)) out_s(o, "|");
   if (! p->wrap)
     while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
-  if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
+  if (p->wrap) *pos = row_end;
+  else if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
 
 static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
@@ -3323,9 +3457,12 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
                           int row, int cols) {
   size_t limit = (cols > 1) ? (size_t) cols - 1 : 1;
   size_t row_start = *pos;
+  bool full, newline;
+  size_t row_end = p->wrap ? visual_row_end(e, p, row_start, limit, &full, &newline) : buffer_len(b);
   size_t col = p->wrap ? visual_col(e, b, line_start(b, row_start), row_start) : 0;
   size_t shown = 0;
-  while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n') && shown < limit) {
+  while ((*pos < row_end) && (buffer_at(b, *pos) != '\n') &&
+         (b->kind != BUFFER_FIND || buffer_at(b, *pos) != '\t') && shown < limit) {
     char c = buffer_at(b, *pos);
     size_t bytes = utf8_len_at(b, *pos, buffer_len(b));
     size_t width = char_width(e, b, *pos, col);
@@ -3357,7 +3494,8 @@ static void snapshot_cell(edit_state * e, output * o, buffer * b, size_t * pos,
   while (shown++ < limit) out_s(o, " ");
   if (! p->wrap)
     while ((*pos < buffer_len(b)) && (buffer_at(b, *pos) != '\n')) (*pos)++;
-  if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
+  if (p->wrap) *pos = row_end;
+  else if ((*pos < buffer_len(b)) && (buffer_at(b, *pos) == '\n')) (*pos)++;
 }
 
 static void snapshot_modeline(edit_state * e, output * o, pane * p,
@@ -3368,7 +3506,7 @@ static void snapshot_modeline(edit_state * e, output * o, pane * p,
   out_clip(o, file_name(b->path), &used, limit);
   if (b->dirty) out_clip(o, "*", &used, limit);
   if (read_only_buffer(b)) out_clip(o, " RO", &used, limit);
-  if (p->wrap) out_clip(o, " Wrap", &used, limit);
+  if (p->wrap) out_clip(o, p->wrap == 2 ? " WordWrap" : " Wrap", &used, limit);
   modeline_pos(o, b, p, &used, limit);
   if (active && e->n_panes > 1) out_clip(o, ">", &used, limit);
   if (cols > 1) while (used++ < limit) out_s(o, " ");
@@ -3763,7 +3901,9 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
 static int cmd_left(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor > 0) p->cursor = utf8_prev_pos(b, p->cursor);
+  if (b->kind == BUFFER_FIND && p->cursor > 0 && p->cursor == line_start(b, p->cursor))
+    p->cursor = line_end(b, prev_line(b, p->cursor));
+  else if (p->cursor > 0) p->cursor = utf8_prev_pos(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -3772,7 +3912,9 @@ static int cmd_left(edit_state * e, int key) {
 static int cmd_right(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  if (p->cursor < buffer_len(b)) p->cursor = utf8_next_pos(b, p->cursor);
+  if (b->kind == BUFFER_FIND && p->cursor == line_end(b, p->cursor))
+    p->cursor = next_line(b, p->cursor);
+  else if (p->cursor < buffer_len(b)) p->cursor = utf8_next_pos(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -3783,10 +3925,10 @@ static int cmd_up(edit_state * e, int key) {
   pane * p = active_pane(e);
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
     if (p->preferred_col == SIZE_MAX)
       p->preferred_col = visual_row_column(e, b, row, p->cursor);
-    p->cursor = visual_row_column_pos(e, b, visual_row_prev(e, b, row, width),
+    p->cursor = visual_row_column_pos(e, p, visual_row_prev(e, p, row, width),
                                       p->preferred_col);
     scroll_line_move(e, -1);
     (void) key;
@@ -3806,11 +3948,11 @@ static int cmd_down(edit_state * e, int key) {
   pane * p = active_pane(e);
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, b, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
     if (p->preferred_col == SIZE_MAX)
       p->preferred_col = visual_row_column(e, b, row, p->cursor);
-    size_t next = visual_row_next(e, b, row, width);
-    if (next > row) p->cursor = visual_row_column_pos(e, b, next, p->preferred_col);
+    size_t next = visual_row_next(e, p, row, width);
+    if (next > row) p->cursor = visual_row_column_pos(e, p, next, p->preferred_col);
     scroll_line_move(e, 1);
     (void) key;
     return 0;
@@ -3903,7 +4045,11 @@ static size_t word_back(buffer * b, size_t pos) {
 
 static int cmd_word_forward(edit_state * e, int key) {
   pane * p = active_pane(e);
-  p->cursor = word_forward(active_buffer(e), p->cursor);
+  buffer * b = active_buffer(e);
+  size_t end = line_end(b, p->cursor);
+  p->cursor = b->kind == BUFFER_FIND && p->cursor == end ? next_line(b, p->cursor) :
+    word_forward(b, p->cursor);
+  if (b->kind == BUFFER_FIND && p->cursor > end && p->cursor < next_line(b, end)) p->cursor = end;
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -3911,7 +4057,10 @@ static int cmd_word_forward(edit_state * e, int key) {
 
 static int cmd_word_back(edit_state * e, int key) {
   pane * p = active_pane(e);
-  p->cursor = word_back(active_buffer(e), p->cursor);
+  buffer * b = active_buffer(e);
+  p->cursor = word_back(b, p->cursor);
+  if (b->kind == BUFFER_FIND && p->cursor > line_end(b, p->cursor))
+    p->cursor = line_end(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -3933,7 +4082,8 @@ static int cmd_recenter(edit_state * e, int key) {
 static int cmd_line_start(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  p->cursor = line_start(b, p->cursor);
+  p->cursor = p->wrap ? visual_row_at_cursor(e, p, p->cursor, pane_wrap_width(e, p)) :
+    line_start(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -3942,8 +4092,37 @@ static int cmd_line_start(edit_state * e, int key) {
 static int cmd_line_end(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  p->cursor = line_end(b, p->cursor);
+  if (p->wrap) {
+    size_t row = visual_row_at_cursor(e, p, p->cursor, pane_wrap_width(e, p));
+    bool full, newline;
+    size_t end = visual_row_end(e, p, row, pane_wrap_width(e, p), &full, &newline);
+    p->cursor = end > row && (full || newline) ? utf8_prev_pos(b, end) : end;
+  } else p->cursor = line_end(b, p->cursor);
   p->preferred_col = SIZE_MAX;
+  (void) key;
+  return 0;
+}
+
+// Swap adjacent UTF-8 characters in one undo group, backing up at line end.
+static int cmd_transpose(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  if (read_only_buffer(b)) return set_status(e, "read only"), 0;
+  size_t middle = p->cursor;
+  if (middle > 0 && middle == line_end(b, middle)) middle = utf8_prev_pos(b, middle);
+  if (middle == 0 || middle == buffer_len(b)) return set_status(e, "need two characters"), 0;
+  size_t start = utf8_prev_pos(b, middle);
+  size_t end = utf8_next_pos(b, middle);
+  char text[8];
+  size_t n = 0;
+  for (size_t i = middle; i < end; i++) text[n++] = buffer_at(b, i);
+  for (size_t i = start; i < middle; i++) text[n++] = buffer_at(b, i);
+  unsigned group = ++b->history_group;
+  if (edit_delete(e, start, end, group, true) != 0 ||
+      edit_insert(e, start, text, n, group, true) != 0) return -1;
+  p->cursor = end;
+  p->preferred_col = SIZE_MAX;
+  clear_mark(e);
   (void) key;
   return 0;
 }
@@ -4021,6 +4200,61 @@ static int cmd_mark(edit_state * e, int key) {
   p->mark_active = true;
   set_status(e, "mark");
   (void) key;
+  return 0;
+}
+
+static int cmd_select_all(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  p->mark = buffer_len(active_buffer(e));
+  p->mark_active = true;
+  p->cursor = p->top = p->left_col = 0;
+  p->preferred_col = SIZE_MAX;
+  set_status(e, "selected all");
+  (void) key;
+  return 0;
+}
+
+// Uppercase the remainder of the next word as one undoable edit.
+static int cmd_upper_word(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  if (read_only_buffer(b)) return set_status(e, "read only"), 0;
+  size_t start = p->cursor;
+  while (start < buffer_len(b) && ! word_byte(b, start)) start++;
+  size_t end = start;
+  while (end < buffer_len(b) && word_byte(b, end)) end++;
+  size_t len = end - start;
+  char * text = malloc(len ? len : 1);
+  if (text == NULL) return -1;
+  bool changed = false;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char) buffer_at(b, start + i);
+    text[i] = (char) toupper(c);
+    changed |= text[i] != (char) c;
+  }
+  int rc = 0;
+  if (changed) {
+    unsigned group = ++b->history_group;
+    rc = edit_delete(e, start, end, group, true);
+    if (rc == 0) rc = edit_insert(e, start, text, len, group, true);
+  }
+  free(text);
+  if (rc != 0) return rc;
+  p->cursor = end;
+  p->preferred_col = SIZE_MAX;
+  clear_mark(e);
+  (void) key;
+  return 0;
+}
+
+// Ask the app-owned terminal to resize its font and grid.
+static int cmd_font_size(edit_state * e, int key) {
+  if (getenv("EDIT_APP") == NULL) return set_status(e, "font sizing requires Edit.app"), 0;
+  int action = key == '+' || key == '=' ? 1 : key == '-' || key == '_' ? 2 : 0;
+  char seq[24];
+  int n = snprintf(seq, sizeof(seq), "\033[777;%dt", action);
+  write(STDOUT_FILENO, seq, (size_t) n);
+  set_status(e, "font %s", action == 1 ? "larger" : action == 2 ? "smaller" : "reset");
   return 0;
 }
 
@@ -4123,27 +4357,37 @@ static int cmd_insert(edit_state * e, int key) {
     buffer * b = active_buffer(e);
     pane * p = active_pane(e);
     size_t start = line_start(b, p->cursor);
-    size_t end = line_end(b, p->cursor);
+    size_t end = next_line(b, start);
+    if (end > start && buffer_at(b, end - 1) == '\n') end--;
+    int column = 0;
+    if (b->find_group_columns) {
+      size_t col = visual_col(e, b, start, p->cursor);
+      size_t dir_cols = (size_t) b->find_dir_width * b->find_group_columns;
+      column = col < dir_cols ? (int) (col / b->find_dir_width) :
+        b->find_group_columns + (int) ((col - dir_cols) / b->find_file_width);
+      if (column >= 2 * b->find_group_columns) column = 2 * b->find_group_columns - 1;
+    }
+    for (int field = 0; field <= column; field++) {
+      while (start < end && buffer_at(b, start) != '\t') start++;
+      if (start < end) start++;
+    }
+    size_t stop = start;
+    while (stop < end && buffer_at(b, stop) != '\t') stop++;
     char path[DEBUG_PATH_SIZE];
-    size_t n = end - start;
+    size_t n = stop - start;
     if (n >= sizeof(path)) n = sizeof(path) - 1;
     for (size_t i = 0; i < n; i++) path[i] = buffer_at(b, start + i);
     path[n] = '\0';
-    char * tab = strchr(path, '\t');
-    if (tab != NULL) memmove(path, tab + 1, strlen(tab + 1) + 1);
     if (path[0] == '\0') return set_status(e, "no file"), 0;
-    bool dir = directory_path(path);
-    e->find_prompt = false;
-    if (e->find_created_pane) find_close_created_pane(e);
-    else if (dir && e->find_origin_pane >= 0 && e->find_origin_pane < e->n_panes)
-      e->active_pane = e->find_origin_pane;
-    if (dir) {
+    if (directory_path(path)) {
       if (strlen(path) + 1 < sizeof(path) && path[strlen(path) - 1] != '/') strcat(path, "/");
       find_set(e, path);
-      e->find_origin_pane = e->active_pane;
       e->find_prompt = true;
-      return set_status(e, "find file: %s", e->find_path), 0;
+      e->find_pane = e->active_pane;
+      return find_complete(e, false);
     }
+    e->find_prompt = false;
+    find_close_created_pane(e);
     return switch_to_path(e, path);
   }
   if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
@@ -4665,9 +4909,11 @@ static int cmd_toggle_read_only(edit_state * e, int key) {
 
 static int cmd_toggle_wrap(edit_state * e, int key) {
   pane * p = active_pane(e);
-  p->wrap = ! p->wrap;
+  p->wrap = (p->wrap + 1) % 3;
+  p->top = line_start(active_buffer(e), p->top);
+  p->preferred_col = SIZE_MAX;
   if (p->wrap) p->left_col = 0;
-  set_status(e, "wrap %s", p->wrap ? "on" : "off");
+  set_status(e, "wrap %s", p->wrap == 2 ? "words" : p->wrap ? "characters" : "off");
   (void) key;
   return 0;
 }
@@ -5140,8 +5386,11 @@ static int cmd_kill_buffer(edit_state * e, int key) {
           (size_t) (e->n_buffers - dead - 1) * sizeof(buffer));
   e->n_buffers--;
   memset(&e->buffers[e->n_buffers], 0, sizeof(buffer));
-  for (int i = 0; i < e->n_panes; i++)
+  for (int i = 0; i < e->n_panes; i++) {
+    if (e->panes[i].help_return_buffer == dead) e->panes[i].help_return_buffer = next;
+    if (e->panes[i].help_return_buffer > dead) e->panes[i].help_return_buffer--;
     if (e->panes[i].buffer > dead) e->panes[i].buffer--;
+  }
   set_status(e, "killed");
   refresh_buffer_list(e);
   return 0;
@@ -5385,6 +5634,12 @@ static int goto_submit(edit_state * e) {
 
 static int cmd_cancel(edit_state * e, int key) {
   input_clear(e);
+  if (active_buffer(e)->kind == BUFFER_HELP) {
+    e->find_mkdir_prompt = false;
+    int previous = active_pane(e)->help_return_buffer;
+    if (e->buffers[previous].kind == BUFFER_HELP) previous = ensure_scratch(e);
+    switch_to_buffer(e, previous);
+  }
   if (e->find_mkdir_prompt) {
     e->find_mkdir_prompt = false;
     e->find_prompt = true;
@@ -5561,7 +5816,7 @@ static const char HELP_TEXT[] =
   "Movement\n"
   "  Arrow keys, C-b, C-f, C-p, C-n  move by character or line\n"
   "  Esc f, Esc b                      move by word\n"
-  "  C-a, C-e                          line start and end\n"
+  "  C-a, C-e                          line start and end (visible when wrapped)\n"
   "  C-v, Esc v                        page down and up\n"
   "  Esc n, Esc p                      move 10 lines down and up\n"
   "  Esc <, Esc >                      file start and end\n"
@@ -5574,6 +5829,10 @@ static const char HELP_TEXT[] =
   "  C-d, Esc d                        delete next character or word\n"
   "  C-k                               cut to end of line\n"
   "  C-o                               insert newline after point\n"
+  "  C-t                               transpose characters\n"
+  "  C-x C-p                           select all\n"
+  "  Esc U                             uppercase word forward\n"
+  "  C-x +, C-x _, C-x )               larger, smaller, default font (app)\n"
   "  C-space, C-w, Esc w               mark, cut region, copy region\n"
   "  C-y, Esc y                        paste clipboard/kill, cycle paste\n"
   "  C-q                               insert next key literally\n"
@@ -5581,7 +5840,7 @@ static const char HELP_TEXT[] =
   "  C-x r                             redo\n"
   "  C-c x                             run shell command\n"
   "  C-c C-r                           toggle read only\n"
-  "  C-c C-w                           toggle visual wrap\n"
+  "  C-c C-w                           cycle overflow / character / word wrap\n"
   "  C-c e                             start suggested changes\n"
   "  C-c c, C-c d                      create and delete comment\n"
   "  C-c ]                             show or hide comments\n"
@@ -5618,6 +5877,7 @@ static const char HELP_TEXT[] =
 static int cmd_help(edit_state * e, int key) {
   int h = help_buffer(e);
   (void) key;
+  e->prefix = 0;
   e->find_prompt = false;
   e->run_prompt = false;
   e->goto_prompt = false;
@@ -5630,6 +5890,7 @@ static int cmd_help(edit_state * e, int key) {
   }
   if (buffer_set_text(&e->buffers[h], "*help*", BUFFER_HELP, HELP_TEXT) != 0)
     return set_status(e, "help failed"), 0;
+  if (active_pane(e)->buffer != h) active_pane(e)->help_return_buffer = active_pane(e)->buffer;
   save_pane_state(e);
   active_pane(e)->buffer = h;
   active_pane(e)->cursor = 0;
@@ -5667,6 +5928,8 @@ static binding bindings[] = {
   {{KEY_CTRL('v'), 0}, 1, cmd_page_down},
   {{KEY_META('b'), 0}, 1, cmd_word_back},
   {{KEY_META('f'), 0}, 1, cmd_word_forward},
+  {{KEY_META('U'), 0}, 1, cmd_upper_word},
+  {{KEY_META('u'), 0}, 1, cmd_upper_word},
   {{KEY_META('d'), 0}, 1, cmd_delete_word_forward},
   {{KEY_META(KEY_BACKSPACE), 0}, 1, cmd_delete_word_back},
   {{KEY_META('n'), 0}, 1, cmd_down_10},
@@ -5684,6 +5947,7 @@ static binding bindings[] = {
   {{KEY_CTRL('d'), 0}, 1, cmd_delete_next},
   {{KEY_CTRL('k'), 0}, 1, cmd_kill_line},
   {{KEY_CTRL('o'), 0}, 1, cmd_open_line},
+  {{KEY_CTRL('t'), 0}, 1, cmd_transpose},
   {{KEY_CTRL(' '), 0}, 1, cmd_mark},
   {{KEY_CTRL('w'), 0}, 1, cmd_cut_region},
   {{KEY_CTRL('y'), 0}, 1, cmd_yank},
@@ -5705,6 +5969,12 @@ static binding bindings[] = {
   {{KEY_CTRL('c'), KEY_CTRL('r')}, 2, cmd_toggle_read_only},
   {{KEY_CTRL('c'), KEY_CTRL('w')}, 2, cmd_toggle_wrap},
   {{KEY_CTRL('c'), 'x'}, 2, cmd_run},
+  {{KEY_CTRL('x'), KEY_CTRL('p')}, 2, cmd_select_all},
+  {{KEY_CTRL('x'), '+'}, 2, cmd_font_size},
+  {{KEY_CTRL('x'), '='}, 2, cmd_font_size},
+  {{KEY_CTRL('x'), '-'}, 2, cmd_font_size},
+  {{KEY_CTRL('x'), '_'}, 2, cmd_font_size},
+  {{KEY_CTRL('x'), ')'}, 2, cmd_font_size},
   {{KEY_CTRL('x'), '0'}, 2, cmd_close_pane},
   {{KEY_CTRL('x'), '1'}, 2, cmd_one_pane},
   {{KEY_CTRL('x'), '2'}, 2, cmd_split},
@@ -5723,10 +5993,10 @@ static binding bindings[] = {
 static int find_dispatch(edit_state * e, int key) {
   e->footer[0] = '\0';
   if (key == KEY_ENTER) return clear_prompt_mark(e), open_find_path(e);
-  if (key == KEY_CTRL('i')) return find_complete(e);
+  if (key == KEY_CTRL('i')) return find_complete(e, true);
   prompt_slot s = {"find file: ", e->find_path, &e->find_len,
                    &e->find_pos, sizeof(e->find_path)};
-  prompt_edit(e, &s, key);
+  if (prompt_edit(e, &s, key) && e->find_pane >= 0) find_complete(e, false);
   set_status(e, "find file: %s", e->find_path);
   return 0;
 }
@@ -5853,10 +6123,19 @@ static int dispatch(edit_state * e, int key) {
   int keys[2] = {key, 0};
   int n_keys = 1;
 
-  if (key == KEY_CTRL('g')) return action_other(e), cmd_cancel(e, key);
+  if (key == KEY_CTRL('g') || (key == KEY_ESC && active_buffer(e)->kind == BUFFER_HELP))
+    return action_other(e), cmd_cancel(e, key);
   if (key == KEY_CTRL('h')) return action_other(e), cmd_help(e, key);
   if (e->find_mkdir_prompt) return action_other(e), find_mkdir_dispatch(e, key);
-  if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND)
+  if (e->find_prompt && e->prefix == 0 && active_buffer(e)->kind == BUFFER_FIND &&
+      ((key >= 32 && key < 127) || key == KEY_BACKSPACE || key == KEY_PASTE_START ||
+       key == KEY_CTRL('i') || key == KEY_CTRL('y'))) {
+    save_pane_state(e);
+    e->active_pane = e->find_origin_pane;
+    return action_other(e), find_dispatch(e, key);
+  }
+  if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND &&
+      key != KEY_CTRL('x') && e->prefix != KEY_CTRL('x'))
     return action_other(e), find_dispatch(e, key);
   if (e->run_prompt) return action_other(e), run_dispatch(e, key);
   if (e->goto_prompt) return action_other(e), goto_dispatch(e, key);
@@ -5945,6 +6224,10 @@ static int tui(const char * path) {
     buffers_free(&e);
     return 1;
   }
+  struct sigaction resize_action = {0};
+  resize_action.sa_handler = window_resized;
+  sigemptyset(&resize_action.sa_mask);
+  sigaction(SIGWINCH, &resize_action, NULL);
   const char * start = "\x1b[?1049h\x1b[?1007h\x1b[?1000h\x1b[?1006h"
     "\x1b[?2004h\x1b[38;2;224;224;224m"
     "\x1b[48;2;32;32;32m\x1b[2 q\x1b[?12l";
@@ -5994,9 +6277,14 @@ static int tui(const char * path) {
       debug_stop_prompt(&e);
       action = "debug-stop";
     } else if (! e.debug_recording && key == KEY_ESC) {
-      e.prefix = KEY_ESC;
-      set_status(&e, "Esc");
-      action = "esc-prefix";
+      if (active_buffer(&e)->kind == BUFFER_HELP) {
+        dispatch(&e, key);
+        action = "help-cancel";
+      } else {
+        e.prefix = KEY_ESC;
+        set_status(&e, "Esc");
+        action = "esc-prefix";
+      }
     } else if (key == KEY_META('r')) {
       if (e.debug_log == NULL && debug_start(&e, path ? path : "*scratch*") == 0) {
         debug_log_key(&e, &ev, "before");

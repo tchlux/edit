@@ -50,7 +50,8 @@ with its own Dock icon and menu bar, but
 the editor itself still runs in an embedded pseudo-terminal.
 
 The modeline shows the file name and current `line:column`. The row below it
-shows built-in key reminders.
+shows built-in key reminders. While help has focus, `Esc` or `C-g` returns
+to the buffer it replaced.
 
 
 ## EVERYDAY KEYS
@@ -61,6 +62,7 @@ key when your terminal does not send Meta or Option key sequences reliably.
 ### Movement
 
 - `C-l` recenter.
+- `C-a` / `C-e` move to line start/end, using the visible row when wrapped.
 - `C-v` / `Esc v` move by page.
 - `Esc n` / `Esc p` move 10 lines.
 - `Esc f` / `Esc b` move by word.
@@ -86,7 +88,10 @@ remaining matches.
 - `C-q` quotes the next key for literal insertion.
 - `C-k` cuts to the end of the line.
 - `C-o` opens a new line after point.
+- `C-t` transposes characters, swapping the preceding pair at line end.
 - `C-space` sets the mark.
+- `C-x C-p` selects the whole buffer.
+- `M-Shift-u` (or `Esc U`) uppercases the word forward from point.
 - `C-w` cuts the region.
 - `Esc w` copies the region.
 - `C-y` pastes the clipboard or kill.
@@ -111,6 +116,16 @@ inserted as one undoable edit.
 - `C-x 0` closes the current pane.
 - `C-x 1` keeps one pane.
 
+In `C-x C-f`, `Tab` shows sorted candidate names while keeping the cursor in
+the find prompt. Typing filters the list immediately. Directories appear in
+blue with a trailing `/`. When space permits, directories occupy the left
+column and files the right; wider panes use two columns for each group, sorted
+down each column. `C-x o` or a click focuses the candidates. Move with the usual
+keys and press `Enter` to select, or click an entry while the pane is focused.
+Selecting a directory refreshes the same pane with its contents and keeps
+focus there. Typing returns to the prompt.
+`C-g` cancels the find prompt and closes its temporary pane.
+
 `C-x C-f` starts in the current file's parent directory and stores opened files
 in `$HOME/.edit/recent`. Set `EDIT_RECENT` to override that path. Clean file
 buffers auto-reload when the file changes on disk.
@@ -120,7 +135,10 @@ buffers auto-reload when the file changes on disk.
 - `C-/`, `C-_`, or `C-x u` undo.
 - `C-x r` redo.
 - `C-c C-r` toggles read-only mode.
-- `C-c C-w` toggles visual wrap.
+- `C-c C-w` cycles overflow (default), character wrap, and word wrap.
+- In `Edit.app`, `C-x +` increases font size, `C-x _` (Shift-minus) decreases it,
+  and `C-x )` (Shift-zero) resets it to 14 points. `C-x =` and `C-x -` also work.
+  In a separate terminal, use that terminal’s font controls.
 - `C-c x` runs a remembered shell command for the current file.
 
 ### Suggested Changes

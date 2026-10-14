@@ -145,13 +145,14 @@ static bool cell_same_text(cell *a, cell *b) {
 
 @implementation EditTerminalView
 
-- (void)setupRenderCache {
-  self.font = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular];
-  self.boldFont = [NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightBold];
+- (void)setFontSize:(CGFloat)size {
+  self.font = [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+  self.boldFont = [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightBold];
   self.cachedCellSize = [@"M" sizeWithAttributes:@{ NSFontAttributeName: _font }];
   self.colorCache = [NSMutableDictionary dictionary];
   self.attrCache = [NSMutableDictionary dictionary];
 }
+
 
 - (instancetype)initWithPath:(NSString *)path {
   self = [super initWithFrame:NSMakeRect(0, 0, 900, 520)];
@@ -163,7 +164,7 @@ static bool cell_same_text(cell *a, cell *b) {
   self.pendingWrite = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
-  [self setupRenderCache];
+  [self setFontSize:14];
   attr_default(&_current);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
   _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
@@ -182,7 +183,7 @@ static bool cell_same_text(cell *a, cell *b) {
   self.pendingWrite = [NSMutableData data];
   self.csi = [NSMutableString string];
   self.ansiState = AnsiNormal;
-  [self setupRenderCache];
+  [self setFontSize:14];
   attr_default(&_current);
   _cells = calloc((size_t)_rows * (size_t)_cols, sizeof(cell));
   _dirtyRows = calloc((size_t)_rows, sizeof(BOOL));
@@ -276,6 +277,7 @@ static bool cell_same_text(cell *a, cell *b) {
   if (child == 0) {
     setenv("TERM", "xterm-256color", 1);
     setenv("EDIT_BATCH_ARROWS", "1", 1);
+    setenv("EDIT_APP", "1", 1);
     if (path) execl(edit.fileSystemRepresentation, "edit", path.fileSystemRepresentation, NULL);
     else execl(edit.fileSystemRepresentation, "edit", NULL);
     _exit(127);
@@ -456,6 +458,15 @@ static bool cell_same_text(cell *a, cell *b) {
 - (void)handleCsi:(NSString *)seq {
   char final = 0;
   NSArray<NSString *> *parts = [self csiParts:seq final:&final];
+  // Private font command from the editor; resizing notifies the child via SIGWINCH.
+  if (final == 't' && [self csiInt:parts at:0 fallback:0] == 777) {
+    int action = [self csiInt:parts at:1 fallback:0];
+    CGFloat size = action == 0 ? 14 : _font.pointSize + (action == 1 ? 1 : -1);
+    [self setFontSize:MAX(6, MIN(72, size))];
+    [self resizeGrid];
+    [self setNeedsDisplay:YES];
+    return;
+  }
   if (final == 'H' || final == 'f') {
     [self markCursorDirty];
     _row = MAX(0, MIN(_rows - 1, [self csiInt:parts at:0 fallback:1] - 1));
@@ -623,7 +634,7 @@ static bool cell_same_text(cell *a, cell *b) {
   if (flags & NSEventModifierFlagControl) {
     if (plain.length == 0) return;
     char c = (char)[plain characterAtIndex:0];
-    char ctrl = (c == ' ') ? 0 : (c & 0x1f);
+    char ctrl = c == '/' ? 0x1f : c == ' ' ? 0 : (c & 0x1f);
     if (ctrl == 0x07) return [self panicCancel];
     _ignoreScrollUntil = 0;
     return [self sendBytes:&ctrl length:1];
@@ -867,7 +878,7 @@ static bool cell_same_text(cell *a, cell *b) {
   [self addCommand:@"Accept All Changes    C-c a" bytes:"\003a" length:2 to:commands];
   [self addCommand:@"Reject All Changes    C-c r" bytes:"\003r" length:2 to:commands];
   [self addCommand:@"Toggle Read-Only    C-c C-r" bytes:"\003\022" length:2 to:commands];
-  [self addCommand:@"Toggle Visual Wrap    C-c C-w" bytes:"\003\027" length:2 to:commands];
+  [self addCommand:@"Cycle Visual Wrap    C-c C-w" bytes:"\003\027" length:2 to:commands];
   [self addCommand:@"Help    C-h" bytes:"\010" length:1 to:commands];
 }
 
@@ -933,6 +944,26 @@ static int ansi_self_test(void) {
       [text containsString:@"["] ||
       [text containsString:@"m"]) {
     fprintf(stderr, "ansi self-test failed: %s\n", text.UTF8String);
+    return 1;
+  }
+
+  // Font commands refresh metrics, cached attributes, and terminal dimensions.
+  EditTerminalView *fontView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  [fontView resizeGrid];
+  int standardCols = fontView.cols;
+  NSSize standardCell = fontView.cachedCellSize;
+  ansi_feed(fontView, "\033[777;1t");
+  if (fontView.font.pointSize != 15 || fontView.boldFont.pointSize != 15 ||
+      fontView.cachedCellSize.width <= standardCell.width || fontView.cols >= standardCols) {
+    fprintf(stderr, "font increase failed\n");
+    return 1;
+  }
+  ansi_feed(fontView, "\033[777;2t");
+  if (fontView.font.pointSize != 14 || fontView.cols != standardCols) return 1;
+  ansi_feed(fontView, "\033[777;1t\033[777;0t");
+  if (fontView.font.pointSize != 14 || fontView.cols != standardCols ||
+      !NSEqualSizes(fontView.cachedCellSize, standardCell) || fontView.attrCache.count != 0) {
+    fprintf(stderr, "font reset failed\n");
     return 1;
   }
 
@@ -1015,11 +1046,26 @@ static int ansi_self_test(void) {
   [shortcutView cut:nil];
   [shortcutView copy:nil];
   [shortcutView pasteString:@"PASTE"];
+  NSArray<NSString *> *keyChars = @[@"x", @"p", @"U", @"x", @"+", @"x", @"_", @"x", @")", @"/", @"t"];
+  NSEventModifierFlags keyFlags[] = {
+    NSEventModifierFlagControl, NSEventModifierFlagControl,
+    NSEventModifierFlagOption | NSEventModifierFlagShift,
+    NSEventModifierFlagControl, NSEventModifierFlagShift,
+    NSEventModifierFlagControl, NSEventModifierFlagShift,
+    NSEventModifierFlagControl, NSEventModifierFlagShift,
+    NSEventModifierFlagControl, NSEventModifierFlagControl
+  };
+  for (NSUInteger i = 0; i < keyChars.count; i++) {
+    NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+      modifierFlags:keyFlags[i] timestamp:0 windowNumber:0 context:nil
+      characters:keyChars[i] charactersIgnoringModifiers:keyChars[i] isARepeat:NO keyCode:0];
+    [shortcutView keyDown:event];
+  }
   close(p[1]);
   shortcutView.fd = -1;
   got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  const char shortcuts[] = "\027\033w\033[200~PASTE\033[201~";
+  const char shortcuts[] = "\027\033w\033[200~PASTE\033[201~\030\020\033U\030+\030_\030)\037\024";
   if (got != (ssize_t)strlen(shortcuts) || memcmp(buf, shortcuts, strlen(shortcuts)) != 0) {
     fprintf(stderr, "shortcut bytes failed got=%zd expected=%zu\n", got, strlen(shortcuts));
     for (ssize_t i = 0; i < got; i++) fprintf(stderr, "%02x%s", (unsigned char)buf[i], i + 1 == got ? "\n" : " ");
