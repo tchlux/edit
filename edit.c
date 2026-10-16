@@ -342,6 +342,11 @@ static size_t env_run_output_max(void) {
     (size_t) n : RUN_OUTPUT_MAX;
 }
 
+static int default_wrap(const char * path) {
+  const char * ext = strrchr(path, '.');
+  return ext && (strcmp(ext, ".md") == 0 || strcmp(ext, ".txt") == 0) ? 2 : 0;
+}
+
 static void init_state(edit_state * e) {
   memset(e, 0, sizeof(*e));
   e->layout_nodes[0] = (layout_node){LAYOUT_LEAF, 0, -1, -1};
@@ -1682,6 +1687,7 @@ static int switch_to_path(edit_state * e, const char * path) {
   i = e->n_buffers++;
   int resumed = buffer_resume_edits(&e->buffers[i]);
   active_pane(e)->buffer = i;
+  active_pane(e)->wrap = default_wrap(path);
   active_pane(e)->cursor = 0;
   active_pane(e)->top = 0;
   active_pane(e)->left_col = 0;
@@ -3911,6 +3917,7 @@ static int cli_render(const char * size, const char * path) {
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  e.panes[0].wrap = default_wrap(path);
   buffer_resume_edits(&e.buffers[0]);
   render_snapshot(&e);
   buffers_free(&e);
@@ -3930,6 +3937,7 @@ static int cli_render_color(const char * size, const char * path) {
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  e.panes[0].wrap = default_wrap(path);
   buffer_resume_edits(&e.buffers[0]);
   render_color_snapshot(&e);
   buffers_free(&e);
@@ -3948,6 +3956,7 @@ static int cli_render_at(const char * size, const char * point, const char * pat
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  e.panes[0].wrap = default_wrap(path);
   buffer_resume_edits(&e.buffers[0]);
 
   size_t pos;
@@ -4008,6 +4017,7 @@ static int cli_render_keys(const char * size, const char * keys, const char * pa
     return fprintf(stderr, "edit: bad render size\n"), 1;
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  e.panes[0].wrap = default_wrap(path);
   buffer_resume_edits(&e.buffers[0]);
 
   for (size_t i = 0; keys[i] != '\0'; i++)
@@ -4031,6 +4041,7 @@ static int cli_render_keys_color(const char * size, const char * keys, const cha
   load_grammar(&e);
   if (buffer_load(&e.buffers[0], path) != 0)
     return fprintf(stderr, "edit: open failed\n"), 1;
+  e.panes[0].wrap = default_wrap(path);
   buffer_resume_edits(&e.buffers[0]);
 
   for (size_t i = 0; keys[i] != '\0'; i++)
@@ -6386,6 +6397,7 @@ static int tui(const char * path) {
     fprintf(stderr, "edit: cannot open %s\n", path);
     return 1;
   } else {
+    e.panes[0].wrap = default_wrap(open_path);
     int resumed = buffer_resume_edits(&e.buffers[0]);
     if (resumed == 1) set_status(&e, "edits conflict: source changed");
     else if (resumed == 2) set_status(&e, "resumed suggested changes");

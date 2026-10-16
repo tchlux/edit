@@ -145,7 +145,7 @@ buffers auto-reload when the file changes on disk.
 - `C-/`, `C-_`, or `C-x u` undo.
 - `C-x r` redo.
 - `C-c C-r` toggles read-only mode.
-- `C-c C-w` cycles overflow (default), character wrap, and word wrap.
+- `C-c C-w` cycles overflow, character wrap, and word wrap. `.md` and `.txt` files open with word wrap; other files default to overflow.
 - In `Edit.app`, `C-x +` increases font size, `C-x _` (Shift-minus) decreases it,
   and `C-x )` (Shift-zero) resets it to 14 points. `C-x =` and `C-x -` also work.
   In a separate terminal, use that terminal’s font controls.

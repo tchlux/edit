@@ -1027,6 +1027,21 @@ python3 ./tui_view.py 5:12 '<c-c>^w<c-c>^w<c-c>^w' "$wrap" > "$out"
 grep -q '01:abcdefghijk' "$out"
 if grep -q 'Wrap' "$out"; then exit 1; fi
 
+# Text files default to word wrapping at startup and through Find File.
+for ext in md txt; do
+  prose="$dir/prose.$ext"
+  printf 'one two three four five\n' > "$prose"
+  python3 ./tui_view.py 8:12 '' "$prose" > "$out"
+  grep -q '02:three.four' "$out"
+  ./edit --render 8:40 "$prose" > "$out"
+  grep -q 'WordWrap' "$out"
+  python3 ./tui_view.py 8:40 "^x^f^a^k$prose
+" "$wrap" > "$out"
+  grep -q 'WordWrap' "$out"
+  python3 ./tui_view.py 8:40 '<c-c>^w' "$prose" > "$out"
+  if grep -q 'Wrap' "$out"; then exit 1; fi
+done
+
 # Word wrapping preserves text and keeps movement on the displayed rows.
 word_wrap="$dir/word-wrap"
 printf 'one two three four five\n' > "$word_wrap"
@@ -1124,12 +1139,12 @@ printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..
 md="$dir/plan.md"
 printf '  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$md"
 ./edit --render-keys 6:90 Q "$md" > "$out"
-printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nnext\nplan.md* 2:8\n%s\n' \
+printf '..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nnext\nplan.md* WordWrap 2:8\n%s\n' \
   "$(foot 90 "fill paragraph")" | cmp -s - "$out"
 
 printf '# Title\n\n## Summary\n  alpha   beta gamma\ndelta epsilon zeta eta theta iota kappa lambda mu nu xi\n\nnext\n' > "$md"
 ./edit --render-keys 8:90 nnnQ "$md" > "$out"
-printf '#.Title\n\n##.Summary\n..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nplan.md* 5:8\n%s\n' \
+printf '#.Title\n\n##.Summary\n..alpha.beta.gamma.delta.epsilon.zeta.eta.theta.iota.kappa.lambda.mu\n..nu.xi|\n\nplan.md* WordWrap 5:8\n%s\n' \
   "$(foot 90 "fill paragraph")" | cmp -s - "$out"
 
 ./edit --render-keys 6:90 Q_ "$tmp" > "$out"
@@ -1637,12 +1652,12 @@ tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:3:1\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
-python3 ./tui_view.py 12:40 '<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
+python3 ./tui_view.py 12:40 '<c-c>^w<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
 tail -n 1 "$out" > "$tmp.head"
 printf 'cursor:6:15\n' > "$tmp.expected"
 cmp -s "$tmp.expected" "$tmp.head"
 
-python3 ./tui_view.py 12:28 '<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
+python3 ./tui_view.py 12:28 '<c-c>^w<right><right><right><right><right><right><right><right><right><right><right><right><right><right><down><down><down><down><down>' readme.md > "$out"
 tail -n 1 "$out" > "$tmp.head"
 cmp -s "$tmp.expected" "$tmp.head"
 
@@ -1691,7 +1706,7 @@ grep -q '^wyzijkmotuwyz|$' "$out"
 printf 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\n' > "$review"
 ./edit --render-keys 20:30 'CeXCcok
 xs' "$review" > "$out"
-python3 ./tui_view.py 20:30 '<c-c>^w' "$review" > "$out"
+python3 ./tui_view.py 20:30 '<c-c>^w<c-c>^w' "$review" > "$out"
 test "$(grep -c 'ok' "$out")" = 1
 grep -q 'Selected' "$out"
 
@@ -1699,7 +1714,7 @@ review_wrap="$dir/review-wrap.txt"
 printf 'alpha\n' > "$review_wrap"
 ./edit --render-keys 14:30 'CeXCcijkmotuwyzijkmotuwyzijkmotuwyz
 xs' "$review_wrap" > "$out"
-python3 ./tui_view.py 14:30 '<c-c>^w' "$review_wrap" > "$out"
+python3 ./tui_view.py 14:30 '<c-c>^w<c-c>^w' "$review_wrap" > "$out"
 grep -q 'ijkmotuwyzij' "$out"
 grep -q 'kmotuwyzijkmot' "$out"
 grep -q 'uwyz' "$out"
@@ -1773,8 +1788,8 @@ env HOME="$find_home" python3 ./tui_view.py 5:50 '^x^fhome.txt
 grep -q 'home.file' "$out"
 
 # Rendering reaches past the old line and syntax-span limits.
-printf '%09000dTAIL\n' 0 > "$dir/long-line.txt"
-./edit --render-keys-color 5:80 e "$dir/long-line.txt" > "$out"
+printf '%09000dTAIL\n' 0 > "$dir/long-line"
+./edit --render-keys-color 5:80 e "$dir/long-line" > "$out"
 grep -q 'TAIL' "$out"
 printf 'style keyword 33\nword keyword int\n' > "$tmp.grammar"
 printf '%s\n' "$(printf 'int %.0s' $(seq 1 300))" > "$dir/many-spans.c"
