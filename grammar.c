@@ -139,11 +139,7 @@ static int _suffix(const char * path, const char * suffix) {
 }
 
 static int _markdown_path(const char * path) {
-  return _suffix(path, ".md") || _suffix(path, ".markdown");
-}
-
-static int _text_path(const char * path) {
-  return _suffix(path, ".txt");
+  return _suffix(path, ".md") || _suffix(path, ".markdown") || _suffix(path, ".txt");
 }
 
 static int _fortran_path(const char * path) {
@@ -809,7 +805,7 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
   memcpy(text, line, len);
   text[len] = '\0';
 
-  if (g->is_default && (_markdown_path(path) || _text_path(path)))
+  if (g->is_default && _markdown_path(path))
     _document_highlight(g, path, line, len, sgrs, attrs);
   else if (g->is_default && _fortran_path(path))
     _fortran_highlight(g, line, len, sgrs);

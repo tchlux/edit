@@ -221,7 +221,8 @@ static bool cell_same_text(cell *a, cell *b) {
 
 - (NSRect)rowRect:(int)row {
   NSSize size = [self cellSize];
-  return NSMakeRect(0, self.bounds.size.height - (row + 1) * size.height,
+  return NSMakeRect((self.bounds.size.width - _cols * size.width) / 2,
+                    self.bounds.size.height - (row + 1) * size.height,
                     _cols * size.width, size.height);
 }
 
@@ -248,8 +249,9 @@ static bool cell_same_text(cell *a, cell *b) {
 
 - (void)resizeGrid {
   NSSize size = [self cellSize];
-  int cols = MAX(20, (int)(self.bounds.size.width / size.width));
-  int rows = MAX(8, (int)(self.bounds.size.height / size.height));
+  // Leave half a cell at each side and at least half a row below the grid.
+  int cols = MAX(20, (int)(self.bounds.size.width / size.width) - 1);
+  int rows = MAX(8, (int)(self.bounds.size.height / size.height - 0.5));
   if (cols == _cols && rows == _rows) return;
   // Keep the previous frame visible while the editor redraws at the new size.
   cell *cells = calloc((size_t)rows * (size_t)cols, sizeof(cell));
@@ -616,7 +618,7 @@ static bool cell_same_text(cell *a, cell *b) {
       cell *first = &_cells[r * _cols + c++];
       while (c < _cols && cell_same_bg(first, &_cells[r * _cols + c])) c++;
       [[self color:cell_bg(first)] setFill];
-      NSRectFill(NSMakeRect(start * size.width, rowRect.origin.y,
+      NSRectFill(NSMakeRect(rowRect.origin.x + start * size.width, rowRect.origin.y,
                             (c - start) * size.width, size.height));
     }
 
@@ -631,14 +633,17 @@ static bool cell_same_text(cell *a, cell *b) {
       }
       if (!hasText) continue;
       NSString *s = [[NSString alloc] initWithCharacters:chars length:c - start];
-      [s drawAtPoint:NSMakePoint(start * size.width, rowRect.origin.y)
+      [s drawAtPoint:NSMakePoint(rowRect.origin.x + start * size.width, rowRect.origin.y)
       withAttributes:[self attrsForCell:first]];
     }
   }
   free(chars);
   if (_cursorVisible && _row >= 0 && _row < _rows && _col >= 0 && _col < _cols) {
     [[NSColor colorWithCalibratedWhite:0.85 alpha:1] setFill];
-    NSRectFillUsingOperation(NSMakeRect(_col * size.width, self.bounds.size.height - (_row + 1) * size.height, size.width, size.height), NSCompositingOperationDifference);
+    NSRect cursor = [self rowRect:_row];
+    cursor.origin.x += _col * size.width;
+    cursor.size.width = size.width;
+    NSRectFillUsingOperation(cursor, NSCompositingOperationDifference);
   }
 }
 
@@ -689,7 +694,7 @@ static bool cell_same_text(cell *a, cell *b) {
   [self.window makeFirstResponder:self];
   NSSize cell = [self cellSize];
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
-  int col = (int)(p.x / cell.width);
+  int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
   int row = (int)((self.bounds.size.height - p.y) / cell.height);
   [self sendMouseClickRow:row col:col];
 }
@@ -705,7 +710,7 @@ static bool cell_same_text(cell *a, cell *b) {
   NSSize cell = [self cellSize];
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   [self sendMouseClickRow:(int)((self.bounds.size.height - p.y) / cell.height)
-                       col:(int)(p.x / cell.width)];
+                       col:(int)floor((p.x - [self rowRect:0].origin.x) / cell.width)];
   NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Suggested Changes"];
   [menu addItem:[self contextItem:@"Create Comment" bytes:"\003c" length:2]];
   [menu addItem:[self contextItem:@"Delete Comment" bytes:"\003d" length:2]];
@@ -978,6 +983,16 @@ static int ansi_self_test(void) {
     return 1;
   }
 
+  NSSize metrics = [view cellSize];
+  NSRect firstRow = [view rowRect:0];
+  CGFloat left = NSMinX(firstRow), right = view.bounds.size.width - NSMaxX(firstRow);
+  CGFloat bottom = NSMinY([view rowRect:view.rows - 1]);
+  if (fabs(left - right) > 0.001 || left < metrics.width / 2 || left >= metrics.width ||
+      bottom < metrics.height / 2 || bottom >= metrics.height * 1.5) {
+    fprintf(stderr, "grid padding failed: left=%.3f right=%.3f bottom=%.3f\n", left, right, bottom);
+    return 1;
+  }
+
   // A redraw split across reads is committed only after its final cursor command.
   [view flushDirty];
   ansi_feed(view, "\033[?25l\033[HZ");
@@ -1187,18 +1202,40 @@ static int ansi_self_test(void) {
     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 3;
     while (CFAbsoluteTimeGetCurrent() < deadline && !complete) {
       CFRunLoopRunInMode((__bridge CFStringRef)NSEventTrackingRunLoopMode, 0.01, false);
-      int footer = (live.rows - 1) * live.cols + live.cols - 9;
+      int footer = (live.rows - 1) * live.cols + live.cols - 8;
       int modeline = (live.rows - 2) * live.cols;
       complete = live.cursorVisible && live.cells[modeline].ch == '*' &&
         live.cells[footer].ch == 'C' && live.cells[footer + 7].ch == 'p';
       if (pass > 0) complete = complete && live.cells[(live.rows / 2 - 1) * live.cols].ch == '*';
-      for (int row = 0; complete && row < live.rows; row++) {
+      for (int row = 0; complete && row < live.rows - 1; row++) {
         int edge = row * live.cols + live.cols - 1;
-        complete = live.cells[edge].ch == ' ' && !live.cells[edge].reverse;
+        bool modelineRow = row == live.rows - 2 || (pass > 0 && row == live.rows / 2 - 1);
+        complete = live.cells[edge].ch == ' ' && live.cells[edge].reverse == modelineRow;
       }
     }
     if (!complete) break;
     if (pass == 0) [live sendKey:"\0302"];
+  }
+  // Filling the last column must keep the next insertion point blank and visible.
+  if (complete) {
+    [live sendKey:"\0301\003\027"];
+    NSMutableString *line = [NSMutableString string];
+    for (int col = 0; col < live.cols; col++) [line appendString:@"x"];
+    [line appendString:@"\r\002"];
+    [live sendKey:line.UTF8String];
+    for (int pass = 0; pass < 2; pass++) {
+      if (pass) [live sendKey:"Z"];
+      complete = NO;
+      CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 3;
+      while (CFAbsoluteTimeGetCurrent() < deadline && !complete) {
+        CFRunLoopRunInMode((__bridge CFStringRef)NSEventTrackingRunLoopMode, 0.01, false);
+        complete = live.cursorVisible && live.row == 1 && live.col == pass &&
+          live.cells[live.cols - 1].ch == 'x' &&
+          live.cells[live.cols + pass].ch == ' ' &&
+          (!pass || live.cells[live.cols].ch == 'Z');
+      }
+      if (!complete) break;
+    }
   }
   [keepAlive invalidate];
   live.handle.readabilityHandler = nil;
@@ -1208,7 +1245,7 @@ static int ansi_self_test(void) {
   } else complete = NO;
   live.pid = 0;
   if (!complete) {
-    fprintf(stderr, "live resize failed without input: rows=%d cols=%d cursor=%d:%d first=%s\n",
+    fprintf(stderr, "live editor rendering failed: rows=%d cols=%d cursor=%d:%d first=%s\n",
             live.rows, live.cols, live.row, live.col, [live lineText:20].UTF8String);
     return 1;
   }

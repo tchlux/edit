@@ -28,6 +28,138 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A selected empty line fills only its pane and clears when the newline is unselected.
+cat > "$dir/empty-selection-check.c" <<EOF
+#define main edit_program_main
+#include "$PWD/edit.c"
+#undef main
+#include <assert.h>
+int main(void) {
+  edit_state e;
+  init_state(&e);
+  e.n_buffers = e.n_panes = 1;
+  buffer * b = &e.buffers[0];
+  pane * p = &e.panes[0];
+  assert(buffer_set_text(b, "selection.txt", BUFFER_FILE, "a\\n\\nb\\n") == 0);
+  for (int raw = 0; raw < 2; raw++)
+    for (int wrap = 0; wrap < 3; wrap++)
+      for (int reverse = 0; reverse < 2; reverse++) {
+        e.raw = raw;
+        p->wrap = wrap;
+        p->mark_active = true;
+        p->mark = reverse ? 3 : 0;
+        p->cursor = reverse ? 0 : 3;
+        for (size_t width = 1; width <= 12; width += 11) {
+          output actual = {0}, expected = {0};
+          size_t pos = 2;
+          render_span_sgr(&e, &expected, REGION_SGR, 0);
+          for (size_t i = 0; i < width; i++) out_s(&expected, " ");
+          render_base_sgr(&e, &expected);
+          assert(render_buffer_line(&e, &actual, b, p, &pos, 8, width) == width);
+          assert(pos == 3 && actual.len == expected.len);
+          assert(!memcmp(actual.data, expected.data, expected.len));
+          free(actual.data); free(expected.data);
+        }
+        // Ending before the newline or cancelling the mark leaves the row unpainted.
+        p->mark = 0; p->cursor = 2;
+        for (int active = 0; active < 2; active++) {
+          p->mark_active = active;
+          output o = {0};
+          size_t pos = 2;
+          assert(render_buffer_line(&e, &o, b, p, &pos, 0, 12) == 0);
+          assert(o.len == 0 && pos == 3);
+          free(o.data);
+        }
+      }
+  buffer_free(b);
+  return 0;
+}
+EOF
+cc -std=c11 -Wall -Wextra -pedantic -O2 -o "$dir/empty-selection-check" "$dir/empty-selection-check.c" grammar.c regex.c
+"$dir/empty-selection-check"
+
+# Named commands complete, list, cancel, and toggle cached Markdown colors per buffer.
+cat > "$dir/command-check.c" <<EOF
+#define main edit_program_main
+#include "$PWD/edit.c"
+#undef main
+#include <assert.h>
+int main(void) {
+  edit_state e;
+  init_state(&e);
+  e.rows = 24; e.cols = 100;
+  e.n_buffers = e.n_panes = 1;
+  e.panes[0].preferred_col = SIZE_MAX;
+  load_grammar(&e);
+  assert(buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE,
+                         "# Heading\\n**bold** and \`code\`\\n\`\`\`\\ninside\\n\`\`\`\\n") == 0);
+  grammar_span txt[128], md[128];
+  const char * heading = "# Heading";
+  int nt = grammar_highlight(&e.grammar, "notes.txt", heading, strlen(heading), txt, 128);
+  int nm = grammar_highlight(&e.grammar, "notes.md", heading, strlen(heading), md, 128);
+  assert(nt > 0 && nt == nm);
+  for (int i = 0; i < nt; i++) {
+    assert(txt[i].start == md[i].start && txt[i].end == md[i].end);
+    assert(txt[i].attr == md[i].attr && !strcmp(txt[i].sgr, md[i].sgr));
+  }
+  output colored = {0}, plain = {0}, restored = {0};
+  size_t pos = 0;
+  render_buffer_line(&e, &colored, &e.buffers[0], &e.panes[0], &pos, 0, 100);
+  assert(e.buffers[0].render_n_spans > 0);
+  e.panes[0].cursor = 3;
+  e.panes[0].mark = 1;
+  e.panes[0].mark_active = true;
+  dispatch(&e, KEY_META('x'));
+  dispatch(&e, KEY_CTRL('i'));
+  assert(e.command_prompt && active_buffer(&e)->kind == BUFFER_FILE);
+  dispatch(&e, KEY_CTRL('i'));
+  assert(active_buffer(&e)->kind == BUFFER_HELP);
+  assert(prompt_footer_cursor(&e));
+  char * commands = buffer_text(active_buffer(&e), &(size_t){0});
+  assert(strstr(commands, "toggle-syntax-highlighting"));
+  free(commands);
+  dispatch(&e, KEY_ESC);
+  assert(!e.command_prompt && active_pane(&e)->buffer == 0);
+  assert(e.panes[0].cursor == 3 && e.panes[0].mark == 1 && e.panes[0].mark_active);
+  dispatch(&e, KEY_META('x'));
+  const char * prefix = "toggle-syntax";
+  for (const char * c = prefix; *c; c++) dispatch(&e, *c);
+  dispatch(&e, KEY_CTRL('i'));
+  assert(!strcmp(e.command, "toggle-syntax-highlighting"));
+  dispatch(&e, KEY_CTRL('i'));
+  dispatch(&e, KEY_ENTER);
+  assert(!e.command_prompt && active_pane(&e)->buffer == 0);
+  assert(e.buffers[0].highlighting_off && !e.buffers[0].dirty);
+  assert(e.panes[0].cursor == 3 && e.panes[0].mark == 1 && e.panes[0].mark_active);
+  e.panes[0].mark_active = false;
+  e.panes[0].cursor = 0;
+  pos = 0;
+  render_buffer_line(&e, &plain, &e.buffers[0], &e.panes[0], &pos, 0, 100);
+  assert(!e.buffers[0].render_n_spans && strcmp(colored.data, plain.data));
+  dispatch(&e, KEY_META('x'));
+  for (const char * c = "toggle-syntax-highlighting"; *c; c++) dispatch(&e, *c);
+  dispatch(&e, KEY_ENTER);
+  pos = 0;
+  render_buffer_line(&e, &restored, &e.buffers[0], &e.panes[0], &pos, 0, 100);
+  assert(!e.buffers[0].highlighting_off && !strcmp(colored.data, restored.data));
+  dispatch(&e, KEY_META('x'));
+  for (const char * c = "not-a-command"; *c; c++) dispatch(&e, *c);
+  dispatch(&e, KEY_ENTER);
+  assert(e.command_prompt);
+  dispatch(&e, KEY_CTRL('g'));
+  assert(!e.command_prompt && !e.buffers[0].dirty);
+  dispatch(&e, KEY_META('x'));
+  for (const char * c = "end-of-buffer"; *c; c++) dispatch(&e, *c);
+  dispatch(&e, KEY_ENTER);
+  assert(e.panes[0].cursor == buffer_len(&e.buffers[0]));
+  for (int i = 0; i < e.n_buffers; i++) buffer_free(&e.buffers[i]);
+  free(colored.data); free(plain.data); free(restored.data);
+  return 0;
+}
+EOF
+cc -std=c11 -Wall -Wextra -pedantic -O2 -o "$dir/command-check" "$dir/command-check.c" grammar.c regex.c
+"$dir/command-check"
+
 # A resize just before waiting must redraw before consuming queued input.
 cat > "$dir/resize-check.c" <<EOF
 #define main edit_program_main
@@ -49,11 +181,89 @@ EOF
 cc -std=c11 -Wall -Wextra -pedantic -O2 -o "$dir/resize-check" "$dir/resize-check.c" grammar.c regex.c
 "$dir/resize-check"
 
+
+# Scrolling work stays local, and cached highlighting matches a fresh render after edits.
+cat > "$dir/scroll-check.c" <<EOF
+#define main edit_program_main
+#include "$PWD/edit.c"
+#undef main
+#include <assert.h>
+
+static void frame(edit_state * e, output * o) {
+  size_t pos = e->panes[0].top;
+  ensure_visible(e);
+  pos = e->panes[0].top;
+  for (int row = 0; row < 28 && pos < buffer_len(&e->buffers[0]); row++)
+    render_buffer_line(e, o, &e->buffers[0], &e->panes[0], &pos, 0, 100);
+}
+
+int main(void) {
+  edit_state e;
+  init_state(&e);
+  e.rows = 30;
+  e.cols = 100;
+  e.n_buffers = e.n_panes = 1;
+  e.panes[0].wrap = 2;
+  e.panes[0].preferred_col = SIZE_MAX;
+  load_grammar(&e);
+  size_t n = 2 * 1024 * 1024;
+  char * text = malloc(n + 1);
+  assert(text);
+  for (size_t i = 0; i < n; i++) text[i] = i % 6 == 5 ? ' ' : 'a';
+  text[n] = 0;
+  for (int long_line = 0; long_line < 2; long_line++) {
+    for (size_t i = 32767; i < n; i += 32768) text[i] = long_line ? ' ' : '\n';
+    assert(buffer_set_text(&e.buffers[0], "scroll.md", BUFFER_FILE, text) == 0);
+    e.panes[0].cursor = e.panes[0].top = 0;
+    output o = {0};
+    frame(&e, &o);
+    free(o.data);
+    long long begin = now_ms();
+    for (int step = 0; step < 100; step++) {
+      cmd_down(&e, 0);
+      o = (output){0};
+      frame(&e, &o);
+      free(o.data);
+    }
+    // This generous gate catches document-wide rescans without depending on frame scheduling.
+    assert(now_ms() - begin < 500);
+    if (long_line) {
+      e.panes[0].cursor = n / 2;
+      e.panes[0].top = 0;
+      o = (output){0};
+      begin = now_ms();
+      frame(&e, &o);
+      assert(now_ms() - begin < 500);
+      free(o.data);
+    }
+  }
+  assert(buffer_insert(&e.buffers[0], 0, "\x60\x60\x60\n", 4) == 0);
+  for (int change = 0; change < 2; change++) {
+    if (change) buffer_delete(&e.buffers[0], 0, 4);
+    e.panes[0].cursor = 700;
+    e.panes[0].top = 100;
+    output cached = {0}, fresh = {0};
+    frame(&e, &cached);
+    // Discard only derived state and require identical source text, wrapping, and styles.
+    buffer_invalidate_render(&e.buffers[0]);
+    frame(&e, &fresh);
+    assert(cached.len == fresh.len && memcmp(cached.data, fresh.data, fresh.len) == 0);
+    free(cached.data);
+    free(fresh.data);
+  }
+  free(text);
+  buffers_free(&e);
+  return 0;
+}
+EOF
+cc -std=c11 -Wall -Wextra -pedantic -O2 -o "$dir/scroll-check" "$dir/scroll-check.c" grammar.c regex.c
+"$dir/scroll-check"
+
 foot() {
   width=$1
   msg=$2
   hint='C-h help'
-  limit=$((width - 1))
+  limit=$width
   left=$((limit - ${#hint}))
   if [ "$left" -le 0 ]; then
     printf '%.*s' "$limit" "$hint"
@@ -554,12 +764,12 @@ printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "close pane")" 
 ./edit --render-keys 6:20 x2x1 "$tmp" > "$out"
 printf '|one\ntwo\nthree\nfour\n%s 1:1\n%s\n' "$base" "$(foot 20 "one pane")" | cmp -s - "$out"
 
-./edit --render-keys 5:24 x3 "$tmp" > "$out"
+./edit --render-keys 5:23 x3 "$tmp" > "$out"
 head=$(printf '%s' "$base" | cut -c 1-11)
-printf '|one       │|one       \ntwo        │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 24 "split")" | cmp -s - "$out"
+printf '|one       │|one       \ntwo        │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 23 "split")" | cmp -s - "$out"
 
-./edit --render-keys 5:24 x3nxof "$tmp" > "$out"
-printf 'one        │o|ne       \n|two       │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 24 "other pane")" | cmp -s - "$out"
+./edit --render-keys 5:23 x3nxof "$tmp" > "$out"
+printf 'one        │o|ne       \n|two       │two        \nthree      │three      \n%s│%s\n%s\n' "$head" "$head" "$(foot 23 "other pane")" | cmp -s - "$out"
 
 cell15() {
   printf '%-15.15s' "$1"
@@ -568,7 +778,7 @@ cell15() {
 pane=$(cell15 "$base 1:1")
 pane_active=$(cell15 "$base 1:1>")
 blank=$(cell15 "")
-./edit --render-keys 8:32 x3x2 "$tmp" > "$out"
+./edit --render-keys 8:31 x3x2 "$tmp" > "$out"
 printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
@@ -577,9 +787,9 @@ printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$blank" \
   "$(cell15 "two")" "$blank" \
   "$pane" "$pane" \
-  "$(foot 32 "split")" | cmp -s - "$out"
+  "$(foot 31 "split")" | cmp -s - "$out"
 
-./edit --render-keys 8:32 x3xox2 "$tmp" > "$out"
+./edit --render-keys 8:31 x3xox2 "$tmp" > "$out"
 printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
@@ -588,9 +798,9 @@ printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$blank" "$(cell15 "|one")" \
   "$blank" "$(cell15 "two")" \
   "$pane" "$pane" \
-  "$(foot 32 "split")" | cmp -s - "$out"
+  "$(foot 31 "split")" | cmp -s - "$out"
 
-./edit --render-keys 8:32 x3x2x0 "$tmp" > "$out"
+./edit --render-keys 8:31 x3x2x0 "$tmp" > "$out"
 printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$(cell15 "|one")" "$(cell15 "|one")" \
   "$(cell15 "two")" "$(cell15 "two")" \
@@ -599,10 +809,10 @@ printf '%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s│%s\n%s\n' \
   "$blank" "$blank" \
   "$blank" "$blank" \
   "$pane_active" "$pane" \
-  "$(foot 32 "close pane")" | cmp -s - "$out"
+  "$(foot 31 "close pane")" | cmp -s - "$out"
 
-./edit --render-keys 8:32 x3x2x1 "$tmp" > "$out"
-printf '|one\ntwo\nthree\nfour\n\n\n%s 1:1\n%s\n' "$base" "$(foot 32 "one pane")" | cmp -s - "$out"
+./edit --render-keys 8:31 x3x2x1 "$tmp" > "$out"
+printf '|one\ntwo\nthree\nfour\n\n\n%s 1:1\n%s\n' "$base" "$(foot 31 "one pane")" | cmp -s - "$out"
 
 python3 ./tui_view.py 6:30 '<c-x>2<c-x>o' "$tmp" > "$out"
 tail -n 1 "$out" > "$tmp.head"
@@ -749,7 +959,7 @@ printf 'abc\n' > "$tmp"
 printf 'A|abc\n\n%s* 1:2\n%s\n' "$base" "$(foot 40 "cancel")" | cmp -s - "$out"
 
 python3 ./tui_view.py 4:40 '^g<wait-status>' "$tmp" > "$out"
-grep -q 'C-s/C-r.search,.C-g.cancel,.EscC-h.help' "$out"
+grep -q 'C-s/C-r.search,.C-g.cancel,.Esc.C-h.help' "$out"
 if grep -q 'cancel\.\{10,\}C-h.help' "$out"; then exit 1; fi
 
 printf 'abc\n' > "$tmp"
@@ -1012,19 +1222,19 @@ printf '|abc\n\n%s 1:1\n%s\n' "$base" "$(foot 20 "undo")" | cmp -s - "$out"
 
 printf 'abcdefghijklmnopqrstuvwxyz\n' > "$tmp"
 ./edit --render-keys 4:12 fffffffffffff "$tmp" > "$out"
-printf 'defghijklm|n\n\n%s 1:14\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
+printf 'cdefghijklm|n\n\n%s 1:14\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 ./edit --render-keys 4:12 fffffffffffffbbbbbbbbbbbbb "$tmp" > "$out"
-printf '|abcdefghijk\n\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
+printf '|abcdefghijkl\n\n%s 1:1\n%s\n' "$base" "$(foot 12 "")" | cmp -s - "$out"
 
 wrap="$dir/w"
 printf 'abcdefghijklmnopqrstuvwxyz\n' > "$wrap"
 python3 ./tui_view.py 5:12 '<c-c>^w' "$wrap" > "$out"
-grep -q '02:lmnopqrstuv' "$out"
+grep -q '02:mnopqrstuvwx' "$out"
 grep -q '04:w.1:1.Wrap' "$out"
 
 python3 ./tui_view.py 5:12 '<c-c>^w<c-c>^w<c-c>^w' "$wrap" > "$out"
-grep -q '01:abcdefghijk' "$out"
+grep -q '01:abcdefghijkl' "$out"
 if grep -q 'Wrap' "$out"; then exit 1; fi
 
 # Text files default to word wrapping at startup and through Find File.
@@ -1095,10 +1305,41 @@ printf 'x' > "$transpose_file"
 python3 ./tui_view.py 8:40 '^e^t<c-x>^s' "$transpose_file" > "$out"
 printf 'x' | cmp -s - "$transpose_file"
 
+# Full-width rows keep a blank insertion point at EOF and before a newline.
+wrap_edge="$dir/w-edge"
+for wrap_keys in '<c-c>^w' '<c-c>^w<c-c>^w'; do
+  printf 'abcdefghijklmnopqrstuvwx' > "$wrap_edge"
+  python3 ./tui_view.py 5:12 "${wrap_keys}<opt-gt>" "$wrap_edge" > "$out"
+  grep -q '^ 01:abcdefghijkl$' "$out"
+  grep -q '^ 02:mnopqrstuvwx$' "$out"
+  grep -q 'cursor:3:1' "$out"
+  python3 ./tui_view.py 4:12 "${wrap_keys}<opt-gt>" "$wrap_edge" > "$out"
+  grep -q '^ 01:mnopqrstuvwx$' "$out"
+  grep -q 'cursor:2:1' "$out"
+  printf '\n' >> "$wrap_edge"
+  python3 ./tui_view.py 6:12 "${wrap_keys}<opt-gt><left>X" "$wrap_edge" > "$out"
+  grep -q '^ 02:mnopqrstuvwx$' "$out"
+  grep -q '^>03:X$' "$out"
+  grep -q 'cursor:3:2' "$out"
+done
+
 # Wrapped line edges stay on the current display row in both wrap modes.
+wrap_cursor="$dir/w-cursor"
+printf 'abc defghi\n' > "$wrap_cursor"
+for wrap_keys in '<c-c>^w' '<c-c>^w<c-c>^w'; do
+  python3 ./tui_view.py 5:12 "${wrap_keys}<opt-gt><left>" "$wrap_cursor" > "$out"
+  grep -q 'cursor:1:11' "$out"
+  python3 ./tui_view.py 5:12 "${wrap_keys}<opt-gt><left>K" "$wrap_cursor" > "$out"
+  grep -q '^>01:abc.defghiK$' "$out"
+  grep -q 'cursor:1:12' "$out"
+  python3 ./tui_view.py 5:12 "${wrap_keys}<opt-gt><left>KL" "$wrap_cursor" > "$out"
+  grep -q 'cursor:2:' "$out"
+done
 for wrap_keys in '<c-c>^w' '<c-c>^w<c-c>^w'; do
   python3 ./tui_view.py 8:12 "${wrap_keys}^n^e" "$word_wrap" > "$out"
-  grep -q 'cursor:2:11' "$out"
+  edge_col=11
+  if [ "$wrap_keys" = '<c-c>^w' ]; then edge_col=12; fi
+  grep -q "cursor:2:$edge_col" "$out"
   python3 ./tui_view.py 8:12 "${wrap_keys}^n^e^a" "$word_wrap" > "$out"
   grep -q 'cursor:2:1' "$out"
 done
@@ -1114,18 +1355,18 @@ grep -q 'font.sizing.requires.Edit.app' "$out"
 
 rights='<right><right><right><right><right><right><right><right><right><right><right><right><right>'
 python3 ./tui_view.py 5:12 "<c-c>^w$rights" "$wrap" > "$out"
-grep -q 'cursor:2:3' "$out"
+grep -q 'cursor:2:2' "$out"
 grep -q '04:w.1:14.Wrap' "$out"
 
 wrap_exact="$dir/w-exact"
-printf 'abcdefghijklmnopqrstuv' > "$wrap_exact"
+printf 'abcdefghijklmnopqrstuvwx' > "$wrap_exact"
 python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>' "$wrap_exact" > "$out"
 grep -q 'cursor:3:1' "$out"
 python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>X' "$wrap_exact" > "$out"
 grep -q 'cursor:3:2' "$out"
 
 wrap_partial="$dir/w-partial"
-printf 'abcdefghijklmnopqrstuvw' > "$wrap_partial"
+printf 'abcdefghijklmnopqrstuvwxy' > "$wrap_partial"
 python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>' "$wrap_partial" > "$out"
 grep -q 'cursor:3:2' "$out"
 python3 ./tui_view.py 5:12 '<c-c>^w<opt-gt>X' "$wrap_partial" > "$out"
@@ -1213,7 +1454,7 @@ grep -q 'cursor:1:2' "$out"
 printf 'abcdefghijklmnopqrstuvwxyz\n' > "$tmp"
 python3 ./tui_view.py 5:25 '<c-c>^w<click:2:2>' "$tmp" > "$out"
 grep -q 'cursor:2:2' "$out"
-grep -q '1:26.Wrap' "$out"
+grep -q '1:27.Wrap' "$out"
 
 printf 'int x\n' > "$tmp"
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
@@ -1446,12 +1687,12 @@ grep -q '\*find.completions\*' "$out"
 # Completion keeps prompt focus, filters on edits, and preserves candidate selection.
 # Long prompts scroll with the cursor in the real terminal footer.
 python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789' "$dir/a" > "$out"
-grep -q 'find.file:.rstuvwxyz0123456789.C-h.help' "$out"
-grep -q '^cursor:5:31$' "$out"
+grep -q 'find.file:.qrstuvwxyz0123456789.C-h.help' "$out"
+grep -q '^cursor:5:32$' "$out"
 python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789^b^b^b' "$dir/a" > "$out"
-grep -q 'find.file:.opqrstuvwxyz01234567C-h.help' "$out"
+grep -q 'find.file:.nopqrstuvwxyz01234567C-h.help' "$out"
 python3 ./tui_view.py 5:40 '^x^f^a^kabcdefghijklmnopqrstuvwxyz0123456789^a' "$dir/a" > "$out"
-grep -q 'find.file:.abcdefghijklmnopqrstC-h.help' "$out"
+grep -q 'find.file:.abcdefghijklmnopqrstuC-h.help' "$out"
 grep -q '^cursor:5:12$' "$out"
 
 # Open a completion whose full path exceeds the old 512-byte buffer.
@@ -1632,7 +1873,7 @@ env SHELL=/bin/zsh HOME="$cancel_home" python3 ./tui_view.py 5:80 '^cxprintf nop
 test ! -e "$cancel_home/.edit/config"
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
-printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:Edit.app/Contents/MacOS/Edit.--ansi-sel\n 06:\n 07:tmp=$(mktemp)\n' > "$tmp.expected"
+printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:Edit.app/Contents/MacOS/Edit.--ansi-self\n 06:\n 07:tmp=$(mktemp)\n' > "$tmp.expected"
 head -n 7 "$out" > "$tmp.head"
 cmp -s "$tmp.expected" "$tmp.head"
 tail -n 1 "$out" > "$tmp.head"
@@ -1689,17 +1930,17 @@ test ! -e "$review.edits"
 wrap_move="$dir/wrap-move"
 printf 'abcdefghijklmnopqrstuvwxyz12345\n\nZYXWVUTSRQPONMLKJIHGFEDCBA98765\n' > "$wrap_move"
 python3 ./tui_view.py 8:25 '<c-c>^w^n' "$wrap_move" > "$out"
-grep -q '1:25.Wrap' "$out"
+grep -q '1:26.Wrap' "$out"
 python3 ./tui_view.py 8:25 '<c-c>^w^n^n' "$wrap_move" > "$out"
 grep -q '2:1.Wrap' "$out"
 python3 ./tui_view.py 8:25 '<c-c>^w^n^n^n' "$wrap_move" > "$out"
 grep -q '3:1.Wrap' "$out"
 python3 ./tui_view.py 8:25 '<c-c>^w^n^n^n^n^p^p^p' "$wrap_move" > "$out"
-grep -q '1:25.Wrap' "$out"
+grep -q '1:26.Wrap' "$out"
 
 compose="$dir/comment-compose.txt"
 printf 'alpha\n' > "$compose"
-./edit --render-keys 7:24 'CeCcijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyz' "$compose" > "$out"
+./edit --render-keys 7:23 'CeCcijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyz' "$compose" > "$out"
 grep -q '^otuwyzijkmotuwyzijkmotu' "$out"
 grep -q '^wyzijkmotuwyz|$' "$out"
 
@@ -1714,7 +1955,7 @@ review_wrap="$dir/review-wrap.txt"
 printf 'alpha\n' > "$review_wrap"
 ./edit --render-keys 14:30 'CeXCcijkmotuwyzijkmotuwyzijkmotuwyz
 xs' "$review_wrap" > "$out"
-python3 ./tui_view.py 14:30 '<c-c>^w<c-c>^w' "$review_wrap" > "$out"
+python3 ./tui_view.py 14:29 '<c-c>^w<c-c>^w' "$review_wrap" > "$out"
 grep -q 'ijkmotuwyzij' "$out"
 grep -q 'kmotuwyzijkmot' "$out"
 grep -q 'uwyz' "$out"
@@ -1842,7 +2083,8 @@ printf 'alpha\n' > "$dir/long-review.txt"
 review_text="$(printf '%0350d' 0)REVIEWTAIL"
 python3 ./tui_view.py 20:120 "<c-c>e<paste>$review_text</paste>^x^s" "$dir/long-review.txt" > "$out"
 python3 ./tui_view.py 20:120 '' "$dir/long-review.txt" > "$out"
-grep -q 'VIEWTAIL' "$out"
+grep -q 'EWTAILalpha' "$out"
+grep -q 'REVIEWTA' "$out"
 review_keys=Ce
 review_move=
 i=0

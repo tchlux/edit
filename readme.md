@@ -197,9 +197,16 @@ builtins, constants, preprocessor lines, decorators, variables, operators,
 shell command substitutions, Python triple-quoted strings, and f-string
 expressions.
 
-Markdown and plain text files use document colors for headings, links, URLs,
+Markdown (`.md`, `.markdown`) and `.txt` files use Markdown highlighting by
+default, with document colors for headings, links, URLs,
 lists, blockquotes, code spans, code fences, emphasis markers, and TODO-style
 labels. See `color-tests/` for sample files.
+
+Use `M-x toggle-syntax-highlighting` and Enter to turn highlighting off or on
+for the current buffer. `Esc x` also opens `M-x`. Type a command name, use Tab
+to complete it, or press Tab twice to list all matching commands (an empty
+prompt lists everything). `C-v` / `M-v` scroll the list; `Esc` or `C-g` cancels
+and restores the file. The toggle lasts while the buffer is open.
 
 Set `EDIT_GRAMMAR=path` to fully override highlighting with a line-based
 grammar:

@@ -1,0 +1,124 @@
+{
+  "scope": "Core navigation plus complete ANSI frame generation to /dev/null; excludes AppKit paint and input transport.",
+  "viewport": {
+    "rows": 24,
+    "cols": 80
+  },
+  "position": {
+    "first": 0,
+    "middle": 1,
+    "near_end": 2
+  },
+  "results": [
+    {
+      "bytes": 2097152,
+      "line_bytes": 8192,
+      "position": 0,
+      "samples": 100,
+      "cold_ms": 0.141,
+      "p50_ms": 0.038,
+      "p95_ms": 0.166,
+      "p99_ms": 0.33,
+      "max_ms": 0.349
+    },
+    {
+      "bytes": 2097152,
+      "line_bytes": 8192,
+      "position": 1,
+      "samples": 100,
+      "cold_ms": 2.053,
+      "p50_ms": 0.039,
+      "p95_ms": 0.173,
+      "p99_ms": 0.33,
+      "max_ms": 0.331
+    },
+    {
+      "bytes": 2097152,
+      "line_bytes": 8192,
+      "position": 2,
+      "samples": 100,
+      "cold_ms": 3.927,
+      "p50_ms": 0.038,
+      "p95_ms": 0.432,
+      "p99_ms": 0.443,
+      "max_ms": 0.444
+    },
+    {
+      "bytes": 2097152,
+      "line_bytes": 2097152,
+      "position": 0,
+      "samples": 100,
+      "cold_ms": 15.983,
+      "p50_ms": 0.039,
+      "p95_ms": 0.043,
+      "p99_ms": 0.058,
+      "max_ms": 0.069
+    },
+    {
+      "bytes": 2097152,
+      "line_bytes": 2097152,
+      "position": 1,
+      "samples": 100,
+      "cold_ms": 43.521,
+      "p50_ms": 0.045,
+      "p95_ms": 0.048,
+      "p99_ms": 0.058,
+      "max_ms": 0.082
+    },
+    {
+      "bytes": 2097152,
+      "line_bytes": 2097152,
+      "position": 2,
+      "samples": 100,
+      "cold_ms": 73.539,
+      "p50_ms": 0.042,
+      "p95_ms": 0.044,
+      "p99_ms": 0.046,
+      "max_ms": 0.056
+    },
+    {
+      "bytes": 8388608,
+      "line_bytes": 1024,
+      "position": 0,
+      "samples": 100,
+      "cold_ms": 0.109,
+      "p50_ms": 0.146,
+      "p95_ms": 0.172,
+      "p99_ms": 0.188,
+      "max_ms": 0.208
+    },
+    {
+      "bytes": 8388608,
+      "line_bytes": 1024,
+      "position": 2,
+      "samples": 100,
+      "cold_ms": 15.241,
+      "p50_ms": 0.14,
+      "p95_ms": 0.168,
+      "p99_ms": 0.179,
+      "max_ms": 0.18
+    },
+    {
+      "bytes": 33554432,
+      "line_bytes": 8192,
+      "position": 2,
+      "samples": 100,
+      "cold_ms": 59.687,
+      "p50_ms": 0.038,
+      "p95_ms": 0.419,
+      "p99_ms": 0.426,
+      "max_ms": 0.452
+    }
+  ],
+  "source_sha256": "b740336a4415a3871b2e265e109136c91159c5ad8c5d0bb1f0f3e933319e2f48",
+  "regression_command": "sh test.sh",
+  "validation": {
+    "full_regression": "passed",
+    "native_ansi_self_test": "passed",
+    "undefined_behavior_sanitizer": "passed",
+    "address_sanitizer": "unavailable: even the smoke executable timed out",
+    "manual_native_file_bytes": 8388608
+  },
+  "benchmark_source": "#define main edit_program_main\n#include EDIT_SOURCE\n#undef main\n#include <sys/time.h>\n\nstatic double elapsed(void) {\n  struct timeval t;\n  gettimeofday(&t, NULL);\n  return t.tv_sec * 1000.0 + t.tv_usec / 1000.0;\n}\nstatic int compare(const void *a, const void *b) {\n  double x = *(const double *)a, y = *(const double *)b;\n  return (x > y) - (x < y);\n}\nint main(int argc, char **argv) {\n  if (argc != 4) return 1;\n  size_t n = strtoull(argv[1], NULL, 10), width = strtoull(argv[2], NULL, 10);\n  int where = atoi(argv[3]);\n  edit_state e;\n  init_state(&e);\n  e.rows = 24;\n  e.cols = 80;\n  e.n_buffers = e.n_panes = 1;\n  e.panes[0].wrap = 2;\n  e.panes[0].preferred_col = SIZE_MAX;\n  char *text = malloc(n + 1);\n  for (size_t i = 0; i < n; i++) text[i] = i % width == width - 1 ? '\\n' : i % 6 == 5 ? ' ' : 'a';\n  text[n] = 0;\n  buffer_set_text(&e.buffers[0], \"frames.txt\", BUFFER_FILE, text);\n  free(text);\n  load_grammar(&e);\n  e.panes[0].cursor = where == 1 ? n / 2 : where == 2 ? n - 2000 : 0;\n  e.panes[0].top = line_start(&e.buffers[0], e.panes[0].cursor);\n  freopen(\"/dev/null\", \"w\", stdout);\n  double start = elapsed();\n  render(&e);\n  double first = elapsed() - start;\n  double samples[100];\n  for (int i = 0; i < 100; i++) {\n    start = elapsed();\n    if (where == 2) cmd_up(&e, 0);\n    else cmd_down(&e, 0);\n    render(&e);\n    samples[i] = elapsed() - start;\n  }\n  qsort(samples, 100, sizeof(double), compare);\n  fprintf(stderr, \"{\\\"bytes\\\":%zu,\\\"line_bytes\\\":%zu,\\\"position\\\":%d,\\\"samples\\\":100,\\\"cold_ms\\\":%.3f,\\\"p50_ms\\\":%.3f,\\\"p95_ms\\\":%.3f,\\\"p99_ms\\\":%.3f,\\\"max_ms\\\":%.3f}\\n\",\n    n, width, where, first, samples[49], samples[94], samples[98], samples[99]);\n  buffers_free(&e);\n  return 0;\n}\n",
+  "compile_command": "cc -std=c11 -Wall -Wextra -pedantic -O2 -DEDIT_SOURCE=\\\"/Users/thomaslux/Git/edit/edit.c\\\" -o /tmp/scroll-frames /tmp/scroll-frames.c grammar.c regex.c"
+}
