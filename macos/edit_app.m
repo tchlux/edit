@@ -27,7 +27,7 @@
 #define SCROLL_MAX_KEYS 48
 #define CSI_MAX 64
 
-enum { AnsiNormal, AnsiEsc, AnsiCsi };
+enum { AnsiNormal, AnsiEsc, AnsiCsi, AnsiOsc, AnsiOscEsc };
 
 typedef struct {
   unichar ch;
@@ -36,6 +36,8 @@ typedef struct {
   bool bold;
   bool italic;
   bool strike;
+  bool underline;
+  int underline_rgb[3];
   bool reverse;
 } cell;
 
@@ -45,6 +47,8 @@ typedef struct {
   bool bold;
   bool italic;
   bool strike;
+  bool underline;
+  int underline_rgb[3];
   bool reverse;
 } attr;
 
@@ -78,6 +82,9 @@ typedef struct {
 @property NSSize cachedCellSize;
 @property NSMutableDictionary<NSNumber *, NSColor *> *colorCache;
 @property NSMutableDictionary<NSNumber *, NSDictionary *> *attrCache;
+@property NSMenu *spellingMenu;
+@property unsigned spellingRequest;
+@property NSInteger spellingItems;
 - (instancetype)initWithPath:(NSString *)path;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
@@ -102,6 +109,8 @@ static void attr_default(attr *a) {
   a->bold = false;
   a->italic = false;
   a->strike = false;
+  a->underline = false;
+  a->underline_rgb[0] = 235; a->underline_rgb[1] = 85; a->underline_rgb[2] = 85;
   a->reverse = false;
 }
 
@@ -113,6 +122,8 @@ static cell blank_cell(attr a) {
   c.bold = a.bold;
   c.italic = a.italic;
   c.strike = a.strike;
+  c.underline = a.underline;
+  memcpy(c.underline_rgb, a.underline_rgb, sizeof(c.underline_rgb));
   c.reverse = a.reverse;
   return c;
 }
@@ -120,7 +131,8 @@ static cell blank_cell(attr a) {
 static bool cell_equal(cell a, cell b) {
   return a.ch == b.ch && memcmp(a.fg, b.fg, sizeof(a.fg)) == 0 &&
     memcmp(a.bg, b.bg, sizeof(a.bg)) == 0 && a.bold == b.bold &&
-    a.italic == b.italic && a.strike == b.strike && a.reverse == b.reverse;
+    a.italic == b.italic && a.strike == b.strike && a.reverse == b.reverse &&
+    a.underline == b.underline && !memcmp(a.underline_rgb, b.underline_rgb, sizeof(a.underline_rgb));
 }
 
 static int rgb_key(const int *rgb) {
@@ -140,7 +152,8 @@ static bool cell_same_bg(cell *a, cell *b) {
 
 static bool cell_same_text(cell *a, cell *b) {
   return rgb_equal(cell_fg(a), cell_fg(b)) && a->bold == b->bold &&
-    a->italic == b->italic && a->strike == b->strike;
+    a->italic == b->italic && a->strike == b->strike && a->underline == b->underline &&
+    rgb_equal(a->underline_rgb, b->underline_rgb);
 }
 
 @implementation EditTerminalView
@@ -464,12 +477,17 @@ static bool cell_same_text(cell *a, cell *b) {
     if (p == 0) attr_default(&_current);
     else if (p == 1) _current.bold = true;
     else if (p == 3) _current.italic = true;
+    else if (p == 4) _current.underline = true;
+    else if (p == 24) _current.underline = false;
+    else if (p == 59) {
+      _current.underline_rgb[0] = 235; _current.underline_rgb[1] = 85; _current.underline_rgb[2] = 85;
+    }
     else if (p == 9) _current.strike = true;
     else if (p == 29) _current.strike = false;
     else if (p == 7) _current.reverse = true;
     else if (p == 27) _current.reverse = false;
-    else if ((p == 38 || p == 48) && i + 4 < parts.count && [self csiInt:parts at:i + 1 fallback:0] == 2) {
-      int *rgb = p == 38 ? _current.fg : _current.bg;
+    else if ((p == 38 || p == 48 || p == 58) && i + 4 < parts.count && [self csiInt:parts at:i + 1 fallback:0] == 2) {
+      int *rgb = p == 38 ? _current.fg : p == 48 ? _current.bg : _current.underline_rgb;
       rgb[0] = [self csiInt:parts at:i + 2 fallback:rgb[0]];
       rgb[1] = [self csiInt:parts at:i + 3 fallback:rgb[1]];
       rgb[2] = [self csiInt:parts at:i + 4 fallback:rgb[2]];
@@ -519,9 +537,24 @@ static bool cell_same_text(cell *a, cell *b) {
 
   for (NSUInteger i = 0; i < data.length; i++) {
     unsigned char b = bytes[i];
+    if (_ansiState == AnsiOsc || _ansiState == AnsiOscEsc) {
+      if (b == 7 || (_ansiState == AnsiOscEsc && b == '\\')) {
+        [self spellingResponse:_csi];
+        [_csi setString:@""];
+        _ansiState = AnsiNormal;
+      } else if (b == 27) _ansiState = AnsiOscEsc;
+      else {
+        if (_csi.length <= 8192) [_csi appendFormat:@"%c", b];
+        _ansiState = AnsiOsc;
+      }
+      continue;
+    }
     if (_ansiState == AnsiEsc) {
       if (b == '[') {
         _ansiState = AnsiCsi;
+        [_csi setString:@""];
+      } else if (b == ']') {
+        _ansiState = AnsiOsc;
         [_csi setString:@""];
       } else _ansiState = AnsiNormal;
       continue;
@@ -587,8 +620,9 @@ static bool cell_same_text(cell *a, cell *b) {
 }
 
 - (NSDictionary *)attrsForCell:(cell *)x {
-  NSUInteger key = ((NSUInteger)rgb_key(cell_fg(x)) << 3) | (x->italic ? 1 : 0) |
-    (x->bold ? 2 : 0) | (x->strike ? 4 : 0);
+  NSUInteger key = ((NSUInteger)rgb_key(cell_fg(x)) << 28) |
+    ((NSUInteger)rgb_key(x->underline_rgb) << 4) | (x->italic ? 1 : 0) |
+    (x->bold ? 2 : 0) | (x->strike ? 4 : 0) | (x->underline ? 8 : 0);
   NSNumber *boxed = @(key);
   NSDictionary *attrs = _attrCache[boxed];
   if (!attrs) {
@@ -596,7 +630,9 @@ static bool cell_same_text(cell *a, cell *b) {
       NSFontAttributeName: x->bold ? _boldFont : _font,
       NSForegroundColorAttributeName: [self color:cell_fg(x)],
       NSObliquenessAttributeName: x->italic ? @0.18 : @0,
-      NSStrikethroughStyleAttributeName: x->strike ? @1 : @0
+      NSStrikethroughStyleAttributeName: x->strike ? @1 : @0,
+      NSUnderlineStyleAttributeName: x->underline ? @1 : @0,
+      NSUnderlineColorAttributeName: [self color:x->underline_rgb]
     };
     _attrCache[boxed] = attrs;
   }
@@ -709,16 +745,71 @@ static bool cell_same_text(cell *a, cell *b) {
 - (NSMenu *)menuForEvent:(NSEvent *)event {
   NSSize cell = [self cellSize];
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
-  [self sendMouseClickRow:(int)((self.bounds.size.height - p.y) / cell.height)
-                       col:(int)floor((p.x - [self rowRect:0].origin.x) / cell.width)];
-  NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Suggested Changes"];
+  int row = (int)((self.bounds.size.height - p.y) / cell.height);
+  int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
+  if (row < 0 || row >= _rows || col < 0 || col >= _cols) return nil;
+  _spellingRequest = _spellingRequest >= INT_MAX ? 1 : _spellingRequest + 1;
+  NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Edit"];
+  menu.autoenablesItems = NO;
+  NSMenuItem *checking = [[NSMenuItem alloc] initWithTitle:@"Checking spelling…" action:NULL keyEquivalent:@""];
+  checking.enabled = NO;
+  [menu addItem:checking];
+  [menu addItem:[NSMenuItem separatorItem]];
+  _spellingMenu = menu;
+  _spellingItems = 1;
   [menu addItem:[self contextItem:@"Create Comment" bytes:"\003c" length:2]];
   [menu addItem:[self contextItem:@"Delete Comment" bytes:"\003d" length:2]];
   [menu addItem:[self contextItem:@"Show/Hide Comments" bytes:"\003]" length:2]];
   [menu addItem:[NSMenuItem separatorItem]];
   [menu addItem:[self contextItem:@"Accept All Changes" bytes:"\003a" length:2]];
   [menu addItem:[self contextItem:@"Reject All Changes" bytes:"\003r" length:2]];
+  char request[64];
+  int n = snprintf(request, sizeof(request), "\033[778;%u;%d;%d~", _spellingRequest, row + 1, col + 1);
+  [self sendBytes:request length:(NSUInteger)n];
   return menu;
+}
+
+// Update the open native menu from the editor's Aspell results, including split reads.
+- (void)spellingResponse:(NSString *)message {
+  if (message.length > 8192) return;
+  NSArray<NSString *> *parts = [message componentsSeparatedByString:@";"];
+  if (parts.count < 4 || parts.count > 13 || ![parts[0] isEqualToString:@"777"] ||
+      ![parts[1] isEqualToString:@"spell"] || parts[2].longLongValue != _spellingRequest || !_spellingMenu) return;
+  NSMutableArray<NSString *> *labels = [NSMutableArray array];
+  for (NSUInteger i = 4; i < parts.count; i++) {
+    NSString *hex = parts[i];
+    if (!hex.length || hex.length > 512 || hex.length % 2) return;
+    NSMutableData *data = [NSMutableData data];
+    for (NSUInteger j = 0; j < hex.length; j += 2) {
+      NSScanner *scan = [NSScanner scannerWithString:[hex substringWithRange:NSMakeRange(j, 2)]];
+      unsigned byte;
+      if (![scan scanHexInt:&byte] || !scan.isAtEnd || byte == 0) return;
+      unsigned char c = (unsigned char)byte;
+      [data appendBytes:&c length:1];
+    }
+    NSString *label = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!label) return;
+    [labels addObject:label];
+  }
+  for (NSInteger i = 0; i < _spellingItems; i++) [_spellingMenu removeItemAtIndex:0];
+  _spellingItems = (NSInteger)labels.count;
+  for (NSUInteger i = 0; i < labels.count; i++) {
+    char command[48];
+    int n = snprintf(command, sizeof(command), "\033[779;%u;%u~", _spellingRequest, (unsigned)i + 1);
+    [_spellingMenu insertItem:[self contextItem:labels[i] bytes:command length:(NSUInteger)n] atIndex:(NSInteger)i];
+  }
+  if (!labels.count) {
+    NSMenuItem *empty = [[NSMenuItem alloc] initWithTitle:@"No spelling suggestions" action:NULL keyEquivalent:@""];
+    empty.enabled = NO;
+    [_spellingMenu insertItem:empty atIndex:0];
+    _spellingItems = 1;
+  }
+  char add[48];
+  int n = snprintf(add, sizeof(add), "\033[779;%u;0~", _spellingRequest);
+  NSMenuItem *accept = [self contextItem:@"Add word" bytes:add length:(NSUInteger)n];
+  accept.enabled = parts[3].length > 0;
+  [_spellingMenu insertItem:accept atIndex:_spellingItems++];
+  [_spellingMenu update];
 }
 
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise {
@@ -1042,6 +1133,39 @@ static int ansi_self_test(void) {
   }
 
   EditTerminalView *wrapView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  // Spelling decoration preserves foreground/background and participates in cache keys.
+  EditTerminalView *spellView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  ansi_feed(spellView, "\033[38;2;170;255;170;48;2;68;68;68;4;58;2;235;85;85mwrong\033[24m right\033[0m reset");
+  cell underlined = spellView.cells[0], plain = spellView.cells[6];
+  NSDictionary *underAttrs = [spellView attrsForCell:&underlined];
+  NSDictionary *plainAttrs = [spellView attrsForCell:&plain];
+  if (!underlined.underline || plain.underline || spellView.cells[12].underline ||
+      underlined.underline_rgb[0] != 235 || underlined.fg[0] != 170 || underlined.bg[0] != 68 ||
+      [underAttrs[NSUnderlineStyleAttributeName] intValue] != 1 ||
+      [plainAttrs[NSUnderlineStyleAttributeName] intValue] != 0 || cell_same_text(&underlined, &plain)) {
+    fprintf(stderr, "ansi spelling underline failed\n");
+    return 1;
+  }
+  cell changed = underlined;
+  changed.underline_rgb[0] = 100;
+  if (cell_equal(changed, underlined) || cell_same_text(&changed, &underlined) ||
+      [[spellView attrsForCell:&changed] isEqual:underAttrs]) return 1;
+  NSBitmapImageRep *spellBitmap = [[NSBitmapImageRep alloc]
+    initWithBitmapDataPlanes:NULL pixelsWide:spellView.bounds.size.width
+    pixelsHigh:spellView.bounds.size.height bitsPerSample:8 samplesPerPixel:4
+    hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+  [NSGraphicsContext saveGraphicsState];
+  [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithBitmapImageRep:spellBitmap]];
+  [spellView drawRect:spellView.bounds];
+  [NSGraphicsContext restoreGraphicsState];
+  BOOL redUnderline = NO;
+  for (int y = 0; y < spellBitmap.pixelsHigh && !redUnderline; y++)
+    for (int x = 0; x < spellBitmap.pixelsWide && !redUnderline; x++) {
+      NSColor *color = [[spellBitmap colorAtX:x y:y] colorUsingColorSpace:NSColorSpace.deviceRGBColorSpace];
+      redUnderline = color.redComponent > 0.5 && color.redComponent > color.greenComponent * 1.5;
+    }
+  if (!redUnderline) { fprintf(stderr, "spelling underline did not draw red\n"); return 1; }
+
   char fullRow[TERM_COLS + 1];
   memset(fullRow, 'a', TERM_COLS);
   fullRow[TERM_COLS] = '\0';
@@ -1098,6 +1222,43 @@ static int ansi_self_test(void) {
     fprintf(stderr, "mouse click bytes failed\n");
     return 1;
   }
+
+  // Right-click suggestions come from Aspell, and stale or malformed replies are ignored.
+  if (pipe(p) != 0) return 1;
+  EditTerminalView *menuView = [[EditTerminalView alloc] initForAnsiSelfTest];
+  menuView.fd = p[1];
+  NSRect menuRow = [menuView rowRect:0];
+  NSEvent *rightClick = [NSEvent mouseEventWithType:NSEventTypeRightMouseDown
+    location:NSMakePoint(menuRow.origin.x + menuView.cellSize.width * 1.5, NSMidY(menuRow))
+    modifierFlags:0 timestamp:0 windowNumber:0 context:nil eventNumber:1 clickCount:1 pressure:1];
+  NSMenu *context = [menuView menuForEvent:rightClick];
+  got = read(p[0], buf, sizeof(buf));
+  const char request[] = "\033[778;1;1;2~";
+  if (!context || got != (ssize_t)strlen(request) || memcmp(buf, request, strlen(request))) return 1;
+  ansi_feed(menuView, "\033]777;spell;1;7370656c696e67;7370656c6c696e67");
+  if (![[context itemAtIndex:0].title isEqualToString:@"Checking spelling…"]) return 1;
+  ansi_feed(menuView, ";7370696c6c696e67\a");
+  if (![[context itemAtIndex:0].title isEqualToString:@"spelling"] ||
+      ![[context itemAtIndex:1].title isEqualToString:@"spilling"] ||
+      ![[context itemAtIndex:2].title isEqualToString:@"Add word"] ||
+      ![context itemAtIndex:2].isEnabled ||
+      ![[context itemAtIndex:4].title isEqualToString:@"Create Comment"]) return 1;
+  ansi_feed(menuView, "\033]777;spell;2;00;626164\a\033]777;spell;1;00;zz\a");
+  if (![[context itemAtIndex:0].title isEqualToString:@"spelling"]) return 1;
+  [menuView sendCommand:[context itemAtIndex:0]];
+  got = read(p[0], buf, sizeof(buf));
+  const char choice[] = "\033[779;1;1~";
+  if (got != (ssize_t)strlen(choice) || memcmp(buf, choice, strlen(choice))) return 1;
+  [menuView sendCommand:[context itemAtIndex:2]];
+  got = read(p[0], buf, sizeof(buf));
+  const char add[] = "\033[779;1;0~";
+  if (got != (ssize_t)strlen(add) || memcmp(buf, add, strlen(add))) return 1;
+  ansi_feed(menuView, "\033]777;spell;1;7370656c696e67\a");
+  if (![[context itemAtIndex:1].title isEqualToString:@"Add word"] ||
+      ![context itemAtIndex:1].isEnabled) return 1;
+  ansi_feed(menuView, "\033]777;spell;1;\a");
+  if ([context itemAtIndex:1].isEnabled) return 1;
+  close(p[0]); close(p[1]); menuView.fd = -1;
 
   if (pipe(p) != 0) return 1;
   EditTerminalView *shortcutView = [[EditTerminalView alloc] initForAnsiSelfTest];

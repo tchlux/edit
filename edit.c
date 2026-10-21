@@ -29,6 +29,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <locale.h>
+#include <wchar.h>
+#include <wctype.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -60,6 +63,8 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define KEY_PASTE_START 1004
 #define KEY_PASTE_END 1005
 #define KEY_MOUSE 1006
+#define KEY_SPELL_MENU 1007
+#define KEY_SPELL_PICK 1008
 #define GAP_SIZE 4096
 #define STATUS_SIZE 160
 #define COMMAND_SIZE 1024
@@ -92,12 +97,15 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define DELETE_SGR "9;38;2;235;145;145;48;2;62;38;38"
 #define COMMENT_SGR "48;2;54;50;34"
 #define COMMENT_ACTIVE_SGR "48;2;76;66;35"
+#define SPELL_CACHE_SIZE 4096
+#define SPELL_WORD_SIZE 256
+#define SPELL_REPLY_SIZE 16384
 
 enum { HIST_INSERT, HIST_DELETE };
 enum { TRACK_SAME, TRACK_INSERT, TRACK_DELETE };
 enum { LAYOUT_ROWS, LAYOUT_COLS };
 enum { LAYOUT_LEAF = -1 };
-enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN, BUFFER_FIND, BUFFER_REVIEW };
+enum { BUFFER_FILE, BUFFER_SCRATCH, BUFFER_LIST, BUFFER_HELP, BUFFER_RUN, BUFFER_FIND, BUFFER_REVIEW, BUFFER_SPELL };
 enum { ACTION_OTHER, ACTION_KILL, ACTION_YANK };
 
 typedef struct {
@@ -133,7 +141,7 @@ typedef struct {
 } review_row;
 
 typedef struct { size_t pos, col; } column_point;
-typedef struct { size_t pos; char quote, fence; } syntax_point;
+typedef struct { size_t pos; char quote, fence, block, interpolation; } syntax_point;
 typedef struct { size_t start, next; bool full, newline; } wrap_point;
 
 typedef struct {
@@ -181,6 +189,11 @@ typedef struct {
   int render_n_spans;
   bool render_highlighted;
   bool highlighting_off;
+  bool spelling_off;
+  unsigned long revision;
+  long long edited_ms;
+  bool spelling_editing;
+  size_t spelling_start, spelling_end;
   column_point * columns;
   size_t n_columns, columns_cap, columns_start;
   int columns_tab;
@@ -249,6 +262,8 @@ typedef struct {
   int mouse_button;
   int mouse_row;
   int mouse_col;
+  unsigned spell_request;
+  int spell_choice;
   long long start_ms;
   long long end_ms;
   char kind[24];
@@ -261,6 +276,38 @@ typedef struct {
   size_t * pos;
   size_t cap;
 } prompt_slot;
+
+typedef struct {
+  char * word;
+  char * suggestions;
+  unsigned seen;
+  int result; // 0: unchecked, 1: accepted, 2: misspelled
+} spell_word;
+
+typedef struct {
+  pid_t pid;
+  int input, output;
+  bool live, failed, header, waiting, redraw;
+  int config_stage;
+  spell_word * cache;
+  unsigned frame;
+  int pending, next;
+  output send;
+  size_t sent, received;
+  char reply[SPELL_REPLY_SIZE];
+  long long started_ms;
+  bool choosing, adding, pending_add;
+  bool native;
+  unsigned request;
+  int origin_pane, preview_pane;
+  pane origin;
+  unsigned long revision;
+  size_t start, end;
+  char word[SPELL_WORD_SIZE];
+  char dictionary[PATH_SIZE];
+  char * choices[9];
+  int n_choices, choice;
+} spell_state;
 
 struct edit_state {
   buffer buffers[8];
@@ -352,6 +399,7 @@ struct edit_state {
   grammar grammar;
   bool has_grammar;
   bool batch_arrows;
+  spell_state spell;
 };
 
 static int env_tab_width(void) {
@@ -361,6 +409,9 @@ static int env_tab_width(void) {
   return (s != NULL && end > s && *end == '\0' && n > 0 && n < 1000) ?
     (int) n : DEFAULT_TAB_WIDTH;
 }
+
+static long long now_ms(void);
+static void spell_close(edit_state * e);
 
 static size_t env_run_output_max(void) {
   const char * s = getenv("EDIT_RUN_OUTPUT_MAX");
@@ -377,6 +428,7 @@ static int default_wrap(const char * path) {
 
 static void init_state(edit_state * e) {
   memset(e, 0, sizeof(*e));
+  setlocale(LC_CTYPE, "");
   e->layout_nodes[0] = (layout_node){LAYOUT_LEAF, 0, -1, -1};
   e->n_layout_nodes = 1;
   e->layout_root = 0;
@@ -385,6 +437,8 @@ static void init_state(edit_state * e) {
   e->find_origin_pane = -1;
   e->find_pane = -1;
   e->batch_arrows = getenv("EDIT_BATCH_ARROWS") != NULL;
+  e->spell.input = e->spell.output = e->spell.pending = -1;
+  e->spell.preview_pane = -1;
 }
 
 static char * _dup(const char * s) {
@@ -506,6 +560,7 @@ static void track_clear(buffer * b) {
 }
 
 static void buffer_invalidate_render(buffer * b) {
+  b->revision++;
   free(b->render_text);
   free(b->render_spans);
   b->render_text = NULL;
@@ -529,10 +584,23 @@ static void buffer_free(buffer * b) {
   free(b->base);
   free(b->data);
   free(b->path);
+  unsigned long revision = b->revision;
   memset(b, 0, sizeof(*b));
+  b->revision = revision;
 }
 
 static void buffers_free(edit_state * e) {
+  spell_close(e);
+  if (e->spell.cache) {
+    for (int i = 0; i < SPELL_CACHE_SIZE; i++) {
+      free(e->spell.cache[i].word);
+      free(e->spell.cache[i].suggestions);
+    }
+    free(e->spell.cache);
+    e->spell.cache = NULL;
+  }
+  for (int i = 0; i < e->spell.n_choices; i++) free(e->spell.choices[i]);
+  e->spell.n_choices = 0;
   for (int i = 0; i < 8; i++) buffer_free(&e->buffers[i]);
 }
 
@@ -707,10 +775,16 @@ static int buffer_insert(buffer * b, size_t pos, const char * s, size_t n) {
   memcpy(b->data + b->gap_a, s, n);
   b->gap_a += n;
   b->dirty = true;
+  b->edited_ms = now_ms();
+  b->spelling_editing = true;
+  b->spelling_start = b->spelling_end = pos + n;
   return 0;
 }
 
 static void buffer_delete(buffer * b, size_t start, size_t end) {
+  b->edited_ms = now_ms();
+  b->spelling_editing = true;
+  b->spelling_start = b->spelling_end = start;
   buffer_invalidate_render(b);
   size_t len = buffer_len(b);
   if (start > len) start = len;
@@ -1658,7 +1732,7 @@ static int buffer_set_text(buffer * b, const char * name, int kind, const char *
 }
 
 static bool read_only_buffer(buffer * b) {
-  return b->read_only || b->kind == BUFFER_LIST || b->kind == BUFFER_HELP ||
+  return b->read_only || b->kind == BUFFER_SPELL || b->kind == BUFFER_LIST || b->kind == BUFFER_HELP ||
     b->kind == BUFFER_RUN || b->kind == BUFFER_REVIEW;
 }
 
@@ -2329,9 +2403,22 @@ static int input_wait(edit_state * e, int usec) {
   struct timespec tv = {usec / 1000000, (usec % 1000000) * 1000};
   FD_ZERO(&set);
   FD_SET(STDIN_FILENO, &set);
+  fd_set writes;
+  FD_ZERO(&writes);
+  int maxfd = STDIN_FILENO;
+  spell_state * s = &e->spell;
+  if (s->waiting && s->pid) {
+    FD_SET(s->output, &set);
+    if (s->output > maxfd) maxfd = s->output;
+    if (s->send.len > s->sent) {
+      FD_SET(s->input, &writes);
+      if (s->input > maxfd) maxfd = s->input;
+    }
+  }
   // Unblock SIGWINCH atomically with waiting so a resize cannot be lost.
   int ready = window_changed ? 0 : e->input.len > 0 ? 1 :
-    pselect(STDIN_FILENO + 1, &set, NULL, NULL, usec < 0 ? NULL : &tv, &previous) == 1;
+    (pselect(maxfd + 1, &set, &writes, NULL, usec < 0 ? NULL : &tv, &previous) > 0 &&
+     FD_ISSET(STDIN_FILENO, &set));
   sigprocmask(SIG_SETMASK, &previous, NULL);
   return ready;
 }
@@ -2456,11 +2543,17 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
   if ((seq[0] == '[') || (seq[0] == 'O')) {
     snprintf(ev.kind, sizeof(ev.kind), "%s", seq[0] == '[' ? "csi" : "ss3");
     int button, x, y;
-    if (seq[0] == '[' && (final == 'M' || final == 'm') &&
+    if (final == '~' && sscanf(seq, "[778;%u;%d;%d", &ev.spell_request, &y, &x) == 3 &&
+        ev.spell_request && x > 0 && y > 0) {
+      ev.key = KEY_SPELL_MENU;
+      ev.mouse_row = y - 1; ev.mouse_col = x - 1;
+    } else if (final == '~' && sscanf(seq, "[779;%u;%d", &ev.spell_request, &ev.spell_choice) == 2 &&
+               ev.spell_request && ev.spell_choice >= 0 && ev.spell_choice <= 9) ev.key = KEY_SPELL_PICK;
+    else if (seq[0] == '[' && (final == 'M' || final == 'm') &&
         sscanf(seq, "[<%d;%d;%d", &button, &x, &y) == 3) {
       snprintf(ev.kind, sizeof(ev.kind), "sgr-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && final == 'M' && button == 0) {
+      if (ev.key < 0 && final == 'M' && (button == 0 || button == 2)) {
         ev.key = KEY_MOUSE;
         ev.mouse_button = button;
         ev.mouse_col = x - 1;
@@ -2470,7 +2563,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
       button = (unsigned char) seq[2] - 32;
       snprintf(ev.kind, sizeof(ev.kind), "x10-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && button == 0) {
+      if (ev.key < 0 && (button == 0 || button == 2)) {
         ev.key = KEY_MOUSE;
         ev.mouse_button = button;
         ev.mouse_col = (unsigned char) seq[3] - 33;
@@ -2915,17 +3008,6 @@ static track_atom * deleted_at(buffer * b, size_t pos) {
   return NULL;
 }
 
-static int markdown_fence_line(buffer * b, size_t start, size_t end, char * mark) {
-  size_t i = start;
-  while (i < end && i - start < 4 && buffer_at(b, i) == ' ') i++;
-  if (i + 2 >= end) return 0;
-  char c = buffer_at(b, i);
-  if ((c != '`' && c != '~') || buffer_at(b, i + 1) != c || buffer_at(b, i + 2) != c)
-    return 0;
-  *mark = c;
-  return 1;
-}
-
 // Cache lexical state at line boundaries, extending only as far as the viewport needs.
 static syntax_point syntax_before(buffer * b, size_t end) {
   size_t lo = 0, hi = b->n_syntax;
@@ -2935,19 +3017,22 @@ static syntax_point syntax_before(buffer * b, size_t end) {
     else hi = mid;
   }
   syntax_point state = lo ? b->syntax[lo - 1] : (syntax_point){0};
+  grammar lexical = {0};
+  lexical.triple_quote = state.quote;
+  lexical.markdown_fence = state.fence;
+  lexical.block_comment = state.block;
+  lexical.string_interpolation = state.interpolation;
+  output line = {0};
   while (state.pos < end) {
     size_t stop = next_line(b, state.pos);
     if (stop > end) stop = end;
-    char mark = 0;
-    if (markdown_fence_line(b, state.pos, stop, &mark))
-      state.fence = state.fence == mark ? 0 : state.fence ? state.fence : mark;
-    for (size_t i = state.pos; i + 2 < stop; i++) {
-      char c = buffer_at(b, i);
-      if ((c == '\'' || c == '"') && buffer_at(b, i + 1) == c && buffer_at(b, i + 2) == c) {
-        state.quote = state.quote == c ? 0 : state.quote ? state.quote : c;
-        i += 2;
-      }
-    }
+    line.len = 0;
+    for (size_t i = state.pos; i < stop; i++) out_add(&line, &(char){buffer_at(b, i)}, 1);
+    grammar_advance(&lexical, b->path, line.data, line.len, NULL);
+    state.quote = lexical.triple_quote;
+    state.fence = lexical.markdown_fence;
+    state.block = lexical.block_comment;
+    state.interpolation = lexical.string_interpolation;
     state.pos = stop;
     if (b->n_syntax && stop <= b->syntax[b->n_syntax - 1].pos) continue;
     if (b->n_syntax == b->syntax_cap) {
@@ -2959,7 +3044,287 @@ static syntax_point syntax_before(buffer * b, size_t end) {
     }
     b->syntax[b->n_syntax++] = state;
   }
+  free(line.data);
   return state;
+}
+
+static void spell_show_choices(edit_state * e);
+static int spell_cancel(edit_state * e);
+
+static void spell_close(edit_state * e) {
+  spell_state * s = &e->spell;
+  if (s->input >= 0) close(s->input);
+  if (s->output >= 0) close(s->output);
+  s->input = s->output = -1;
+  if (s->pid > 0) {
+    kill(s->pid, SIGKILL);
+    while (waitpid(s->pid, NULL, 0) < 0 && errno == EINTR) {}
+  }
+  s->pid = 0;
+  s->pending = -1;
+  free(s->send.data);
+  s->send = (output){0};
+  s->sent = s->received = 0;
+}
+
+static void spell_fail(edit_state * e, const char * message) {
+  if (e->spell.choosing) spell_cancel(e);
+  spell_close(e);
+  e->spell.failed = true;
+  e->spell.adding = false;
+  e->spell.redraw = true;
+  set_status(e, "spelling: %s (toggle to retry)", message);
+}
+
+static int spell_start(edit_state * e) {
+  spell_state * s = &e->spell;
+  if (s->pid) return 1;
+  if (s->failed || !s->live) return 0;
+  int input[2], reply[2];
+  if (pipe(input) != 0) return spell_fail(e, "pipe failed"), 0;
+  if (pipe(reply) != 0) {
+    close(input[0]); close(input[1]);
+    return spell_fail(e, "pipe failed"), 0;
+  }
+  const char * program = getenv("EDIT_ASPELL");
+  const char * language = getenv("EDIT_SPELL_LANGUAGE");
+  const char * personal = getenv("EDIT_SPELL_DICTIONARY");
+  if (!language || !*language) language = "en_US";
+  char dictionary[PATH_SIZE] = "";
+  const char * home = getenv("HOME");
+  if (personal && *personal) snprintf(dictionary, sizeof(dictionary), "%s", personal);
+  else if (!strncmp(language, "en", 2) && home) {
+    snprintf(dictionary, sizeof(dictionary), "%s/.aspell.en.pws", home);
+    if (access(dictionary, R_OK) != 0) dictionary[0] = 0;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    dup2(input[0], STDIN_FILENO);
+    dup2(reply[1], STDOUT_FILENO);
+    dup2(reply[1], STDERR_FILENO);
+    close(input[0]); close(input[1]); close(reply[0]); close(reply[1]);
+    char * args[] = {(char *)(program && *program ? program : "aspell"), "-a",
+      "--encoding=utf-8", "--mode=none", "--dont-save-repl", "--lang", (char *)language,
+      dictionary[0] ? "--personal" : NULL, dictionary[0] ? dictionary : NULL, NULL};
+    execvp(args[0], args);
+    if (!program || !*program) {
+      execv("/opt/homebrew/bin/aspell", args);
+      execv("/usr/local/bin/aspell", args);
+    }
+    _exit(127);
+  }
+  close(input[0]); close(reply[1]);
+  if (pid < 0) {
+    close(input[1]); close(reply[0]);
+    return spell_fail(e, "cannot start Aspell"), 0;
+  }
+  s->pid = pid;
+  s->input = input[1]; s->output = reply[0];
+  fcntl(s->input, F_SETFL, O_NONBLOCK);
+  fcntl(s->output, F_SETFL, O_NONBLOCK);
+  fcntl(s->input, F_SETFD, FD_CLOEXEC);
+  fcntl(s->output, F_SETFD, FD_CLOEXEC);
+  // Closed checker pipes are handled as errors, never as an editor-ending signal.
+  signal(SIGPIPE, SIG_IGN);
+  s->header = false; s->config_stage = 0;
+  s->started_ms = now_ms();
+  out_s(&s->send, "$$cr personal\n$$cr home-dir\n");
+  return 1;
+}
+
+// A bounded word cache keeps current viewport entries across hash collisions.
+static spell_word * spell_lookup(edit_state * e, const char * word, size_t n) {
+  spell_state * s = &e->spell;
+  if (!n || n >= SPELL_WORD_SIZE) return NULL;
+  if (!s->cache) s->cache = calloc(SPELL_CACHE_SIZE, sizeof(*s->cache));
+  if (!s->cache) return NULL;
+  unsigned hash = 2166136261u;
+  for (size_t i = 0; i < n; i++) hash = (hash ^ (unsigned char)word[i]) * 16777619u;
+  int replace = -1;
+  for (int i = 0; i < SPELL_CACHE_SIZE; i++) {
+    int slot = (int)((hash + (unsigned)i) % SPELL_CACHE_SIZE);
+    spell_word * w = &s->cache[slot];
+    if (w->word && strlen(w->word) == n && !memcmp(w->word, word, n)) return w;
+    if (!w->word) { replace = slot; break; }
+    if (replace < 0 && slot != s->pending && w->seen != s->frame &&
+        (!(s->choosing || s->adding) || strcmp(w->word, s->word))) replace = slot;
+  }
+  if (replace < 0) return NULL;
+  spell_word * w = &s->cache[replace];
+  char * copy = malloc(n + 1);
+  if (!copy) return NULL;
+  memcpy(copy, word, n); copy[n] = 0;
+  free(w->word); free(w->suggestions);
+  *w = (spell_word){.word = copy};
+  return w;
+}
+
+static bool spell_saved(spell_state * s) {
+  FILE * f = fopen(s->dictionary, "r");
+  if (!f) return false;
+  char * line = NULL;
+  size_t cap = 0;
+  bool found = false;
+  // Verify disk contents as well as the checker's in-memory acceptance.
+  while (getline(&line, &cap, f) >= 0) {
+    line[strcspn(line, "\r\n")] = 0;
+    if (!strcmp(line, s->word)) found = true;
+  }
+  free(line); fclose(f);
+  return found;
+}
+
+static void spell_reply(edit_state * e, char * line) {
+  spell_state * s = &e->spell;
+  if (!s->header) {
+    if (strncmp(line, "@(#)", 4)) { spell_fail(e, "Aspell did not start"); return; }
+    s->header = true;
+    return;
+  }
+  if (!strncmp(line, "Error:", 6)) { spell_fail(e, line); return; }
+  if (s->config_stage < 2) {
+    if (!s->config_stage) snprintf(s->dictionary, sizeof(s->dictionary), "%s", line);
+    else if (s->dictionary[0] != '/') {
+      char path[PATH_SIZE];
+      int n = snprintf(path, sizeof(path), "%s/%s", line, s->dictionary);
+      if (n < 0 || (size_t)n >= sizeof(path)) { spell_fail(e, "dictionary path too long"); return; }
+      strcpy(s->dictionary, path);
+    }
+    s->config_stage++;
+    return;
+  }
+  if (s->pending < 0) { spell_fail(e, "unexpected checker response"); return; }
+  spell_word * w = &s->cache[s->pending];
+  if (!*line) {
+    if (!w->result) { spell_fail(e, "incomplete checker response"); return; }
+    s->pending = -1;
+    s->redraw = true;
+    if (s->pending_add) {
+      s->pending_add = false;
+      s->adding = false;
+      if (!spell_saved(s)) { spell_fail(e, "dictionary was not saved"); return; }
+      for (int i = 0; i < SPELL_CACHE_SIZE; i++) s->cache[i].result = 0;
+      set_status(e, "saved %s to personal dictionary", s->word);
+    } else if (s->adding && !strcmp(w->word, s->word)) {
+      w->result = 0;
+    }
+    if (s->choosing && !strcmp(w->word, s->word)) spell_show_choices(e);
+    return;
+  }
+  if (line[0] == '*' || line[0] == '+' || line[0] == '-') w->result = 1;
+  else if (line[0] == '&' || line[0] == '?' || line[0] == '#') {
+    w->result = 2;
+    char * choices = strchr(line, ':');
+    free(w->suggestions);
+    w->suggestions = choices ? _dup(choices + 1) : NULL;
+  } else spell_fail(e, "invalid checker response");
+}
+
+// Pump partial reads and writes; one outstanding word makes reply ownership explicit.
+static void spell_service(edit_state * e, bool schedule) {
+  spell_state * s = &e->spell;
+  if (!s->pid) return;
+  if (s->send.len > s->sent) {
+    ssize_t n = write(s->input, s->send.data + s->sent, s->send.len - s->sent);
+    if (n > 0) s->sent += (size_t)n;
+    else if (n < 0 && errno != EAGAIN && errno != EINTR)
+      { spell_fail(e, "checker pipe closed"); return; }
+    if (s->sent == s->send.len) s->sent = s->send.len = 0;
+  }
+  for (;;) {
+    ssize_t n = read(s->output, s->reply + s->received, sizeof(s->reply) - 1 - s->received);
+    if (n == 0) { spell_fail(e, "Aspell exited"); return; }
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EINTR) break;
+      { spell_fail(e, "checker read failed"); return; }
+    }
+    s->received += (size_t)n;
+    s->reply[s->received] = 0;
+    char * end;
+    while ((end = memchr(s->reply, '\n', s->received))) {
+      size_t used = (size_t)(end - s->reply) + 1;
+      *end = 0;
+      spell_reply(e, s->reply);
+      if (!s->pid) return;
+      memmove(s->reply, s->reply + used, s->received - used);
+      s->received -= used;
+    }
+    if (s->received == sizeof(s->reply) - 1) { spell_fail(e, "checker reply too long"); return; }
+  }
+  if ((!s->header || s->config_stage < 2 || s->pending >= 0) && now_ms() - s->started_ms > 5000)
+    { spell_fail(e, "checker timed out"); return; }
+  if (!schedule || s->config_stage < 2 || s->pending >= 0 || s->send.len || !s->cache) return;
+  for (int i = 0; i < SPELL_CACHE_SIZE; i++) {
+    int slot = (s->next + i) % SPELL_CACHE_SIZE;
+    spell_word * w = &s->cache[slot];
+    bool requested = (s->choosing || s->adding) && w->word && !strcmp(w->word, s->word);
+    if (!w->word || w->result || (!requested && w->seen != s->frame)) continue;
+    if ((s->choosing || s->adding) && !requested) continue;
+    s->pending = slot;
+    s->next = (slot + 1) % SPELL_CACHE_SIZE;
+    s->started_ms = now_ms();
+    s->pending_add = s->adding;
+    if (s->pending_add) out_f(&s->send, "*%s\n#\n", w->word);
+    out_f(&s->send, "^%s\n", w->word);
+    break;
+  }
+}
+
+// Decode letters as UTF-8 code points so punctuation never joins unrelated words.
+static size_t spell_letter(const char * text, size_t len) {
+  wchar_t c;
+  mbstate_t state = {0};
+  size_t n = mbrtowc(&c, text, len, &state);
+  return n && n <= len && (iswalpha(c) || (c >= 0x300 && c <= 0x36f)) ? n : 0;
+}
+
+// Return a complete word at or following offset, retaining UTF-8 byte positions.
+static size_t spell_token(const char * line, size_t len, size_t * offset, size_t * end) {
+  size_t i = *offset;
+  while (i < len && !spell_letter(line + i, len - i) &&
+         !isdigit((unsigned char)line[i]) && line[i] != '_') i++;
+  size_t start = i;
+  bool technical = false;
+  while (i < len) {
+    size_t bytes = spell_letter(line + i, len - i);
+    if (bytes) i += bytes;
+    else if (isdigit((unsigned char)line[i]) || line[i] == '_') technical = true, i++;
+    else {
+      size_t apostrophe = line[i] == '\'' ? 1 :
+        i + 2 < len && !memcmp(line + i, "\xe2\x80\x99", 3) ? 3 : 0;
+      if (!apostrophe || i == start || i + apostrophe >= len ||
+          !spell_letter(line + i + apostrophe, len - i - apostrophe)) break;
+      i += apostrophe;
+    }
+  }
+  *offset = i > start ? i : start < len ? start + 1 : len;
+  *end = i;
+  return technical ? len : start;
+}
+
+// Test a whole prose word and its surrounding token, excluding language delimiters.
+static bool spell_prose_word(const char * line, grammar_span * spans, int count,
+                              size_t start, size_t end) {
+  if (start >= end || end - start >= SPELL_WORD_SIZE) return false;
+  for (int i = 0; i < count; i++) {
+    if (spans[i].end <= start) continue;
+    if (spans[i].start > start || !(spans[i].attr & GRAMMAR_ATTR_SPELL)) return false;
+    int first = i, last = i;
+    while (first && spans[first-1].end == spans[first].start &&
+           (spans[first-1].attr & GRAMMAR_ATTR_SPELL)) first--;
+    while (last + 1 < count && spans[last].end == spans[last+1].start &&
+           (spans[last+1].attr & GRAMMAR_ATTR_SPELL)) last++;
+    if (end > spans[last].end) return false;
+    size_t left = start, right = end;
+    while (left > spans[first].start && !isspace((unsigned char)line[left-1]) &&
+           !strchr("\"'`<>()[]{}", line[left-1])) left--;
+    while (right < spans[last].end && !isspace((unsigned char)line[right]) &&
+           !strchr("\"'`<>()[]{}", line[right])) right++;
+    for (size_t j = left; j < right; j++)
+      if (line[j] == '/' || line[j] == '\\' || line[j] == '@' || line[j] == '_') return false;
+    return true;
+  }
+  return false;
 }
 
 static void render_base_sgr(edit_state * e, output * o) {
@@ -2973,6 +3338,7 @@ static void render_span_sgr(edit_state * e, output * o, const char * sgr,
     out_f(o, "\x1b[0;%s", BASE_SGR);
     if (attr & GRAMMAR_ATTR_BOLD) out_s(o, ";1");
     if (attr & GRAMMAR_ATTR_ITALIC) out_s(o, ";3");
+    if (attr & GRAMMAR_ATTR_UNDERLINE) out_s(o, ";4;58;2;235;85;85");
     if (sgr != NULL) out_f(o, ";%s", sgr);
     out_s(o, "m");
     return;
@@ -2986,6 +3352,10 @@ static void render_span_sgr(edit_state * e, output * o, const char * sgr,
   }
   if (attr & GRAMMAR_ATTR_ITALIC) {
     out_f(o, "%s3", sep);
+    sep = ";";
+  }
+  if (attr & GRAMMAR_ATTR_UNDERLINE) {
+    out_f(o, "%s4;58;2;235;85;85", sep);
     sep = ";";
   }
   if (sgr != NULL) out_f(o, "%s%s", sep, sgr);
@@ -3040,11 +3410,13 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
       for (int r = 0; r < b->n_review && b->review[r].offset <= start; r++) review_line = &b->review[r];
   }
 
-  if (!b->render_highlighted && !b->highlighting_off && e->has_grammar && b->kind != BUFFER_FIND && b->kind != BUFFER_REVIEW) {
+  if (!b->render_highlighted && e->has_grammar && b->kind != BUFFER_FIND && b->kind != BUFFER_REVIEW) {
     if (e->grammar.is_default) {
       syntax_point state = syntax_before(b, start);
       e->grammar.triple_quote = state.quote;
       e->grammar.markdown_fence = state.fence;
+      e->grammar.block_comment = state.block;
+      e->grammar.string_interpolation = state.interpolation;
     }
     b->render_spans = malloc((n ? n : 1) * sizeof(*b->render_spans));
     if (b->render_spans) {
@@ -3075,6 +3447,8 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
   size_t col = 0;
   size_t shown = 0;
   size_t i = row_start - start;
+  size_t word_start = 0, word_end = 0;
+  bool misspelled = false;
   if (p->wrap) col = visual_col(e, b, start, row_start);
   for (; i < n && start + i < row_end && shown < limit;) {
     track_atom * deleted = deleted_at(b, start + i);
@@ -3118,9 +3492,44 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
         n && line[n - 1] == '/';
       sgr = dir ? "38;2;110;195;240" : "38;2;224;224;224";
     }
-    else if (span < n_spans && i >= spans[span].start) {
+    else if (!b->highlighting_off && span < n_spans && i >= spans[span].start) {
       sgr = spans[span].sgr;
-      new_attr = spans[span].attr;
+      new_attr = spans[span].attr & (GRAMMAR_ATTR_BOLD | GRAMMAR_ATTR_ITALIC);
+    }
+    if (e->spell.live && !e->spell.failed && !b->spelling_off &&
+        (b->kind == BUFFER_FILE || b->kind == BUFFER_SCRATCH)) {
+      if (i >= word_end) {
+        size_t offset = i;
+        // Recover the full word when a wrapped row begins inside it.
+        while (offset) {
+          size_t prev = utf8_prev_pos(b, start + offset) - start;
+          if (!spell_letter(line + prev, n - prev) && !isdigit((unsigned char)line[prev]) &&
+              line[prev] != '_' && line[prev] != '\'' &&
+              !(offset - prev == 3 && !memcmp(line + prev, "\xe2\x80\x99", 3))) break;
+          offset = prev;
+        }
+        word_start = spell_token(line, n, &offset, &word_end);
+        misspelled = false;
+        if (spell_prose_word(line, spans, n_spans, word_start, word_end)) {
+          spell_word * w = spell_lookup(e, line + word_start, word_end - word_start);
+          if (w) {
+            misspelled = w->result == 2;
+            if (now_ms() - b->edited_ms >= 250) {
+              w->seen = e->spell.frame;
+              if (!w->result) spell_start(e);
+            }
+          }
+        }
+        pane * active = active_pane(e);
+        if (b->edited_ms && b->spelling_editing && pane_buffer(e, active) == b &&
+            b->spelling_end >= start + word_start && b->spelling_start <= start + word_end &&
+            active->cursor >= start + word_start && active->cursor <= start + word_end) {
+          b->spelling_start = start + word_start;
+          b->spelling_end = start + word_end;
+          misspelled = false;
+        }
+      }
+      if (misspelled && i >= word_start && i < word_end) new_attr |= GRAMMAR_ATTR_UNDERLINE;
     }
     if (sgr != color || new_attr != attr) {
       if (e->raw) {
@@ -4997,6 +5406,7 @@ static bool fallback_text_byte(char c) {
 
 static bool fallback_context(edit_state * e, int key) {
   return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
+    (!e->spell.choosing || e->spell.native) &&
     ! e->command_prompt && ! e->run_prompt && ! e->goto_prompt && ! e->search_prompt && ! e->replace_phase &&
     ! e->debug_recording && ! e->debug_note_prompt &&
     active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
@@ -6272,6 +6682,9 @@ static const char HELP_TEXT[] =
   "  M-x (or Esc x)                    run a command by name\n"
   "  Tab / Tab Tab                     complete / list matching commands\n"
   "  toggle-syntax-highlighting        toggle colors in the current buffer\n"
+  "  toggle-spell-checking             toggle spelling in the current buffer\n"
+  "  spell-correct-word (M-$)          choose correction; i adds word\n"
+  "  spell-add-word                    save word to personal dictionary\n"
   "\n"
   "Help\n"
   "  C-h                               show this help\n";
@@ -6324,6 +6737,264 @@ static int cmd_toggle_syntax_highlighting(edit_state * e, int key) {
   buffer_invalidate_render(b);
   set_status(e, "syntax highlighting %s", b->highlighting_off ? "off" : "on");
   (void) key;
+  return 0;
+}
+
+// Send only hex-encoded labels; the app returns a numbered choice and request ID.
+static void spell_native_menu(edit_state * e) {
+  spell_state * s = &e->spell;
+  output o = {0};
+  out_f(&o, "\x1b]777;spell;%u", s->request);
+  for (int i = -1; i < s->n_choices; i++) {
+    const unsigned char * text = (const unsigned char *)(i < 0 ? s->word : s->choices[i]);
+    out_s(&o, ";");
+    for (; *text; text++) out_f(&o, "%02x", *text);
+  }
+  out_s(&o, "\a");
+  terminal_write(o.data, o.len);
+  free(o.data);
+}
+
+static int spell_cancel(edit_state * e) {
+  spell_state * s = &e->spell;
+  bool restore = s->choosing && !s->native;
+  if (s->preview_pane >= 0 && s->preview_pane < e->n_panes &&
+      pane_buffer(e, &e->panes[s->preview_pane])->kind == BUFFER_SPELL) {
+    e->active_pane = s->preview_pane;
+    cmd_close_pane(e, 0);
+  }
+  s->preview_pane = -1;
+  if (restore && s->origin_pane < e->n_panes) {
+    e->active_pane = s->origin_pane;
+    *active_pane(e) = s->origin;
+  }
+  s->word[0] = 0;
+  if (s->native && s->choosing && !s->n_choices) spell_native_menu(e);
+  s->choosing = false;
+  for (int i = 0; i < s->n_choices; i++) free(s->choices[i]);
+  s->n_choices = s->choice = 0;
+  e->prefix = 0;
+  e->footer[0] = 0;
+  return 0;
+}
+
+static int cmd_toggle_spell_checking(edit_state * e, int key) {
+  buffer * b = active_buffer(e);
+  b->spelling_off = !b->spelling_off;
+  if (!b->spelling_off && e->spell.failed) {
+    e->spell.failed = false;
+    if (e->spell.cache)
+      for (int i = 0; i < SPELL_CACHE_SIZE; i++) e->spell.cache[i].result = 0;
+  }
+  set_status(e, "spell checking %s", b->spelling_off ? "off" : "on");
+  (void)key;
+  return 0;
+}
+
+// Capture a current prose word; the saved revision protects asynchronous corrections.
+static int spell_target(edit_state * e) {
+  spell_state * s = &e->spell;
+  buffer * b = active_buffer(e);
+  pane * p = active_pane(e);
+  if (b->kind != BUFFER_FILE && b->kind != BUFFER_SCRATCH)
+    return set_status(e, "no prose word here"), 0;
+  size_t start = line_start(b, p->cursor), len = line_end(b, p->cursor) - start;
+  char * line = malloc(len + 1);
+  grammar_span * spans = malloc((len ? len : 1) * sizeof(*spans));
+  if (!line || !spans) { free(line); free(spans); return 0; }
+  for (size_t i = 0; i < len; i++) line[i] = buffer_at(b, start + i);
+  line[len] = 0;
+  grammar g = e->grammar;
+  syntax_point state = syntax_before(b, start);
+  g.triple_quote = state.quote; g.markdown_fence = state.fence;
+  g.block_comment = state.block; g.string_interpolation = state.interpolation;
+  int count = grammar_highlight(&g, b->path, line, len, spans, len < INT_MAX ? (int)len : INT_MAX);
+  bool found = false;
+  for (size_t offset = 0; offset < len;) {
+    size_t end, word = spell_token(line, len, &offset, &end);
+    if (word >= end || end - word >= sizeof(s->word) ||
+        p->cursor < start + word || p->cursor > start + end) continue;
+    if (!spell_prose_word(line, spans, count, word, end)) break;
+    memcpy(s->word, line + word, end - word);
+    s->word[end - word] = 0;
+    s->start = start + word; s->end = start + end;
+    s->origin = *p; s->revision = b->revision;
+    s->origin_pane = e->active_pane;
+    found = true;
+    break;
+  }
+  free(line); free(spans);
+  if (!found) set_status(e, "no prose word here");
+  return found;
+}
+
+static void spell_show_choices(edit_state * e) {
+  spell_state * s = &e->spell;
+  if (!s->choosing) return;
+  if (e->buffers[s->origin.buffer].revision != s->revision) {
+    spell_cancel(e);
+    set_status(e, "word changed; check again"); return;
+  }
+  if (s->preview_pane < 0) {
+    spell_word * w = spell_lookup(e, s->word, strlen(s->word));
+    if (!w || !w->result) return;
+    if (w->result == 1) {
+      spell_cancel(e);
+      set_status(e, w->result == 1 ? "word is spelled correctly" : "no spelling suggestions"); return;
+    }
+    char * copy = _dup(w->suggestions ? w->suggestions : "");
+    if (!copy) return;
+    char * next = copy;
+    while (next && s->n_choices < 9) {
+      char * word = next;
+      next = strchr(word, ',');
+      if (next) *next++ = 0;
+      while (*word == ' ') word++;
+      size_t n = strlen(word);
+      while (n && word[n-1] == ' ') word[--n] = 0;
+      if (n && n < SPELL_WORD_SIZE) s->choices[s->n_choices++] = _dup(word);
+    }
+    free(copy);
+    if (s->native) {
+      spell_native_menu(e);
+      s->choosing = false;
+      return;
+    }
+    int preview = -1;
+    for (int i = 0; i < e->n_buffers; i++) if (e->buffers[i].kind == BUFFER_SPELL) preview = i;
+    if (e->rows < 5 || e->n_panes >= PANE_MAX || (preview < 0 && e->n_buffers >= 8)) {
+      spell_cancel(e);
+      set_status(e, "not enough room for spelling preview"); return;
+    }
+    if (preview < 0) preview = e->n_buffers++;
+    layout_compact(e);
+    int root = e->n_layout_nodes++, leaf = e->n_layout_nodes++;
+    e->layout_nodes[root] = (layout_node){LAYOUT_ROWS, -1, e->layout_root, leaf};
+    e->layout_nodes[leaf] = (layout_node){LAYOUT_LEAF, e->n_panes, -1, -1};
+    e->layout_root = root;
+    s->preview_pane = e->n_panes++;
+    e->panes[s->preview_pane] = (pane){.buffer = preview, .preferred_col = SIZE_MAX};
+    e->active_pane = s->preview_pane;
+  }
+  output text = {0};
+  out_f(&text, "Spelling: %s\n\nArrows choose; Enter or 1-9 replaces; i adds word; Esc/C-g cancels\n\n", s->word);
+  size_t cursor = text.len;
+  if (!s->n_choices) out_s(&text, "No spelling suggestions; press i to add word\n");
+  for (int i = 0; i < s->n_choices; i++) {
+    if (i == s->choice) cursor = text.len;
+    out_f(&text, "%s %d  %s\n", i == s->choice ? ">" : " ", i + 1, s->choices[i]);
+  }
+  pane * preview = &e->panes[s->preview_pane];
+  buffer_set_text(pane_buffer(e, preview), "*spelling*", BUFFER_SPELL, text.data);
+  preview->cursor = cursor;
+  preview->preferred_col = SIZE_MAX;
+  free(text.data);
+  set_status(e, "spelling: arrows, Enter, 1-9; i adds word; Esc/C-g cancel");
+}
+
+static int cmd_spell_correct_word(edit_state * e, int key) {
+  if (e->spell.adding) return set_status(e, "dictionary save in progress"), 0;
+  if (e->spell.choosing || e->spell.n_choices) spell_cancel(e);
+  e->spell.word[0] = 0;
+  e->spell.native = key == KEY_SPELL_MENU;
+  if (read_only_buffer(active_buffer(e))) return set_status(e, "read only"), 0;
+  if (!spell_target(e) || !spell_start(e)) { e->spell.word[0] = 0; return 0; }
+  e->spell.choosing = true;
+  e->spell.choice = 0;
+  if (!spell_lookup(e, e->spell.word, strlen(e->spell.word))) {
+    spell_cancel(e);
+    return set_status(e, "checker busy; try again"), 0;
+  }
+  set_status(e, "checking %s (Esc/C-g cancels)", e->spell.word);
+  spell_show_choices(e);
+  (void)key;
+  return 0;
+}
+
+static int cmd_spell_add_word(edit_state * e, int key) {
+  if (e->spell.adding) return set_status(e, "dictionary save in progress"), 0;
+  if (e->spell.choosing || e->spell.n_choices) spell_cancel(e);
+  if (!spell_target(e) || !spell_start(e)) return 0;
+  spell_word * w = spell_lookup(e, e->spell.word, strlen(e->spell.word));
+  if (!w) return set_status(e, "checker busy; try again"), 0;
+  w->result = 0;
+  e->spell.adding = true;
+  set_status(e, "saving %s to personal dictionary", e->spell.word);
+  (void)key;
+  return 0;
+}
+
+static int spell_choice_key(edit_state * e, int key) {
+  spell_state * s = &e->spell;
+  if (key == KEY_ESC || key == KEY_CTRL('g')) {
+    spell_cancel(e);
+    return set_status(e, "cancel"), 0;
+  }
+  if (key == 'i') {
+    if (!s->word[0] || s->origin_pane >= e->n_panes ||
+        e->panes[s->origin_pane].buffer != s->origin.buffer ||
+        e->buffers[s->origin.buffer].revision != s->revision) {
+      spell_cancel(e);
+      return set_status(e, "word changed; check again"), 0;
+    }
+    if (s->native) {
+      e->active_pane = s->origin_pane;
+      *active_pane(e) = s->origin;
+    }
+    spell_cancel(e);
+    return cmd_spell_add_word(e, key);
+  }
+  if (!s->n_choices) return 0;
+  if (key == KEY_CTRL('x')) { e->prefix = key; return 0; }
+  if (e->prefix == KEY_CTRL('x')) {
+    e->prefix = 0;
+    if (key == 'o') return cmd_other_pane(e, key);
+    if (key == '0') return spell_cancel(e);
+    return 0;
+  }
+  if (key == KEY_CTRL('v')) return cmd_page_down(e, key);
+  if (key == KEY_META('v')) return cmd_page_up(e, key);
+  if (e->active_pane != s->preview_pane && !s->native) {
+    if (key == KEY_UP) return cmd_up(e, key);
+    if (key == KEY_DOWN) return cmd_down(e, key);
+    if (key == KEY_LEFT) return cmd_left(e, key);
+    if (key == KEY_RIGHT) return cmd_right(e, key);
+  }
+  if (key == KEY_UP || key == KEY_DOWN) {
+    s->choice = (s->choice + (key == KEY_UP ? s->n_choices - 1 : 1)) % s->n_choices;
+    spell_show_choices(e);
+    return 0;
+  }
+  if (key >= '1' && key < '1' + s->n_choices) s->choice = key - '1';
+  else if (key != KEY_ENTER) return 0;
+  char * replacement = _dup(s->choices[s->choice]);
+  size_t start = s->start, end = s->end;
+  unsigned long revision = s->revision;
+  if (s->native) {
+    if (s->origin_pane >= e->n_panes || e->panes[s->origin_pane].buffer != s->origin.buffer ||
+        e->buffers[s->origin.buffer].revision != revision) {
+      free(replacement);
+      spell_cancel(e);
+      return set_status(e, "word changed; check again"), 0;
+    }
+    e->active_pane = s->origin_pane;
+    *active_pane(e) = s->origin;
+  }
+  spell_cancel(e);
+  buffer * b = active_buffer(e);
+  if (b->revision != revision || read_only_buffer(b)) {
+    free(replacement);
+    return set_status(e, "word changed; check again"), 0;
+  }
+  unsigned group = ++b->history_group;
+  if (replacement && edit_delete(e, start, end, group, true) == 0 &&
+      edit_insert(e, start, replacement, strlen(replacement), group, true) == 0) {
+    active_pane(e)->cursor = start + strlen(replacement);
+    active_pane(e)->preferred_col = SIZE_MAX;
+    clear_mark(e);
+    set_status(e, "spelling corrected");
+  }
+  free(replacement);
   return 0;
 }
 
@@ -6415,6 +7086,9 @@ static binding bindings[] = {
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit, "save-buffers-kill-terminal"},
   {{KEY_META('x'), 0}, 1, cmd_execute_extended_command, "execute-extended-command"},
   {{0, 0}, 0, cmd_toggle_syntax_highlighting, "toggle-syntax-highlighting"},
+  {{0, 0}, 0, cmd_toggle_spell_checking, "toggle-spell-checking"},
+  {{KEY_META('$'), 0}, 1, cmd_spell_correct_word, "spell-correct-word"},
+  {{0, 0}, 0, cmd_spell_add_word, "spell-add-word"},
 };
 
 // Complete command names, then reuse the cancellable help view for the full list.
@@ -6611,6 +7285,7 @@ static int replace_dispatch(edit_state * e, int key) {
 }
 
 static int dispatch(edit_state * e, int key) {
+  if (e->spell.choosing && !e->spell.native) return spell_choice_key(e, key);
   sync_review(e);
   int keys[2] = {key, 0};
   int n_keys = 1;
@@ -6733,14 +7408,33 @@ static int tui(const char * path) {
     "\x1b[48;2;32;32;32m\x1b[2 q\x1b[?12l";
   terminal_write(start, strlen(start));
 
+  e.spell.live = true;
   while (! e.quit) {
     window_changed = 0;
     auto_reload(&e);
+    buffer * edited = active_buffer(&e);
+    if (active_pane(&e)->cursor < edited->spelling_start || active_pane(&e)->cursor > edited->spelling_end)
+      edited->spelling_editing = false;
+    spell_service(&e, false);
+    e.spell.frame++;
     render(&e);
+    e.spell.redraw = false;
+    spell_service(&e, true);
+    if (e.spell.redraw) continue;
     int timeout = status_timeout(&e);
+    for (int i = 0; i < e.n_panes; i++) {
+      buffer * b = pane_buffer(&e, &e.panes[i]);
+      long long delay = 250 - (now_ms() - b->edited_ms);
+      if (!e.spell.failed && !b->spelling_off && (b->kind == BUFFER_FILE || b->kind == BUFFER_SCRATCH) &&
+          delay > 0 && (timeout < 0 || delay < timeout)) timeout = (int)delay;
+    }
+    if (e.spell.pid && (e.spell.pending >= 0 || e.spell.config_stage < 2) &&
+        (timeout < 0 || timeout > 250)) timeout = 250;
     if (search_highlight_active(&e) && (timeout < 0 || SEARCH_BLINK_MS < timeout))
       timeout = SEARCH_BLINK_MS;
+    e.spell.waiting = true;
     key_event ev = read_key_event(&e, timeout);
+    e.spell.waiting = false;
     status_expire(&e);
     const char * action = "ignored";
     int key = ev.key;
@@ -6749,15 +7443,44 @@ static int tui(const char * path) {
       debug_log_state(&e, "before");
     }
 
-    if (key == KEY_MOUSE) {
-      e.prefix = 0;
-      e.quit_confirm = false;
-      active_pane(&e)->recenter = 0;
-      mouse_click(&e, &ev);
+    if (key == KEY_SPELL_PICK) {
+      if (e.spell.native && e.spell.request == ev.spell_request && e.spell.word[0])
+        spell_choice_key(&e, ev.spell_choice ? '0' + ev.spell_choice : 'i');
+      key = -1;
+    }
+    if (key == KEY_MOUSE || key == KEY_SPELL_MENU) {
+      bool correction = key == KEY_SPELL_MENU || ev.mouse_button == 2;
+      if (correction && (e.spell.choosing || e.spell.n_choices)) spell_cancel(&e);
+      pane_rect rects[PANE_MAX];
+      pane_rects(&e, rects);
+      int pane_i = pane_at(&e, ev.mouse_row, ev.mouse_col, rects);
+      bool body = pane_i >= 0 && ev.mouse_row - rects[pane_i].row < pane_body_rows(&e, pane_i);
+      if (correction && prompt_footer_cursor(&e) && !e.find_prompt) body = false;
+      if (body) {
+        e.prefix = 0;
+        e.quit_confirm = false;
+        mouse_click(&e, &ev);
+        if (correction) {
+          if (key == KEY_SPELL_MENU) e.spell.request = ev.spell_request;
+          cmd_spell_correct_word(&e, key == KEY_SPELL_MENU ? KEY_SPELL_MENU : 0);
+          if (key == KEY_SPELL_MENU && !e.spell.choosing && !e.spell.n_choices) spell_native_menu(&e);
+        } else if (e.spell.choosing && !e.spell.native && e.active_pane == e.spell.preview_pane) {
+          size_t line, col;
+          pos_line_col(active_buffer(&e), active_pane(&e)->cursor, &line, &col);
+          if (line >= 5 && line < (size_t)e.spell.n_choices + 5) {
+            e.spell.choice = (int)line - 5;
+            spell_show_choices(&e);
+          }
+        }
+      } else if (key == KEY_SPELL_MENU) {
+        e.spell.word[0] = 0;
+        e.spell.request = ev.spell_request;
+        spell_native_menu(&e);
+      }
       action = "mouse";
       key = -1;
     }
-    if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC &&
+    if (! e.debug_recording && ! e.debug_note_prompt && e.prefix == KEY_ESC && key >= 0 &&
         key != KEY_CTRL('g')) {
       e.prefix = 0;
       if (key >= 0 && key < 128) {
@@ -6778,7 +7501,7 @@ static int tui(const char * path) {
       debug_stop_prompt(&e);
       action = "debug-stop";
     } else if (! e.debug_recording && key == KEY_ESC) {
-      if (e.command_prompt || active_buffer(&e)->kind == BUFFER_HELP) {
+      if ((e.spell.choosing && !e.spell.native) || e.command_prompt || active_buffer(&e)->kind == BUFFER_HELP) {
         dispatch(&e, key);
         action = "help-cancel";
       } else {
@@ -6792,6 +7515,9 @@ static int tui(const char * path) {
         debug_log_state(&e, "before");
         action = "debug-start";
       } else action = "debug-already-recording";
+    } else if (key == KEY_PASTE_START && e.spell.choosing && !e.spell.native) {
+      output ignored = read_paste(&e);
+      free(ignored.data);
     } else if (key == KEY_PASTE_START && (e.find_prompt || e.search_prompt ||
                e.replace_phase || e.command_prompt || e.run_prompt || e.goto_prompt)) {
       dispatch(&e, key);

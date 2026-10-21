@@ -2,13 +2,13 @@
 set -eu
 
 sh ./build.sh
-Edit.app/Contents/MacOS/Edit --ansi-self-test
 
 tmp=$(mktemp)
 base=${tmp##*/}
 out=$(mktemp)
 recent=$(mktemp)
 dir=$(mktemp -d)
+spell_dir=$(mktemp -d)
 export EDIT_RECENT="$recent"
 clip_has=0
 clip_saved=
@@ -23,10 +23,389 @@ if command -v pbcopy >/dev/null 2>&1 && command -v pbpaste >/dev/null 2>&1; then
 fi
 cleanup() {
   if [ "$clip_has" = 1 ]; then printf '%s' "$clip_saved" | pbcopy; fi
-  rm -rf "$dir"
+  rm -rf "$dir" "$spell_dir"
   rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"
 }
 trap cleanup EXIT
+
+# Exercise native menus without registering a freshly rebuilt app bundle with Launch Services.
+cp Edit.app/Contents/MacOS/Edit "$spell_dir/Edit"
+"$spell_dir/Edit" --ansi-self-test
+
+# Spelling uses a controllable pipe checker; no test writes the user's dictionaries.
+cat > "$spell_dir/fake-aspell" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+import time
+
+personal = os.environ['EDIT_SPELL_DICTIONARY']
+accepted = {'hello', 'spelling', 'don’t', 'café'}
+if os.path.exists(personal):
+    accepted.update(open(personal, encoding='utf-8').read().splitlines()[1:])
+print('@(#) fake Aspell', flush=True)
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    if line == '$$cr personal':
+        print(personal, flush=True)
+    elif line == '$$cr home-dir':
+        print(os.environ['HOME'], flush=True)
+    elif line.startswith('*'):
+        accepted.add(line[1:])
+    elif line == '#':
+        if os.environ.get('EDIT_TEST_SAVE_FAIL'):
+            print('Error: dictionary cannot be saved', flush=True)
+        else:
+            with open(personal, 'w', encoding='utf-8') as target:
+                target.write('personal_ws-1.1 en 0 utf-8\n' + '\n'.join(sorted(accepted)) + '\n')
+    elif line.startswith('^'):
+        word = line[1:]
+        if word == 'crashword':
+            sys.exit(1)
+        with open(os.environ['EDIT_TEST_SPELL_LOG'], 'a', encoding='utf-8') as log:
+            log.write(word + '\n')
+        # Split every response and delay its final bytes to exercise partial reads.
+        result = '*\n\n' if word in accepted else ('# ' + word + ' 1\n\n' if word == 'newpersonalword' else '& ' + word + ' 2 1: spelling, spilling\n\n')
+        sys.stdout.write(result[:2])
+        sys.stdout.flush()
+        time.sleep(0.04)
+        sys.stdout.write(result[2:])
+        sys.stdout.flush()
+PY
+chmod +x "$spell_dir/fake-aspell"
+cat > "$spell_dir/spell-check.c" <<'EOF'
+#define main edit_program_main
+#include "edit.c"
+#undef main
+#include <assert.h>
+
+// Drive asynchronous work without making a checker response part of editing.
+static void pump(edit_state * e) {
+  long long until = now_ms() + 4000;
+  do {
+    spell_service(e, true);
+    if (e->spell.failed) break;
+    if (e->spell.header && e->spell.config_stage == 2 && e->spell.pending < 0 &&
+        !e->spell.send.len && !e->spell.adding && (!e->spell.choosing || e->spell.preview_pane >= 0)) break;
+    nanosleep(&(struct timespec){0, 1000000}, NULL);
+  } while (now_ms() < until);
+  assert(now_ms() < until);
+}
+
+// Compare semantic prose coverage with the same lexical checkpoints used for scrolling.
+static void prose(const char * path, const char * text, const char * word, int expected) {
+  edit_state e;
+  init_state(&e);
+  load_grammar(&e);
+  e.n_buffers = e.n_panes = 1;
+  assert(buffer_set_text(&e.buffers[0], path, BUFFER_FILE, text) == 0);
+  const char * at = strstr(text, word);
+  assert(at);
+  e.panes[0].cursor = (size_t)(at - text);
+  assert(spell_target(&e) == expected);
+  if (expected) assert(!strcmp(e.spell.word, word));
+  buffers_free(&e);
+}
+
+// Buffer snapshots contain bytes without a trailing NUL.
+static void assert_text(buffer * b, const char * expected) {
+  size_t n;
+  char * text = buffer_text(b, &n);
+  assert(n == strlen(expected) && !memcmp(text, expected, n));
+  free(text);
+}
+
+static void paint(edit_state * e, output * o) {
+  size_t pos = 0;
+  e->spell.frame++;
+  render_buffer_line(e, o, &e->buffers[0], &e->panes[0], &pos, 0, 100);
+}
+
+int main(int argc, char ** argv) {
+  assert(argc == 3 || argc == 4);
+  assert(setenv("EDIT_ASPELL", argv[1], 1) == 0);
+  assert(setenv("EDIT_SPELL_DICTIONARY", argv[2], 1) == 0);
+  if (argc == 4) {
+    edit_state real;
+    init_state(&real); real.spell.live = true; real.n_buffers = real.n_panes = 1;
+    real.rows = 24; real.cols = 80; load_grammar(&real);
+    buffer_set_text(&real.buffers[0], "notes.txt", BUFFER_FILE, "speling");
+    cmd_spell_correct_word(&real, 0); pump(&real);
+    assert(!real.spell.failed && real.spell.n_choices && !strcmp(real.spell.choices[0], "spelling"));
+    dispatch(&real, '1');
+    assert_text(&real.buffers[0], "spelling");
+    buffer_set_text(&real.buffers[0], "notes.txt", BUFFER_FILE, "editzzpersonalterm");
+    real.panes[0].cursor = 0;
+    cmd_spell_add_word(&real, 0); pump(&real);
+    assert(!real.spell.failed && strstr(real.status, "saved"));
+    struct stat info;
+    assert(!lstat(argv[2], &info) && S_ISLNK(info.st_mode));
+    buffers_free(&real);
+    init_state(&real); real.spell.live = true;
+    spell_word * known = spell_lookup(&real, "editzzpersonalterm", strlen("editzzpersonalterm"));
+    known->seen = real.spell.frame;
+    spell_start(&real); pump(&real); assert(!real.spell.failed && known->result == 1);
+    buffers_free(&real);
+    puts("real Aspell corrections and dictionary restart ok");
+    return 0;
+  }
+  prose("notes.txt", "speling", "speling", 1);
+  prose("notes.md", "# speling", "speling", 1);
+  prose("notes.md", "`speling`", "speling", 0);
+  prose("notes.md", "```c\nspeling\n```", "speling", 0);
+  prose("notes.md", "[speling](url)", "speling", 1);
+  prose("notes.md", "[label](speling)", "speling", 0);
+  prose("notes.md", "https://speling.example", "speling", 0);
+  prose("notes.txt", "/tmp/speling.txt", "speling", 0);
+  prose("notes.txt", "speling_42", "speling_42", 0);
+  prose("notes.txt", "café—don’t", "café", 1);
+  prose("notes.txt", "café—don’t", "don’t", 1);
+  prose("x.py", "x = value // speling", "speling", 0);
+  prose("x.c", "int speling;", "speling", 0);
+  prose("x.c", "// speling", "speling", 1);
+  prose("x.c", "//speling", "speling", 1);
+  prose("x.c", "/*speling*/", "speling", 1);
+  prose("x.py", "#speling", "speling", 1);
+  prose("x.c", "/*\nspeling\n*/", "speling", 1);
+  prose("x.c", "char *x = \"/*\";\nint speling;", "speling", 0);
+  prose("x.py", "# speling", "speling", 1);
+  prose("x.py", "x = \"\"\"\nspeling\n\"\"\"", "speling", 1);
+  prose("x.py", "x = f\"hello {speling}\"", "speling", 0);
+  prose("x.py", "x = f\"speling {value}\"", "speling", 1);
+  prose("x.sh", "echo \"speling $(cmd)\"", "speling", 1);
+  prose("x.sh", "echo \"hello ${speling}\"", "speling", 0);
+  prose("x.f90", "! speling", "speling", 1);
+  prose("x.f90", "x = 'speling'", "speling", 1);
+
+  edit_state custom;
+  init_state(&custom); custom.n_buffers = custom.n_panes = 1;
+  custom.has_grammar = true;
+  custom.grammar.n_rules = 2;
+  strcpy(custom.grammar.rules[0].scope, "keyword");
+  strcpy(custom.grammar.rules[0].regex, "identifier"); custom.grammar.rules[0].word = 1;
+  strcpy(custom.grammar.rules[1].scope, "comment");
+  strcpy(custom.grammar.rules[1].regex, "speling"); custom.grammar.rules[1].word = 1;
+  buffer_set_text(&custom.buffers[0], "custom", BUFFER_FILE, "identifier speling");
+  assert(!spell_target(&custom));
+  custom.panes[0].cursor = 11;
+  assert(spell_target(&custom));
+  buffers_free(&custom);
+
+  edit_state e;
+  init_state(&e);
+  e.rows = 24; e.cols = 80;
+  e.n_buffers = e.n_panes = 1;
+  e.panes[0].preferred_col = SIZE_MAX;
+  e.spell.live = true;
+  load_grammar(&e);
+  assert(buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "speling speling hello") == 0);
+  e.buffers[0].edited_ms = 0;
+  output o = {0};
+  long long begin = now_ms();
+  paint(&e, &o);
+  assert(now_ms() - begin < 100);
+  free(o.data);
+  pump(&e);
+  assert(!e.spell.failed);
+  spell_word * w = spell_lookup(&e, "speling", 7);
+  assert(w && w->result == 2 && w->suggestions);
+  // Typing hides only the edited word, while other cached misspellings remain visible.
+  e.buffers[0].edited_ms = now_ms();
+  e.buffers[0].spelling_editing = true;
+  e.buffers[0].spelling_start = 0; e.buffers[0].spelling_end = 7;
+  e.panes[0].cursor = 3;
+  o = (output){0}; paint(&e, &o);
+  assert(!strncmp(o.data, "speling ", 8));
+  assert(strstr(o.data + 8, "4;58;2;235;85;85")); free(o.data);
+  e.buffers[0].edited_ms = 0;
+  e.buffers[0].spelling_editing = false;
+  e.panes[0].cursor = 0;
+  for (int wrap = 0; wrap < 3; wrap++) {
+    e.panes[0].wrap = wrap;
+    for (int off = 0; off < 2; off++) {
+      e.buffers[0].highlighting_off = off;
+      o = (output){0}; paint(&e, &o);
+      assert(strstr(o.data, "4;58;2;235;85;85"));
+      free(o.data);
+    }
+  }
+  e.panes[0].mark = 1; e.panes[0].mark_active = true;
+  pane origin = e.panes[0];
+  cmd_spell_correct_word(&e, 0);
+  assert(e.spell.n_choices == 2 && active_buffer(&e)->kind == BUFFER_SPELL);
+  assert(e.n_panes == 2 && e.panes[0].buffer == 0 && e.spell.preview_pane == 1);
+  dispatch(&e, KEY_ESC);
+  assert(!e.spell.choosing && !memcmp(&e.panes[0], &origin, sizeof(origin)));
+  // Preview cancellation preserves unrelated panes and ordinary C-x o navigation.
+  split_pane(&e, LAYOUT_COLS);
+  pane saved_panes[PANE_MAX];
+  pane_rect before[PANE_MAX], after[PANE_MAX];
+  memcpy(saved_panes, e.panes, sizeof(saved_panes));
+  pane_rects(&e, before);
+  cmd_spell_correct_word(&e, 0);
+  assert(e.n_panes == 3 && e.spell.preview_pane == 2);
+  dispatch(&e, KEY_CTRL('x')); dispatch(&e, 'o');
+  assert(e.active_pane == 0);
+  dispatch(&e, KEY_CTRL('g'));
+  assert(e.n_panes == 2 && !memcmp(e.panes, saved_panes, 2 * sizeof(pane)));
+  pane_rects(&e, after);
+  assert(!memcmp(before, after, sizeof(before)));
+  e.active_pane = 1; cmd_close_pane(&e, 0); e.active_pane = 0;
+
+  cmd_spell_correct_word(&e, 0);
+  e.rows = 5;
+  dispatch(&e, KEY_DOWN);
+  ensure_visible(&e);
+  assert(pane_cursor_row(&e, active_pane(&e), pane_body_rows(&e, e.active_pane)) < 3);
+  e.rows = 24;
+  dispatch(&e, KEY_UP);
+  dispatch(&e, KEY_ENTER);
+  assert_text(&e.buffers[0], "spelling speling hello");
+  cmd_undo(&e, 0);
+  assert_text(&e.buffers[0], "speling speling hello");
+  e.panes[0].cursor = 0;
+  cmd_spell_correct_word(&e, 0);
+  buffer_insert(&e.buffers[0], 0, "X", 1);
+  dispatch(&e, '1');
+  assert_text(&e.buffers[0], "Xspeling speling hello");
+
+  // Both SGR and classic terminal right-button presses are decoded without treating release as a click.
+  const char * events[] = {"\033[<2;4;3M", "\033[M\042\044\043", "\033[<2;4;3m",
+                           "\033[778;7;3;4~", "\033[779;7;2~", "\033[779;7;0~"};
+  for (int i = 0; i < 6; i++) {
+    out_s(&e.input, events[i]);
+    key_event event = read_key_event(&e, 0);
+    if (i < 2) assert(event.key == KEY_MOUSE && event.mouse_button == 2 && event.mouse_col == 3 && event.mouse_row == 2);
+    if (i == 2) assert(event.key != KEY_MOUSE);
+    if (i == 3) assert(event.key == KEY_SPELL_MENU && event.spell_request == 7 && event.mouse_col == 3 && event.mouse_row == 2);
+    if (i == 4) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 2);
+    if (i == 5) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 0);
+  }
+
+  // A missing checker fails once; the per-buffer toggle allows an explicit retry.
+  spell_close(&e);
+  setenv("EDIT_ASPELL", "/no/such/edit-spell-checker", 1);
+  spell_start(&e); pump(&e);
+  assert(e.spell.failed && !e.spell.pid);
+  cmd_toggle_spell_checking(&e, 0);
+  cmd_toggle_spell_checking(&e, 0);
+  assert(!e.spell.failed && !e.buffers[0].spelling_off);
+  setenv("EDIT_ASPELL", argv[1], 1);
+
+  // Only current-frame candidates are queued; a delayed reply cannot mark new text.
+  spell_close(&e);
+  for (int i = 0; i < SPELL_CACHE_SIZE; i++) if (e.spell.cache[i].word) e.spell.cache[i].result = 0;
+  e.spell.frame++;
+  w = spell_lookup(&e, "invisibleword", 13); assert(w); w->seen = e.spell.frame;
+  e.spell.frame++;
+  w = spell_lookup(&e, "visibleword", 11); assert(w); w->seen = e.spell.frame;
+  spell_start(&e); pump(&e);
+  assert(w->result == 2);
+  assert(spell_lookup(&e, "invisibleword", 13)->result == 0);
+  buffers_free(&e);
+
+  // Spelling corrections use the same edit operations in Suggested mode.
+  init_state(&e); e.spell.live = true; e.n_buffers = e.n_panes = 1;
+  e.rows = 24; e.cols = 80; load_grammar(&e);
+  buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "speling");
+  cmd_suggested(&e, 0);
+  assert(e.buffers[0].suggested);
+  cmd_spell_correct_word(&e, 0); pump(&e); dispatch(&e, '1');
+  assert_text(&e.buffers[0], "spelling");
+  assert(e.buffers[0].suggested && e.buffers[0].base_len == 7 &&
+         !memcmp(e.buffers[0].base, "speling", 7));
+  cmd_undo(&e, 0); assert_text(&e.buffers[0], "speling");
+  buffers_free(&e);
+
+  // Dictionary writes follow symlinks, are confirmed on disk, and survive restart.
+  init_state(&e); e.spell.live = true; e.n_buffers = e.n_panes = 1; load_grammar(&e);
+  buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "newpersonalword");
+  e.rows = 24; e.cols = 80;
+  dispatch(&e, KEY_META('$')); pump(&e);
+  assert(e.spell.choosing && e.spell.n_choices == 0 && e.n_panes == 2);
+  dispatch(&e, 'i'); pump(&e);
+  assert(e.n_panes == 1 && e.active_pane == 0);
+  assert_text(&e.buffers[0], "newpersonalword");
+  assert(!e.spell.failed && strstr(e.status, "saved"));
+  struct stat info;
+  assert(!lstat(argv[2], &info) && S_ISLNK(info.st_mode));
+  buffers_free(&e);
+  init_state(&e); e.spell.live = true;
+  w = spell_lookup(&e, "newpersonalword", 15); w->seen = e.spell.frame;
+  spell_start(&e); pump(&e); assert(w->result == 1); buffers_free(&e);
+
+  // Native Add word uses the clicked target and rejects a changed source.
+  init_state(&e); e.spell.live = true; e.n_buffers = e.n_panes = 1; load_grammar(&e);
+  buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "nativepersonalword hello");
+  cmd_spell_correct_word(&e, KEY_SPELL_MENU); pump(&e);
+  assert(!e.spell.choosing && e.spell.n_choices);
+  e.panes[0].cursor = 22;
+  spell_choice_key(&e, 'i'); pump(&e);
+  assert(strstr(e.status, "saved nativepersonalword"));
+  e.panes[0].cursor = 0;
+  buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "stalepersonalword");
+  cmd_spell_correct_word(&e, KEY_SPELL_MENU); pump(&e);
+  e.buffers[0].revision++;
+  spell_choice_key(&e, 'i');
+  assert(!e.spell.adding && strstr(e.status, "word changed"));
+  buffers_free(&e);
+
+  init_state(&e); e.spell.live = true;
+  w = spell_lookup(&e, "crashword", 9); w->seen = e.spell.frame;
+  spell_start(&e); pump(&e); assert(e.spell.failed && !e.spell.pid);
+  buffers_free(&e);
+  init_state(&e); e.spell.live = true; e.n_buffers = e.n_panes = 1; load_grammar(&e);
+  setenv("EDIT_TEST_SAVE_FAIL", "1", 1);
+  buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, "unsavedword");
+  cmd_spell_add_word(&e, 0); pump(&e);
+  assert(e.spell.failed && !strstr(e.status, "saved unsavedword"));
+  unsetenv("EDIT_TEST_SAVE_FAIL"); buffers_free(&e);
+  puts("spelling checks ok");
+  return 0;
+}
+EOF
+printf 'personal_ws-1.1 en 0 utf-8\n' > "$spell_dir/words.pws"
+ln -s "$spell_dir/words.pws" "$spell_dir/words-link.pws"
+export EDIT_TEST_SPELL_LOG="$spell_dir/spell.log"
+cc -std=c11 -Wall -Wextra -pedantic -O2 -I "$PWD" -o "$spell_dir/spell-check" "$spell_dir/spell-check.c" grammar.c regex.c
+"$spell_dir/spell-check" "$spell_dir/fake-aspell" "$spell_dir/words-link.pws"
+[ "$(grep -c '^speling$' "$spell_dir/spell.log")" = 2 ]
+! grep -q '^invisibleword$' "$spell_dir/spell.log"
+unset EDIT_TEST_SPELL_LOG
+
+# Right-click keeps the source above a numbered preview, applies a choice, and restores split layouts.
+printf 'hello speling\nsecond line\n' > "$spell_dir/right-click.txt"
+export EDIT_TEST_SPELL_LOG="$spell_dir/terminal-spell.log"
+EDIT_ASPELL="$spell_dir/fake-aspell" EDIT_SPELL_DICTIONARY="$spell_dir/words-link.pws" \
+  python3 ./tui_view.py 14:60 '<right-click:8:1><wait-status>' "$spell_dir/right-click.txt" > "$out"
+grep -q 'hello.speling' "$out"
+grep -q '\*spelling\*' "$out"
+grep -q '1..spelling' "$out"
+EDIT_ASPELL="$spell_dir/fake-aspell" EDIT_SPELL_DICTIONARY="$spell_dir/words-link.pws" \
+  python3 ./tui_view.py 14:60 '<right-click:8:1><wait-status>2^x^s' "$spell_dir/right-click.txt" > "$out"
+printf 'hello spilling\nsecond line\n' | cmp -s - "$spell_dir/right-click.txt"
+if grep -q '\*spelling\*' "$out"; then exit 1; fi
+printf 'hello speling\nsecond line\n' > "$spell_dir/right-click.txt"
+EDIT_ASPELL="$spell_dir/fake-aspell" EDIT_SPELL_DICTIONARY="$spell_dir/words-link.pws" \
+  python3 ./tui_view.py 14:60 '^x3<right-click:8:1><wait-status><esc>' "$spell_dir/right-click.txt" > "$out"
+[ "$(grep -o 'right-click.txt' "$out" | wc -l)" -eq 2 ]
+if grep -q '\*spelling\*' "$out"; then exit 1; fi
+EDIT_ASPELL="$spell_dir/fake-aspell" EDIT_SPELL_DICTIONARY="$spell_dir/words-link.pws" \
+  python3 ./tui_view.py 14:8 '<right-click:2:2><wait-status>1^x^s' "$spell_dir/right-click.txt" > "$out"
+printf 'hello spelling\nsecond line\n' | cmp -s - "$spell_dir/right-click.txt"
+# The Emacs cursor shortcut opens the preview; i saves without changing the document.
+printf 'terminalpersonalword\n' > "$spell_dir/add-word.txt"
+EDIT_ASPELL="$spell_dir/fake-aspell" EDIT_SPELL_DICTIONARY="$spell_dir/words-link.pws" \
+  python3 ./tui_view.py 14:60 '<esc>$<wait-status>i<wait-status>' "$spell_dir/add-word.txt" > "$out"
+grep -q '^terminalpersonalword$' "$spell_dir/words.pws"
+printf 'terminalpersonalword\n' | cmp -s - "$spell_dir/add-word.txt"
+if grep -q '\*spelling\*' "$out"; then exit 1; fi
+unset EDIT_TEST_SPELL_LOG
+if command -v aspell >/dev/null 2>&1; then
+  printf 'personal_ws-1.1 en 0 utf-8\n' > "$spell_dir/real-words.pws"
+  ln -s "$spell_dir/real-words.pws" "$spell_dir/real-words-link.pws"
+  "$spell_dir/spell-check" "$(command -v aspell)" "$spell_dir/real-words-link.pws" real
+fi
 
 # A selected empty line fills only its pane and clears when the newline is unselected.
 cat > "$dir/empty-selection-check.c" <<EOF
@@ -135,7 +514,7 @@ int main(void) {
   e.panes[0].cursor = 0;
   pos = 0;
   render_buffer_line(&e, &plain, &e.buffers[0], &e.panes[0], &pos, 0, 100);
-  assert(!e.buffers[0].render_n_spans && strcmp(colored.data, plain.data));
+  assert(e.buffers[0].render_n_spans && strcmp(colored.data, plain.data));
   dispatch(&e, KEY_META('x'));
   for (const char * c = "toggle-syntax-highlighting"; *c; c++) dispatch(&e, *c);
   dispatch(&e, KEY_ENTER);
@@ -1873,7 +2252,7 @@ env SHELL=/bin/zsh HOME="$cancel_home" python3 ./tui_view.py 5:80 '^cxprintf nop
 test ! -e "$cancel_home/.edit/config"
 
 python3 ./tui_view.py 10:40 '<down><down><down><right><right>' test.sh > "$out"
-printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:Edit.app/Contents/MacOS/Edit.--ansi-self\n 06:\n 07:tmp=$(mktemp)\n' > "$tmp.expected"
+printf ' 01:#!/bin/sh\n 02:set.-eu\n 03:\n>04:sh../build.sh\n 05:\n 06:tmp=$(mktemp)\n 07:base=${tmp##*/}\n' > "$tmp.expected"
 head -n 7 "$out" > "$tmp.head"
 cmp -s "$tmp.expected" "$tmp.head"
 tail -n 1 "$out" > "$tmp.head"

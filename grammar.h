@@ -26,6 +26,8 @@
 #define GRAMMAR_MAX_SPANS 256
 #define GRAMMAR_ATTR_BOLD 1
 #define GRAMMAR_ATTR_ITALIC 2
+#define GRAMMAR_ATTR_SPELL 4
+#define GRAMMAR_ATTR_UNDERLINE 8
 
 typedef struct {
   char scope[GRAMMAR_SCOPE_SIZE];
@@ -46,6 +48,8 @@ typedef struct {
   int is_default;
   char triple_quote;
   char markdown_fence;
+  char block_comment;
+  char string_interpolation;
 } grammar;
 
 typedef struct {
@@ -56,6 +60,8 @@ typedef struct {
 } grammar_span;
 
 void grammar_load_default(grammar * g);
+void grammar_advance(grammar * g, const char * path, const char * line,
+                     size_t len, int * attrs);
 int grammar_load(grammar * g, const char * path);
 int grammar_highlight(grammar * g, const char * path, const char * line,
                       size_t len, grammar_span * spans, int max_spans);

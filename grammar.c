@@ -173,6 +173,14 @@ static void _attr(int * attrs, size_t len, size_t start, size_t end, int attr) {
   for (size_t i = start; i < end; i++) attrs[i] |= attr;
 }
 
+// Mark prose without tying its meaning to a theme's colors.
+static void _spell(int * attrs, size_t start, size_t end, int enabled) {
+  for (size_t i = start; attrs && i < end; i++) {
+    if (enabled) attrs[i] |= GRAMMAR_ATTR_SPELL;
+    else attrs[i] &= ~GRAMMAR_ATTR_SPELL;
+  }
+}
+
 static int _word_start(char c) {
   return isalpha((unsigned char) c) || c == '_';
 }
@@ -686,6 +694,14 @@ static void _default_highlight(grammar * g, const char * line, size_t len,
   size_t start = 0;
   size_t end = 0;
 
+  if (g->block_comment) {
+    size_t j = 0;
+    while (j + 1 < len && !(line[j] == '*' && line[j+1] == '/')) j++;
+    if (j + 1 >= len) { _paint(sgrs, len, 0, len, _sgr(g, "comment")); return; }
+    i0 = j + 2;
+    _paint(sgrs, len, 0, i0, _sgr(g, "comment"));
+  }
+
   if (g->triple_quote != '\0') {
     size_t j = _triple_close(line, len, g->triple_quote);
     _paint(sgrs, len, 0, j, _sgr(g, "string"));
@@ -710,8 +726,8 @@ static void _default_highlight(grammar * g, const char * line, size_t len,
         _paint(sgrs, len, i, j + 2, _sgr(g, "comment"));
         i = j + 2;
       } else {
-        _paint(sgrs, len, i, i + 1, _sgr(g, "operator"));
-        i++;
+        _paint(sgrs, len, i, len, _sgr(g, "comment"));
+        return;
       }
     } else if (line[i] == '#') {
       _paint(sgrs, len, i, len, _sgr(g, "comment"));
@@ -780,14 +796,132 @@ static void _default_highlight(grammar * g, const char * line, size_t len,
 }
 
 static void _word(const char ** sgrs, const char * line, size_t len,
-                  const char * word, const char * sgr) {
+                  const char * word, const char * sgr, int * attrs, int prose) {
   size_t n = strlen(word);
   if (n == 0 || n > len) return;
   for (size_t i = 0; i + n <= len; i++)
     if ((i == 0 || _boundary(line[i-1])) &&
         (i + n == len || _boundary(line[i+n])) &&
-        memcmp(line + i, word, n) == 0)
+        memcmp(line + i, word, n) == 0) {
       _paint(sgrs, len, i, i + n, sgr);
+      if (prose) _spell(attrs, i, i + n, 1);
+    }
+}
+
+// Exclude escapes and interpolated code from an otherwise prose string.
+static void _spell_string(const char * line, size_t start, size_t end,
+                           int interpolation, int * attrs) {
+  _spell(attrs, start, end, 1);
+  for (size_t i = start; i < end; i++) {
+    size_t j = i;
+    if (line[i] == '\\') j = i + (i + 1 < end ? 2 : 1);
+    else if (interpolation && line[i] == '{') {
+      int depth = 1;
+      for (j = i + 1; j < end && depth; j++) {
+        if (line[j] == '{') depth++;
+        if (line[j] == '}') depth--;
+      }
+    } else if (line[i] == '$' && i + 1 < end) {
+      j = i + 1;
+      if (line[j] == '{' || line[j] == '(') {
+        char open = line[j], close = open == '{' ? '}' : ')';
+        int depth = 1;
+        for (j++; j < end && depth; j++) {
+          if (line[j] == open) depth++;
+          if (line[j] == close) depth--;
+        }
+      } else while (j < end && _word_char(line[j])) j++;
+    }
+    if (j > i) _spell(attrs, i, j, 0), i = j - 1;
+  }
+}
+
+// Advance the same lexical state for viewport checkpoints and prose spans.
+void grammar_advance(grammar * g, const char * path, const char * line,
+                     size_t len, int * attrs) {
+  if (_markdown_path(path) || path == NULL) {
+    size_t lead = _lead(line, len);
+    char fence = lead < len ? line[lead] : 0;
+    if ((fence == '`' || fence == '~') && lead + 2 < len &&
+        line[lead+1] == fence && line[lead+2] == fence) {
+      if (!g->markdown_fence) g->markdown_fence = fence;
+      else if (g->markdown_fence == fence) g->markdown_fence = 0;
+      return;
+    }
+    if (g->markdown_fence) return;
+    _spell(attrs, 0, len, 1);
+    for (size_t i = 0; i < len; i++) {
+      if (line[i] == '`') {
+        size_t count = 1, j;
+        while (i + count < len && line[i+count] == '`') count++;
+        for (j = i + count; j < len; j++) {
+          size_t k = 0;
+          while (j + k < len && line[j+k] == '`') k++;
+          if (k == count) { j += k; break; }
+          if (k) j += k - 1;
+        }
+        _spell(attrs, i, j, 0);
+        i = j ? j - 1 : i;
+      } else if (line[i] == ']' && i + 1 < len && line[i+1] == '(') {
+        size_t j = i + 2;
+        int depth = 1;
+        for (; j < len && depth; j++) {
+          if (line[j] == '(') depth++;
+          if (line[j] == ')') depth--;
+        }
+        _spell(attrs, i, j, 0);
+        i = j - 1;
+      }
+    }
+    return;
+  }
+  int python = _suffix(path, ".py") || _suffix(path, ".pyw");
+  int shell = _suffix(path, ".sh") || _suffix(path, ".bash") || _suffix(path, ".zsh");
+  int fortran = _fortran_path(path);
+  int c_style = !python && !shell && !fortran;
+  const char * base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  const char * ext = strrchr(base, '.');
+  // Unrecognized extensions retain the editor's existing mixed code highlighting.
+  int generic = !ext || !_word_in("c h cpp cc hpp m mm js jsx ts tsx java go rs css swift py pyw sh bash zsh f90", ext + 1, strlen(ext + 1));
+  int triple = python || generic;
+  for (size_t i = 0; i < len;) {
+    if (g->block_comment) {
+      size_t j = i;
+      while (j + 1 < len && !(line[j] == '*' && line[j+1] == '/')) j++;
+      int closed = j + 1 < len;
+      _spell(attrs, i, closed ? j : len, 1);
+      i = closed ? j + 2 : len;
+      g->block_comment = !closed;
+    } else if (g->triple_quote) {
+      size_t j = _triple_close(line + i, len - i, g->triple_quote) + i;
+      int closed = j >= i + 3 && _triple_at(line, len, j - 3, g->triple_quote);
+      _spell_string(line, i, closed ? j - 3 : len, g->string_interpolation, attrs);
+      if (closed) g->triple_quote = g->string_interpolation = 0;
+      i = j;
+    } else if ((c_style && i + 1 < len && line[i] == '/' && line[i+1] == '/') ||
+               ((python || shell || generic) && line[i] == '#') || (fortran && line[i] == '!')) {
+      _spell(attrs, i + (c_style ? 2 : 1), len, 1);
+      break;
+    } else if (c_style && i + 1 < len && line[i] == '/' && line[i+1] == '*') {
+      g->block_comment = 1;
+      i += 2;
+    } else if (line[i] == '\'' || line[i] == '"' || (c_style && line[i] == '`')) {
+      char quote = line[i];
+      int interpolation = 0;
+      if (triple) _string_prefix(line, i, &interpolation);
+      if (triple && _triple_at(line, len, i, quote)) {
+        g->triple_quote = quote;
+        g->string_interpolation = interpolation;
+        i += 3;
+      } else {
+        size_t j = fortran ? _fortran_quote_end(line, len, i) : _quote_end(line, len, i);
+        int closed = j > i + 1 && line[j-1] == quote;
+        _spell_string(line, i + 1, closed ? j - 1 : j, interpolation, attrs);
+        i = j;
+      }
+    } else i++;
+  }
 }
 
 int grammar_highlight(grammar * g, const char * path, const char * line,
@@ -813,19 +947,24 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
     _default_highlight(g, line, len, sgrs);
   for (int i = 0; !g->is_default && i < g->n_rules; i++) {
     const char * sgr = _sgr(g, g->rules[i].scope);
+    int prose = !strcmp(g->rules[i].scope, "comment") || !strcmp(g->rules[i].scope, "string");
     if (g->rules[i].word) {
-      _word(sgrs, line, len, g->rules[i].regex, sgr);
+      _word(sgrs, line, len, g->rules[i].regex, sgr, attrs, prose);
     } else {
       int n = len < INT_MAX ? (int) len + 1 : INT_MAX;
       int * starts = NULL;
       int * ends = NULL;
       matcha(g->rules[i].regex, text, &n, &starts, &ends);
       for (int j = 0; j < n; j++)
-        if (starts[j] >= 0 && ends[j] > starts[j])
+        if (starts[j] >= 0 && ends[j] > starts[j]) {
           _paint(sgrs, len, (size_t) starts[j], (size_t) ends[j], sgr);
+          if (prose) _spell(attrs, (size_t)starts[j], (size_t)ends[j] < len ? (size_t)ends[j] : len, 1);
+        }
       free(starts);
     }
   }
+
+  if (g->is_default) grammar_advance(g, path, line, len, attrs);
 
   int n_spans = 0;
   for (size_t i = 0; i < len && n_spans < max_spans; i++) {

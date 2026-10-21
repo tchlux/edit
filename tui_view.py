@@ -83,10 +83,11 @@ def keys(s):
         elif s.startswith("<wheel-x10-shift-down>", i):
             out += b"\x1b[Me!!"
             i += 22
-        elif s.startswith("<click:", i):
+        elif s.startswith("<click:", i) or s.startswith("<right-click:", i):
             j = s.find(">", i)
-            col, row = [int(x) for x in s[i + 7:j].split(":")]
-            out += ("\x1b[<0;%d;%dM" % (col, row)).encode()
+            right = s.startswith("<right-click:", i)
+            col, row = [int(x) for x in s[i + (13 if right else 7):j].split(":")]
+            out += ("\x1b[<%d;%d;%dM" % (2 if right else 0, col, row)).encode()
             i = j + 1
         elif s.startswith("<click-x10:", i):
             j = s.find(">", i)
@@ -250,9 +251,9 @@ def read_tui(path, rows, cols, key_text):
             except OSError:
                 break
     for c in keys(key_text):
-        if c == 255:
+        if c in (253, 255):
             # Drain frames during the pause so output cannot block Escape handling.
-            pause_end = time.time() + 0.05
+            pause_end = time.time() + (3.2 if c == 253 else 0.05)
             while time.time() < pause_end:
                 ready, _, _ = select.select([fd], [], [], max(0, pause_end - time.time()))
                 if fd in ready:
@@ -265,8 +266,6 @@ def read_tui(path, rows, cols, key_text):
                 with open(path, "wb") as f:
                     f.write(b"external reload\n")
             time.sleep(0.1)
-        elif c == 253:
-            time.sleep(3.2)
         else:
             os.write(fd, bytes([c]))
 
@@ -286,7 +285,9 @@ def read_tui(path, rows, cols, key_text):
         except ChildProcessError:
             break
 
-    snapshot = out
+    # Capture complete frames when an asynchronous redraw reaches the deadline.
+    complete = out.rfind(b"\x1b[?25h")
+    snapshot = out[:complete + len(b"\x1b[?25h")] if complete >= 0 else out
     if not done[0]:
         os.write(fd, ctrl("g") + ctrl("x") + ctrl("c"))
         for _ in range(2):

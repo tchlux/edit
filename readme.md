@@ -220,6 +220,57 @@ word keyword int return static
 
 ## CUSTOMIZATION
 
+### Spelling
+
+Interactive Edit checks visible prose automatically using an installed `aspell`
+binary. It checks `.txt`, `.md`, and `.markdown` prose and source comments and
+strings, skipping Markdown code, link destinations, URLs, paths, and technical
+tokens containing digits or underscores. Checks run asynchronously after a
+250 ms typing pause. The word being edited stays unmarked until the cursor
+leaves it. Spelling remains active when syntax colors are disabled.
+
+Misspellings have red underlines in the Mac app. Other terminals display an
+underline; separate underline color depends on terminal support.
+
+- `M-x toggle-spell-checking` toggles checking for the current buffer.
+- `M-$` (`M-x spell-correct-word`) offers up to nine suggestions for the word at or
+  immediately before the cursor in a temporary bottom pane. Choose with arrows and Enter, or a number;
+  `i` permanently adds the word to your personal dictionary, as in Emacs;
+  `Esc`/`C-g` cancels. Corrections are undoable and respect Suggested mode.
+- `M-x spell-add-word` accepts the word permanently and verifies it was saved
+  to the personal dictionary. Existing dictionary symlinks are preserved.
+
+Right-click a word in the Mac app to choose an Aspell correction from the
+native context menu, or choose **Add word** to save it to your personal
+dictionary. Add word is also available when there are no suggestions. Existing comment actions remain available below it.
+In terminals that forward mouse events, right-click opens the numbered
+bottom preview while keeping the source visible. `C-x o` or a click switches
+between panes; `Esc`/`C-g` or a replacement closes the preview and restores
+the original layout. `M-x spell-correct-word` uses the same preview in both
+interfaces.
+
+Edit looks for Aspell on `PATH`, then `/opt/homebrew/bin/aspell` and
+`/usr/local/bin/aspell`. Install it separately, for example with
+`brew install aspell`. If unavailable, editing continues; toggle checking off
+and on to retry after fixing a checker or dictionary error.
+
+The default language is `en_US`. For English, Edit reuses `~/.aspell.en.pws`
+when readable, including an existing Emacs dictionary; otherwise it uses
+Aspell's configured personal dictionary. Optional environment overrides:
+
+```sh
+EDIT_ASPELL=/path/to/aspell
+EDIT_SPELL_LANGUAGE=en_GB
+EDIT_SPELL_DICTIONARY=/absolute/path/to/personal.pws
+```
+
+Custom grammar rules with scope `comment` or `string` identify prose too.
+The built-in lexical scanner handles C-style block comments, Python multiline
+strings, shell substitutions, and Fortran comments; it is not a full language
+parser. Batch rendering commands do not start a spell checker.
+
+### Editing
+
 Literal tabs display at width 3 by default. Set `EDIT_TAB_WIDTH` to another
 positive integer to change that. Pressing `Tab` inserts spaces, using 2 spaces
 for JavaScript and CSS files; press `C-q Tab` for a literal tab byte.
