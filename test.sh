@@ -10,6 +10,8 @@ recent=$(mktemp)
 dir=$(mktemp -d)
 spell_dir=$(mktemp -d)
 export EDIT_RECENT="$recent"
+# Rendering and pty fixtures must never restore or replace a real session.
+export EDIT_SESSION=
 clip_has=0
 clip_saved=
 if command -v pbcopy >/dev/null 2>&1 && command -v pbpaste >/dev/null 2>&1; then
@@ -27,6 +29,248 @@ cleanup() {
   rm -f "$tmp" "$out" "$recent" "$tmp.grammar" "$tmp.expected" "$tmp.head" "$tmp.debug" "$tmp.debug2" "$tmp.debug3"
 }
 trap cleanup EXIT
+
+# Round-trip editing state and exercise actual process shutdown and relaunch.
+mkdir -p "$spell_dir/session-home/.edit"
+cat > "$spell_dir/session-check.c" <<'C'
+#define main edit_program_main
+#include "edit.c"
+#undef main
+#include <assert.h>
+#include <util.h>
+
+static void release_session(edit_state * e) {
+  buffers_free(e);
+  kill_ring_free(e);
+}
+
+static pid_t launch_session(int * fd) {
+  struct winsize ws = {.ws_row = 24, .ws_col = 80};
+  pid_t pid = forkpty(fd, NULL, NULL, &ws);
+  assert(pid >= 0);
+  if (!pid) { execl("./edit", "edit", NULL); _exit(127); }
+  return pid;
+}
+
+static void await_text(int fd, const char * needle) {
+  output o = {0};
+  long long deadline = now_ms() + 5000;
+  while (now_ms() < deadline) {
+    fd_set reads;
+    FD_ZERO(&reads); FD_SET(fd, &reads);
+    struct timeval timeout = {0, 10000};
+    if (select(fd + 1, &reads, NULL, NULL, &timeout) <= 0) continue;
+    char chunk[8192];
+    ssize_t n = read(fd, chunk, sizeof(chunk));
+    if (n <= 0) break;
+    out_add(&o, chunk, (size_t)n);
+    if (strstr(o.data, needle)) { free(o.data); return; }
+  }
+  fprintf(stderr, "missing frame: %s\n%s\n", needle, o.data ? o.data : "");
+  free(o.data);
+  assert(0);
+}
+
+static void close_session(pid_t pid, int fd, int sig) {
+  assert(kill(pid, sig) == 0);
+  int status = 0;
+  long long deadline = now_ms() + 5000;
+  fcntl(fd, F_SETFL, O_NONBLOCK);
+  while (now_ms() < deadline) {
+    char chunk[8192];
+    while (read(fd, chunk, sizeof(chunk)) > 0) {}
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      close(fd);
+      return;
+    }
+    nanosleep(&(struct timespec){0, 1000000}, NULL);
+  }
+  kill(pid, SIGKILL);
+  assert(0);
+}
+
+int main(void) {
+  edit_state e, restored;
+  init_state(&e);
+  e.n_buffers = e.n_panes = 1;
+  e.rows = 24; e.cols = 80;
+  assert(!buffer_scratch(&e.buffers[0]));
+  assert(!edit_insert(&e, 0, "hello\nworld", 11, 1, true));
+  e.panes[0].cursor = 8; e.panes[0].top = 6;
+  e.panes[0].mark = 6; e.panes[0].mark_active = true;
+  e.panes[0].left_col = 2; e.panes[0].wrap = 2;
+  assert(!split_pane(&e, LAYOUT_COLS));
+  e.active_pane = 1;
+  e.buffers[0].highlighting_off = true;
+  e.buffers[0].spelling_off = true;
+  assert(kill_push_text(&e, "copied", 6));
+  char source[PATH_SIZE];
+  snprintf(source, sizeof(source), "%s.source", getenv("EDIT_SESSION"));
+  assert(!write_atomic(source, "disk", 4));
+  assert(!buffer_load(&e.buffers[e.n_buffers++], source));
+  e.buffers[1].read_only = true;
+  assert(!session_save(&e));
+  assert(!write_atomic(source, "changed", 7));
+  struct stat st;
+  assert(!stat(getenv("EDIT_SESSION"), &st) && (st.st_mode & 0777) == 0600);
+  init_state(&restored);
+  assert(session_restore(&restored) == 1);
+  assert(restored.n_panes == 2 && restored.active_pane == 1 && restored.n_buffers == 2);
+  assert(restored.buffers[1].dirty && restored.buffers[1].read_only);
+  assert(buffer_len(&restored.buffers[1]) == 4 && buffer_at(&restored.buffers[1], 0) == 'd');
+  assert(!memcmp(e.panes, restored.panes, sizeof(e.panes)));
+  assert(restored.buffers[0].highlighting_off && restored.buffers[0].spelling_off);
+  assert(!memcmp(restored.kill_ring[0].data, "copied", 6));
+  assert(buffer_len(&restored.buffers[0]) == 11);
+  cmd_undo(&restored, 0);
+  assert(buffer_len(&restored.buffers[0]) == 0);
+  cmd_redo(&restored, 0);
+  assert(buffer_len(&restored.buffers[0]) == 11);
+  // Suggested changes retain their base and comments as well as history.
+  restored.buffers[0].kind = BUFFER_FILE;
+  restored.buffers[0].dirty = false;
+  cmd_suggested(&restored, 0);
+  assert(restored.buffers[0].suggested);
+  assert(!edit_insert(&restored, 0, "new ", 4, 2, true));
+  restored.buffers[0].comments[0] = (edit_comment){0, 4, _dup("keep comment")};
+  restored.buffers[0].n_comments = 1;
+  assert(!session_save(&restored));
+  release_session(&restored);
+  init_state(&restored);
+  assert(session_restore(&restored) == 1 && restored.buffers[0].suggested);
+  assert(restored.buffers[0].base_len == 11 && restored.buffers[0].n_atoms > 0);
+  assert(restored.buffers[0].n_comments == 1 && !strcmp(restored.buffers[0].comments[0].text, "keep comment"));
+  cmd_undo(&restored, 0);
+  assert(buffer_len(&restored.buffers[0]) == 11);
+  assert(session_enabled());
+  cmd_toggle_session_restore(&restored, 0); assert(!session_enabled());
+  cmd_toggle_session_restore(&restored, 0); assert(session_enabled());
+  cmd_fresh_session(&restored, 0);
+  assert(restored.n_buffers == 1 && restored.n_panes == 1 && !buffer_len(&restored.buffers[0]));
+  assert(access(getenv("EDIT_SESSION"), F_OK) != 0);
+  release_session(&e); release_session(&restored);
+
+  int fd;
+  pid_t pid = launch_session(&fd);
+  await_text(fd, "C-h help");
+  assert(write(fd, "UNSAVED\0303", 9) == 9);
+  await_text(fd, "UNSAVED");
+  // Wait for the split command to finish before delivering the close signal.
+  assert(write(fd, "\033xtoggle-syntax-highlighting\r", 30) == 30);
+  await_text(fd, "syntax highlighting off");
+  close_session(pid, fd, SIGHUP);
+  init_state(&restored);
+  assert(session_restore(&restored) == 1 && restored.n_panes == 2);
+  assert(buffer_len(&restored.buffers[0]) == 7);
+  release_session(&restored);
+  pid = launch_session(&fd);
+  await_text(fd, "session restored");
+  assert(write(fd, "\033xfresh-session\r", 16) == 16);
+  await_text(fd, "fresh session");
+  assert(write(fd, "\033xtoggle-session-restore\r", 25) == 25);
+  await_text(fd, "session restoration off");
+  close_session(pid, fd, SIGTERM);
+  assert(access(getenv("EDIT_SESSION"), F_OK) != 0);
+  pid = launch_session(&fd);
+  await_text(fd, "C-h help");
+  assert(write(fd, "\033xtoggle-session-restore\r", 25) == 25);
+  await_text(fd, "session restoration on");
+  close_session(pid, fd, SIGHUP);
+  init_state(&restored);
+  assert(session_restore(&restored) == 1 && !buffer_len(&restored.buffers[0]));
+  release_session(&restored);
+
+  // A truncated snapshot never partially installs its state or overwrites itself.
+  assert(!truncate(getenv("EDIT_SESSION"), 32));
+  init_state(&restored);
+  assert(session_restore(&restored) == -1 && restored.n_buffers == 0);
+  release_session(&restored);
+  return 0;
+}
+C
+cc -std=c11 -Wall -Wextra -pedantic -O2 -I. -o "$spell_dir/session-check" "$spell_dir/session-check.c" grammar.c regex.c -lutil
+HOME="$spell_dir/session-home" EDIT_SESSION="$spell_dir/session" EDIT_ASPELL=/nonexistent "$spell_dir/session-check"
+
+# Use real AppKit windows and child editors with isolated snapshots and no defaults writes.
+cat > "$spell_dir/native-session-check.m" <<'M'
+#define main edit_app_main
+#include "macos/edit_app.m"
+#undef main
+#include <assert.h>
+
+@interface SessionTestDelegate : EditAppDelegate
+@property NSArray *remembered;
+@end
+@implementation SessionTestDelegate
+- (void)rememberWindows:(NSWindow *)closing { self.remembered = [self sessionWindows:closing]; }
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender { (void)sender; return NO; }
+@end
+
+static void await_window(EditTerminalView * view, NSString * prefix) {
+  CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5;
+  while (CFAbsoluteTimeGetCurrent() < deadline) {
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    int footer = (view.rows - 1) * view.cols + view.cols - 8;
+    if (prefix ? [[view lineText:(int)prefix.length] isEqualToString:prefix] : view.cells[footer].ch == 'C') return;
+  }
+  fprintf(stderr, "native session frame missing: %s\n", prefix.UTF8String);
+  assert(0);
+}
+
+int main(int argc, char ** argv) {
+  assert(argc == 3);
+  @autoreleasepool {
+    NSApplication *app = NSApplication.sharedApplication;
+    [app setActivationPolicy:NSApplicationActivationPolicyProhibited];
+    SessionTestDelegate *delegate = [SessionTestDelegate new];
+    app.delegate = delegate;
+    unsetenv("EDIT_SESSION");
+    NSWindow *window = [delegate openPath:nil session:@{@"id": @"one"}];
+    EditTerminalView *view = (EditTerminalView *)window.contentView;
+    await_window(view, nil);
+    [view setFontSize:17];
+    [window setFrame:NSMakeRect(120, 140, 720, 480) display:YES];
+    [view sendKey:"WINDOW-ONE"];
+    await_window(view, @"WINDOW-ONE");
+    NSRect frame = window.frame;
+    [window close];
+    assert(view.pid == 0 && !access(argv[1], F_OK));
+    assert([delegate applicationShouldTerminate:app] == NSTerminateNow);
+    assert(delegate.remembered.count == 1);
+    delegate.terminating = NO;
+    NSDictionary *saved = delegate.remembered.firstObject;
+    assert([saved[@"id"] isEqual:@"one"]);
+    window = [delegate openPath:nil session:saved];
+    view = (EditTerminalView *)window.contentView;
+    await_window(view, @"WINDOW-ONE");
+    // AppKit may constrain geometry when the test host has no attached screen.
+    assert([saved[@"frame"] isEqual:NSStringFromRect(frame)] && view.font.pointSize == 17);
+    NSWindow *secondWindow = [delegate openPath:nil session:@{@"id": @"two"}];
+    EditTerminalView *second = (EditTerminalView *)secondWindow.contentView;
+    await_window(second, nil);
+    [second sendKey:"WINDOW-TWO"];
+    await_window(second, @"WINDOW-TWO");
+    assert([delegate applicationShouldTerminate:app] == NSTerminateNow);
+    assert(delegate.remembered.count == 2 && view.pid == 0 && second.pid == 0);
+    assert(!access(argv[1], F_OK) && !access(argv[2], F_OK));
+    NSArray *windows = [delegate.windows copy];
+    for (NSWindow *old in windows) [old close];
+    for (NSDictionary *session in delegate.remembered) {
+      BOOL first = [session[@"id"] isEqual:@"one"];
+      NSWindow *restoredWindow = [delegate openPath:nil session:session];
+      EditTerminalView *restored = (EditTerminalView *)restoredWindow.contentView;
+      await_window(restored, first ? @"WINDOW-ONE" : @"WINDOW-TWO");
+    }
+    windows = [delegate.windows copy];
+    for (NSWindow *old in windows) [old close];
+    puts("native session close, multi-window quit, and restoration ok");
+  }
+  return 0;
+}
+M
+cc -O2 -fobjc-arc -I. -framework Cocoa -lutil -o "$spell_dir/native-session-check" "$spell_dir/native-session-check.m"
+HOME="$spell_dir/session-home" EDIT_ASPELL=/nonexistent "$spell_dir/native-session-check" "$spell_dir/session-home/.edit/session-one" "$spell_dir/session-home/.edit/session-two"
 
 # Exercise native menus without registering a freshly rebuilt app bundle with Launch Services.
 cp Edit.app/Contents/MacOS/Edit "$spell_dir/Edit"

@@ -220,6 +220,27 @@ word keyword int return static
 
 ## CUSTOMIZATION
 
+### Sessions
+
+Interactive Edit snapshots its session on normal quit, window close, or termination
+and restores it on the next launch without a file argument. This includes buffer
+contents (including unsaved and scratch text), undo/redo, Suggested changes and
+comments, split panes, cursor/scroll positions, selections, and the working
+directory. The Mac app also restores its open windows, window sizes, and fonts.
+Opening a file explicitly starts a separate session for that file.
+
+- `M-x fresh-session` deletes the current snapshot and resets this window to an
+  empty scratch buffer, discarding its unsaved edits. Other windows are unaffected.
+- `M-x toggle-session-restore` turns automatic snapshots and restoration off or
+  on. This preference persists across launches and applies to all windows.
+
+Snapshots are private files under `~/.edit/`, replaced atomically at shutdown;
+source files are only written when you save them. If a source file changed while
+Edit was closed, its restored snapshot is marked modified to preserve your text.
+Live tools and temporary command prompts restart. Force-kill and crashes cannot
+save a new snapshot. `EDIT_SESSION=/path` selects an isolated snapshot;
+`EDIT_SESSION=` disables snapshots for scripts and tests.
+
 ### Spelling
 
 Interactive Edit checks visible prose automatically using an installed `aspell`

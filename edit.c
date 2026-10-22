@@ -1936,6 +1936,204 @@ static int config_path(char * out, size_t n, bool create) {
   return edit_home_path(out, n, "config", create);
 }
 
+// A versioned, atomic snapshot stores owned data; render caches and live tools restart.
+static int session_path(char * path, size_t n, bool create) {
+  const char * override = getenv("EDIT_SESSION");
+  if (override) return *override ? (snprintf(path, n, "%s", override) < (int)n ? 0 : -1) : -1;
+  return edit_home_path(path, n, "session", create);
+}
+
+static bool session_enabled(void) {
+  const char * override = getenv("EDIT_SESSION");
+  if (override && !*override) return false;
+  char path[PATH_SIZE];
+  return edit_home_path(path, sizeof(path), "session-disabled", false) == 0 && access(path, F_OK) != 0;
+}
+
+static int session_bytes(FILE * f, bool writing, void * data, size_t n) {
+  return (writing ? fwrite(data, 1, n, f) : fread(data, 1, n, f)) == n ? 0 : -1;
+}
+
+static int session_blob(FILE * f, bool writing, char ** data, size_t * n) {
+  if (session_bytes(f, writing, n, sizeof(*n))) return -1;
+  if (!writing) {
+    struct stat st;
+    long pos = ftell(f);
+    if (pos < 0 || fstat(fileno(f), &st) || *n > (size_t)(st.st_size - pos) || *n == SIZE_MAX) return -1;
+    *data = calloc(*n + 1, 1);
+    if (!*data) return -1;
+  }
+  return session_bytes(f, writing, *data, *n);
+}
+
+static bool session_count(FILE * f, int n, size_t minimum) {
+  struct stat st;
+  long pos = ftell(f);
+  return n >= 0 && pos >= 0 && !fstat(fileno(f), &st) &&
+    (size_t)n <= (size_t)(st.st_size - pos) / minimum;
+}
+
+#define SESSION_FIELD(v) do { if (session_bytes(f, writing, &(v), sizeof(v))) return -1; } while (0)
+static int session_buffer(FILE * f, bool writing, buffer * b) {
+  size_t n = writing ? strlen(b->path) : 0;
+  if (session_blob(f, writing, &b->path, &n)) return -1;
+  if (!n || strlen(b->path) != n) return -1;
+  n = writing ? buffer_len(b) : 0;
+  char * text = writing ? buffer_text(b, &n) : NULL;
+  if (writing && !text) return -1;
+  int rc = session_blob(f, writing, &text, &n);
+  if (!writing && !rc) {
+    b->cap = n; b->gap_a = n; b->gap_b = n; b->data = text;
+  } else free(text);
+  if (rc) return -1;
+  SESSION_FIELD(b->cursor); SESSION_FIELD(b->top);
+  SESSION_FIELD(b->disk_size); SESSION_FIELD(b->disk_mtime);
+  SESSION_FIELD(b->dirty); SESSION_FIELD(b->read_only); SESSION_FIELD(b->kind);
+  if (b->kind < BUFFER_FILE || b->kind > BUFFER_SPELL ||
+      b->cursor > buffer_len(b) || b->top > buffer_len(b)) return -1;
+  SESSION_FIELD(b->highlighting_off); SESSION_FIELD(b->spelling_off);
+  SESSION_FIELD(b->find_group_columns); SESSION_FIELD(b->find_dir_width); SESSION_FIELD(b->find_file_width);
+  SESSION_FIELD(b->undo_at); SESSION_FIELD(b->redo_end); SESSION_FIELD(b->clean_at);
+  SESSION_FIELD(b->history_group); SESSION_FIELD(b->suggested_history_start);
+  int count = b->n_history;
+  SESSION_FIELD(count);
+  if (count < 0 || count > INT_MAX / (int)sizeof(history) || b->undo_at < 0 ||
+      b->undo_at > count || b->redo_end < b->undo_at || b->redo_end > count) return -1;
+  if (!writing && !session_count(f, count, sizeof(size_t) * 2 + sizeof(int) + sizeof(unsigned))) return -1;
+  if (!writing && count) {
+    b->history = calloc((size_t)count, sizeof(history));
+    if (!b->history) return -1;
+    b->n_history = b->history_cap = count;
+  }
+  for (int i = 0; i < count; i++) {
+    history * h = &b->history[i];
+    SESSION_FIELD(h->kind); SESSION_FIELD(h->pos); SESSION_FIELD(h->group);
+    if (session_blob(f, writing, &h->text, &h->len)) return -1;
+    if (h->kind != HIST_INSERT && h->kind != HIST_DELETE) return -1;
+  }
+  SESSION_FIELD(b->suggested); SESSION_FIELD(b->comments_visible);
+  if (session_blob(f, writing, &b->base, &b->base_len)) return -1;
+  count = b->n_comments;
+  SESSION_FIELD(count);
+  if (count < 0 || count > COMMENT_MAX) return -1;
+  if (!writing) b->n_comments = count;
+  for (int i = 0; i < count; i++) {
+    edit_comment * c = &b->comments[i];
+    SESSION_FIELD(c->start); SESSION_FIELD(c->end);
+    n = writing ? strlen(c->text) : 0;
+    if (session_blob(f, writing, &c->text, &n)) return -1;
+  }
+  SESSION_FIELD(b->review_source); SESSION_FIELD(b->review_selected);
+  if (b->kind == BUFFER_REVIEW && (b->review_source < -1 || b->review_source >= 8)) return -1;
+  count = b->n_review;
+  SESSION_FIELD(count);
+  if (count < 0 || count > INT_MAX / (int)sizeof(review_row)) return -1;
+  if (!writing && !session_count(f, count, sizeof(size_t) * 4 + sizeof(int) * 2)) return -1;
+  if (!writing && count) {
+    b->review = calloc((size_t)count, sizeof(review_row));
+    if (!b->review) return -1;
+    b->n_review = count;
+  }
+  for (int i = 0; i < count; i++) {
+    review_row * r = &b->review[i];
+    SESSION_FIELD(r->style); SESSION_FIELD(r->anchor); SESSION_FIELD(r->end);
+    SESSION_FIELD(r->offset); SESSION_FIELD(r->section);
+    n = writing ? strlen(r->text) : 0;
+    if (session_blob(f, writing, &r->text, &n)) return -1;
+  }
+  if (!writing) track_rebuild(b);
+  return 0;
+}
+
+static int session_state(FILE * f, bool writing, edit_state * e, char * cwd) {
+  char magic[16] = "EDIT-SESSION-1";
+  SESSION_FIELD(magic);
+  if (memcmp(magic, "EDIT-SESSION-1", 15)) return -1;
+  if (session_bytes(f, writing, cwd, PATH_SIZE) || !memchr(cwd, 0, PATH_SIZE)) return -1;
+  SESSION_FIELD(e->n_buffers); SESSION_FIELD(e->n_panes); SESSION_FIELD(e->n_layout_nodes);
+  if (e->n_buffers < 1 || e->n_buffers > 8 || e->n_panes < 1 || e->n_panes > PANE_MAX ||
+      e->n_layout_nodes < 1 || e->n_layout_nodes > LAYOUT_MAX) return -1;
+  SESSION_FIELD(e->active_pane); SESSION_FIELD(e->layout); SESSION_FIELD(e->layout_root);
+  SESSION_FIELD(e->tab_width); SESSION_FIELD(e->find_home);
+  SESSION_FIELD(e->panes); SESSION_FIELD(e->layout_nodes);
+  SESSION_FIELD(e->search); SESSION_FIELD(e->search_len); SESSION_FIELD(e->search_reverse);
+  if (e->active_pane < 0 || e->active_pane >= e->n_panes || e->tab_width < 1 ||
+      e->layout_root < 0 || e->layout_root >= e->n_layout_nodes ||
+      e->search_len >= sizeof(e->search) || e->search[e->search_len]) return -1;
+  for (int i = 0; i < e->n_buffers; i++) if (session_buffer(f, writing, &e->buffers[i])) return -1;
+  for (int i = 0; i < e->n_buffers; i++)
+    if (e->buffers[i].kind == BUFFER_REVIEW && e->buffers[i].review_source >= e->n_buffers) return -1;
+  SESSION_FIELD(e->n_kills); SESSION_FIELD(e->kill_head);
+  if (e->n_kills < 0 || e->n_kills > KILL_RING_MAX || e->kill_head < 0 || e->kill_head >= KILL_RING_MAX) return -1;
+  for (int i = 0; i < KILL_RING_MAX; i++) {
+    output * o = &e->kill_ring[i];
+    if (session_blob(f, writing, &o->data, &o->len)) return -1;
+    if (!writing) o->cap = o->len + 1;
+  }
+  for (int i = 0; i < e->n_panes; i++) {
+    pane * p = &e->panes[i];
+    if (p->buffer < 0 || p->buffer >= e->n_buffers || p->wrap < 0 || p->wrap > 2) return -1;
+    size_t len = buffer_len(&e->buffers[p->buffer]);
+    if (p->cursor > len || p->top > len || (p->mark_active && p->mark > len)) return -1;
+  }
+  // Each reachable layout node and pane must occur exactly once.
+  int stack[LAYOUT_MAX], used[LAYOUT_MAX] = {0}, panes[PANE_MAX] = {0}, n = 0;
+  stack[n++] = e->layout_root;
+  while (n) {
+    int i = stack[--n];
+    if (i < 0 || i >= e->n_layout_nodes || used[i]++) return -1;
+    layout_node * node = &e->layout_nodes[i];
+    if (node->split == LAYOUT_LEAF) {
+      if (node->pane < 0 || node->pane >= e->n_panes || panes[node->pane]++) return -1;
+    } else {
+      if ((node->split != LAYOUT_ROWS && node->split != LAYOUT_COLS) || n + 2 > LAYOUT_MAX) return -1;
+      stack[n++] = node->first; stack[n++] = node->second;
+    }
+  }
+  for (int i = 0; i < e->n_panes; i++) if (!panes[i]) return -1;
+  return 0;
+}
+#undef SESSION_FIELD
+
+static int session_save(edit_state * e) {
+  char path[PATH_SIZE], tmp[PATH_SIZE], cwd[PATH_SIZE] = {0};
+  if (session_path(path, sizeof(path), true) || !getcwd(cwd, sizeof(cwd)) ||
+      snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path) >= (int)sizeof(tmp)) return -1;
+  int fd = mkstemp(tmp);
+  if (fd < 0) return -1;
+  FILE * f = fdopen(fd, "wb");
+  if (!f) { close(fd); unlink(tmp); return -1; }
+  save_pane_state(e);
+  int rc = session_state(f, true, e, cwd);
+  if (fflush(f) || fsync(fd)) rc = -1;
+  if (fclose(f)) rc = -1;
+  if (!rc) rc = rename(tmp, path);
+  if (rc) unlink(tmp);
+  return rc;
+}
+
+static int session_restore(edit_state * e) {
+  char path[PATH_SIZE], cwd[PATH_SIZE];
+  if (session_path(path, sizeof(path), false)) return 0;
+  FILE * f = fopen(path, "rb");
+  if (!f) return errno == ENOENT ? 0 : -1;
+  edit_state saved;
+  init_state(&saved);
+  int rc = session_state(f, false, &saved, cwd);
+  if (fgetc(f) != EOF) rc = -1;
+  fclose(f);
+  if (!rc && chdir(cwd)) rc = -1;
+  if (rc) { buffers_free(&saved); kill_ring_free(&saved); return -1; }
+  for (int i = 0; i < saved.n_buffers; i++) {
+    buffer * b = &saved.buffers[i];
+    struct stat st;
+    if (b->kind == BUFFER_FILE && (stat(b->path, &st) ||
+        st.st_size != b->disk_size || st.st_mtime != b->disk_mtime)) b->dirty = true;
+  }
+  *e = saved;
+  return 1;
+}
+
 static int recent_save(const char * path) {
   char recent[PATH_SIZE];
   char lines[RECENT_MAX][PATH_SIZE];
@@ -2350,6 +2548,12 @@ static void load_grammar(edit_state * e) {
 }
 
 static volatile sig_atomic_t window_changed;
+static volatile sig_atomic_t session_closing;
+
+static void session_close_signal(int signum) {
+  (void)signum;
+  session_closing = 1;
+}
 
 // Remember resize requests even when they arrive before the input wait.
 static void window_resized(int signum) {
@@ -2398,6 +2602,8 @@ static int input_wait(edit_state * e, int usec) {
   sigset_t block, previous;
   sigemptyset(&block);
   sigaddset(&block, SIGWINCH);
+  sigaddset(&block, SIGHUP);
+  sigaddset(&block, SIGTERM);
   sigprocmask(SIG_BLOCK, &block, &previous);
   fd_set set;
   struct timespec tv = {usec / 1000000, (usec % 1000000) * 1000};
@@ -2416,7 +2622,7 @@ static int input_wait(edit_state * e, int usec) {
     }
   }
   // Unblock SIGWINCH atomically with waiting so a resize cannot be lost.
-  int ready = window_changed ? 0 : e->input.len > 0 ? 1 :
+  int ready = window_changed || session_closing ? 0 : e->input.len > 0 ? 1 :
     (pselect(maxfd + 1, &set, &writes, NULL, usec < 0 ? NULL : &tv, &previous) > 0 &&
      FD_ISSET(STDIN_FILENO, &set));
   sigprocmask(SIG_SETMASK, &previous, NULL);
@@ -6726,8 +6932,51 @@ static int cmd_quit(edit_state * e, int key) {
       (void) key;
       return 0;
     }
+  if (session_enabled() && session_save(e)) return set_status(e, "session snapshot failed; quit cancelled"), 0;
   e->quit = true;
   (void) key;
+  return 0;
+}
+
+static int cmd_fresh_session(edit_state * e, int key) {
+  char path[PATH_SIZE];
+  if (session_path(path, sizeof(path), false) == 0 && unlink(path) && errno != ENOENT)
+    return set_status(e, "cannot clear session"), 0;
+  buffer scratch = {0};
+  if (buffer_scratch(&scratch)) return set_status(e, "cannot create scratch"), 0;
+  spell_cancel(e);
+  buffers_free(e);
+  kill_ring_free(e);
+  memset(e->kill_ring, 0, sizeof(e->kill_ring));
+  e->n_kills = e->kill_head = 0;
+  e->buffers[0] = scratch;
+  memset(e->panes, 0, sizeof(e->panes));
+  e->panes[0].preferred_col = SIZE_MAX;
+  e->n_buffers = e->n_panes = e->n_layout_nodes = 1;
+  e->layout_root = e->active_pane = 0;
+  e->layout_nodes[0] = (layout_node){LAYOUT_LEAF, 0, -1, -1};
+  e->spell.live = true;
+  e->spell.failed = false;
+  e->find_home = true;
+  e->search_len = e->search_pos = 0;
+  e->search[0] = 0;
+  set_status(e, "fresh session");
+  (void)key;
+  return 0;
+}
+
+static int cmd_toggle_session_restore(edit_state * e, int key) {
+  char path[PATH_SIZE];
+  bool enabled = session_enabled();
+  if (edit_home_path(path, sizeof(path), "session-disabled", true))
+    return set_status(e, "cannot save session preference"), 0;
+  int rc;
+  if (enabled) {
+    int fd = open(path, O_WRONLY | O_CREAT, 0600);
+    rc = fd < 0 ? -1 : close(fd);
+  } else rc = unlink(path);
+  set_status(e, rc ? "cannot save session preference" : "session restoration %s", enabled ? "off" : "on");
+  (void)key;
   return 0;
 }
 
@@ -7085,6 +7334,8 @@ static binding bindings[] = {
   {{KEY_CTRL('x'), 'u'}, 2, cmd_undo, "undo"},
   {{KEY_CTRL('x'), KEY_CTRL('c')}, 2, cmd_quit, "save-buffers-kill-terminal"},
   {{KEY_META('x'), 0}, 1, cmd_execute_extended_command, "execute-extended-command"},
+  {{0, 0}, 0, cmd_fresh_session, "fresh-session"},
+  {{0, 0}, 0, cmd_toggle_session_restore, "toggle-session-restore"},
   {{0, 0}, 0, cmd_toggle_syntax_highlighting, "toggle-syntax-highlighting"},
   {{0, 0}, 0, cmd_toggle_spell_checking, "toggle-spell-checking"},
   {{KEY_META('$'), 0}, 1, cmd_spell_correct_word, "spell-correct-word"},
@@ -7377,8 +7628,11 @@ static int tui(const char * path) {
     }
   }
 
+  int restored = path == NULL && session_enabled() ? session_restore(&e) : 0;
   load_grammar(&e);
-  if (scratch) {
+  if (restored == 1) {
+    set_status(&e, "session restored");
+  } else if (scratch) {
     if (buffer_scratch(&e.buffers[0]) != 0) {
       fprintf(stderr, "edit: cannot open scratch\n");
       buffers_free(&e);
@@ -7399,6 +7653,13 @@ static int tui(const char * path) {
     buffers_free(&e);
     return 1;
   }
+  if (restored < 0) set_status(&e, "session unreadable; starting fresh");
+  session_closing = 0;
+  struct sigaction close_action = {0};
+  close_action.sa_handler = session_close_signal;
+  sigemptyset(&close_action.sa_mask);
+  sigaction(SIGHUP, &close_action, NULL);
+  sigaction(SIGTERM, &close_action, NULL);
   struct sigaction resize_action = {0};
   resize_action.sa_handler = window_resized;
   sigemptyset(&resize_action.sa_mask);
@@ -7409,7 +7670,7 @@ static int tui(const char * path) {
   terminal_write(start, strlen(start));
 
   e.spell.live = true;
-  while (! e.quit) {
+  while (! e.quit && !session_closing) {
     window_changed = 0;
     auto_reload(&e);
     buffer * edited = active_buffer(&e);
@@ -7545,7 +7806,9 @@ static int tui(const char * path) {
     }
   }
 
+  int snapshot = !e.quit && session_enabled() ? session_save(&e) : 0;
   raw_off(&e);
+  if (snapshot) fprintf(stderr, "edit: session snapshot failed\n");
   const char * clear = "\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[?2004l"
     "\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
   terminal_write(clear, strlen(clear));
@@ -7556,7 +7819,7 @@ static int tui(const char * path) {
     fclose(e.debug_log);
   }
   buffers_free(&e);
-  return 0;
+  return snapshot ? 1 : 0;
 }
 
 static int cli_print(const char * range, const char * path) {

@@ -77,6 +77,7 @@ typedef struct {
 @property BOOL dirtyAll;
 @property BOOL hasDirty;
 @property BOOL *dirtyRows;
+@property NSString *sessionID;
 @property NSFont *font;
 @property NSFont *boldFont;
 @property NSSize cachedCellSize;
@@ -86,6 +87,8 @@ typedef struct {
 @property unsigned spellingRequest;
 @property NSInteger spellingItems;
 - (instancetype)initWithPath:(NSString *)path;
+- (instancetype)initWithPath:(NSString *)path sessionID:(NSString *)sessionID;
+- (void)stopEditor;
 - (instancetype)initForAnsiSelfTest;
 - (NSString *)lineText:(int)width;
 - (NSUInteger)csiLength;
@@ -168,8 +171,13 @@ static bool cell_same_text(cell *a, cell *b) {
 
 
 - (instancetype)initWithPath:(NSString *)path {
+  return [self initWithPath:path sessionID:nil];
+}
+
+- (instancetype)initWithPath:(NSString *)path sessionID:(NSString *)sessionID {
   self = [super initWithFrame:NSMakeRect(0, 0, 900, 520)];
   if (!self) return nil;
+  self.sessionID = sessionID;
   self.rows = TERM_ROWS;
   self.cols = TERM_COLS;
   self.cursorVisible = true;
@@ -214,6 +222,19 @@ static bool cell_same_text(cell *a, cell *b) {
 
 - (void)viewDidMoveToWindow {
   [self.window makeFirstResponder:self];
+}
+
+// Drain the pty while the child finishes its snapshot, including large final frames.
+- (void)stopEditor {
+  if (_pid <= 0) return;
+  self.handle.readabilityHandler = nil;
+  kill(_pid, SIGHUP);
+  char discard[8192];
+  while (waitpid(_pid, NULL, WNOHANG) == 0) {
+    while (read(_fd, discard, sizeof(discard)) > 0) {}
+    usleep(1000);
+  }
+  _pid = 0;
 }
 
 - (void)dealloc {
@@ -305,10 +326,18 @@ static bool cell_same_text(cell *a, cell *b) {
   NSString *edit = [NSBundle.mainBundle pathForResource:@"edit" ofType:nil];
   if (!edit) edit = [[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:@"edit"];
 
+  NSString *snapshot = nil;
+  if (_sessionID && !getenv("EDIT_SESSION")) {
+    NSString *home = [(NSProcessInfo.processInfo.environment[@"HOME"] ?: NSHomeDirectory()) stringByAppendingPathComponent:@".edit"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:home withIntermediateDirectories:YES attributes:nil error:nil];
+    snapshot = [home stringByAppendingPathComponent:[@"session-" stringByAppendingString:_sessionID]];
+  }
+
   struct winsize ws = { .ws_row = (unsigned short)_rows, .ws_col = (unsigned short)_cols };
   int master = -1;
   pid_t child = forkpty(&master, NULL, NULL, &ws);
   if (child == 0) {
+    if (snapshot) setenv("EDIT_SESSION", snapshot.fileSystemRepresentation, 1);
     setenv("TERM", "xterm-256color", 1);
     setenv("EDIT_BATCH_ARROWS", "1", 1);
     setenv("EDIT_APP", "1", 1);
@@ -868,27 +897,49 @@ static bool cell_same_text(cell *a, cell *b) {
 
 @end
 
-@interface EditAppDelegate : NSObject <NSApplicationDelegate>
+@interface EditAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property BOOL openedFiles;
+@property BOOL terminating;
+@property NSMutableArray<NSWindow *> *windows;
 @end
 
 @implementation EditAppDelegate
 
 - (void)openPath:(NSString *)path {
-  EditTerminalView *view = [[EditTerminalView alloc] initWithPath:path];
+  [self openPath:path session:nil];
+}
+
+- (NSWindow *)openPath:(NSString *)path session:(NSDictionary *)session {
+  NSString *sessionID = session[@"id"] ?: NSUUID.UUID.UUIDString;
+  EditTerminalView *view = [[EditTerminalView alloc] initWithPath:path sessionID:sessionID];
+  if (session[@"font"]) [view setFontSize:[session[@"font"] doubleValue]];
   NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 900, 520)
                                                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
                                                    backing:NSBackingStoreBuffered
                                                      defer:NO];
+  window.releasedWhenClosed = NO;
+  if (!_windows) _windows = [NSMutableArray array];
+  [_windows addObject:window];
+  window.delegate = self;
+  if (session[@"frame"]) [window setFrame:NSRectFromString(session[@"frame"]) display:NO];
   window.title = path.lastPathComponent.length ? path.lastPathComponent : @"Edit";
   window.contentView = view;
+  if (session[@"title"]) window.title = session[@"title"];
   [window makeKeyAndOrderFront:nil];
+  if ([session[@"minimized"] boolValue]) [window miniaturize:nil];
+  return window;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   [self buildMenus];
   dispatch_async(dispatch_get_main_queue(), ^{
-    if (!self.openedFiles && NSApp.windows.count == 0) [self openPath:nil];
+    if (!self.openedFiles && NSApp.windows.count == 0) {
+      NSString *disabled = [(NSProcessInfo.processInfo.environment[@"HOME"] ?: NSHomeDirectory()) stringByAppendingPathComponent:@".edit/session-disabled"];
+      NSArray *sessions = [[NSFileManager defaultManager] fileExistsAtPath:disabled] ? nil :
+        [NSUserDefaults.standardUserDefaults arrayForKey:@"EditSessions"];
+      for (NSDictionary *session in sessions) [self openPath:nil session:session];
+      if (!sessions.count) [self openPath:nil];
+    }
   });
 }
 
@@ -896,6 +947,42 @@ static bool cell_same_text(cell *a, cell *b) {
   _openedFiles = YES;
   for (NSString *path in filenames) [self openPath:path];
   [sender replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+}
+
+// Remember all open windows on quit; closing the last window keeps it for relaunch.
+- (NSArray *)sessionWindows:(NSWindow *)closing {
+  NSMutableArray *windows = [_windows mutableCopy];
+  NSWindow *key = NSApp.keyWindow;
+  if ([windows containsObject:key]) { [windows removeObject:key]; [windows addObject:key]; }
+  if (windows.count > 1 && closing) [windows removeObject:closing];
+  NSMutableArray *sessions = [NSMutableArray array];
+  // Reopen the key window last, including windows that were minimized.
+  for (NSWindow *window in windows) {
+    EditTerminalView *view = (EditTerminalView *)window.contentView;
+    [sessions addObject:@{@"id": view.sessionID, @"frame": NSStringFromRect(window.frame),
+                         @"font": @(view.font.pointSize), @"title": window.title,
+                         @"minimized": @(window.isMiniaturized)}];
+  }
+  return sessions;
+}
+
+- (void)rememberWindows:(NSWindow *)closing {
+  [NSUserDefaults.standardUserDefaults setObject:[self sessionWindows:closing] forKey:@"EditSessions"];
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+  NSWindow *window = notification.object;
+  if (!_terminating) [self rememberWindows:window];
+  [(EditTerminalView *)window.contentView stopEditor];
+  [_windows removeObject:window];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+  if (_windows.count) [self rememberWindows:nil];
+  _terminating = YES;
+  for (NSWindow *window in _windows) [(EditTerminalView *)window.contentView stopEditor];
+  (void)sender;
+  return NSTerminateNow;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
