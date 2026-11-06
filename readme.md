@@ -155,7 +155,9 @@ buffers auto-reload when the file changes on disk.
 
 - `C-c e` starts Suggested Changes mode. The original file is left untouched.
 - `C-x C-s` saves the proposed document and comments to `file.edits`.
-- `C-c c` comments on the selection, or the current line without a selection.
+- `C-c c` edits the comment under the cursor. Outside a comment, it creates one
+  for the selection or current line and starts Suggested Changes if needed.
+  Clicking or typing in comment text on the right also opens the comment editor.
 - `C-c d` deletes the comment nearest the cursor.
 - `C-c ]` shows or hides the read-only Suggested Changes buffer on the right.
 - `C-x o` focuses it for normal navigation and search. The focused pane controls

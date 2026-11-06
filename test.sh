@@ -524,15 +524,16 @@ int main(int argc, char ** argv) {
 
   // Both SGR and classic terminal right-button presses are decoded without treating release as a click.
   const char * events[] = {"\033[<2;4;3M", "\033[M\042\044\043", "\033[<2;4;3m",
-                           "\033[778;7;3;4~", "\033[779;7;2~", "\033[779;7;0~"};
-  for (int i = 0; i < 6; i++) {
+                           "\033[<0;4;3m", "\033[778;7;3;4~", "\033[779;7;2~", "\033[779;7;0~"};
+  for (int i = 0; i < 7; i++) {
     out_s(&e.input, events[i]);
     key_event event = read_key_event(&e, 0);
     if (i < 2) assert(event.key == KEY_MOUSE && event.mouse_button == 2 && event.mouse_col == 3 && event.mouse_row == 2);
     if (i == 2) assert(event.key != KEY_MOUSE);
-    if (i == 3) assert(event.key == KEY_SPELL_MENU && event.spell_request == 7 && event.mouse_col == 3 && event.mouse_row == 2);
-    if (i == 4) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 2);
-    if (i == 5) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 0);
+    if (i == 3) assert(event.key == KEY_MOUSE && event.mouse_button == 3);
+    if (i == 4) assert(event.key == KEY_SPELL_MENU && event.spell_request == 7 && event.mouse_col == 3 && event.mouse_row == 2);
+    if (i == 5) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 2);
+    if (i == 6) assert(event.key == KEY_SPELL_PICK && event.spell_request == 7 && event.spell_choice == 0);
   }
 
   // A missing checker fails once; the per-buffer toggle allows an explicit retry.
@@ -2605,6 +2606,12 @@ int main(int argc, char **argv) {
   mouse_click(&e, &click);
   mouse_click(&e, &drag);
   assert(e.panes[0].mark_active && e.panes[0].mark == 1 && e.panes[0].cursor == 4);
+  key_event release = {.mouse_row = 0, .mouse_col = 4, .mouse_button = 3};
+  mouse_click(&e, &release);
+  assert(!e.mouse_down);
+  drag.mouse_col = 5;
+  mouse_click(&e, &drag);
+  assert(e.panes[0].cursor == 4);
   cmd_comment(&e, 0);
   assert(e.comment_prompt && e.buffers[0].suggested);
   strcpy(e.comment, "abcdef");
@@ -2626,6 +2633,41 @@ int main(int argc, char **argv) {
   click.mouse_row = 6; click.mouse_col = 0;
   mouse_click(&e, &click);
   assert(e.comment_pos > 3900 && e.comment_pos < 4000);
+  cmd_cancel(&e, 0);
+  cmd_comment(&e, 0);
+  strcpy(e.comment, "old"); e.comment_len = e.comment_pos = 3;
+  comment_submit(&e);
+  assert(e.buffers[0].n_comments == 1);
+  e.panes[0].cursor = 2;
+  e.panes[0].mark = 0;
+  e.panes[0].mark_active = true;
+  cmd_comment(&e, 0);
+  assert(e.comment_prompt && e.buffers[0].n_comments == 1 && !strcmp(e.comment, "old"));
+  strcpy(e.comment, "new"); e.comment_len = e.comment_pos = 3;
+  comment_submit(&e);
+  assert(e.buffers[0].n_comments == 1 && !strcmp(e.buffers[0].comments[0].text, "new"));
+  e.rows = 24; e.cols = 80;
+  sync_review(&e);
+  int text_row = -1;
+  for (int i = 0; i < e.buffers[1].n_review; i++)
+    if (!strcmp(e.buffers[1].review[i].text, "> new")) text_row = i;
+  assert(text_row >= 0 && e.n_panes == 2);
+  e.panes[1].top = e.buffers[1].review[text_row].offset;
+  pane_rect rects[PANE_MAX];
+  pane_rects(&e, rects);
+  click.mouse_row = rects[1].row;
+  click.mouse_col = rects[1].col + 3;
+  mouse_click(&e, &click);
+  assert(e.comment_prompt && e.comment_pos == 1 && !strcmp(e.comment, "new"));
+  cmd_cancel(&e, 0);
+  e.active_pane = 1;
+  e.panes[1].cursor = e.buffers[1].review[text_row].offset + 3;
+  dispatch(&e, 'X');
+  assert(e.comment_prompt && !strcmp(e.comment, "nXew"));
+  comment_submit(&e);
+  assert(e.buffers[0].n_comments == 1 && !strcmp(e.buffers[0].comments[0].text, "nXew"));
+  e.active_pane = 0;
+  cmd_save(&e, 0);
   buffers_free(&e);
   kill_ring_free(&e);
   return 0;
@@ -2633,6 +2675,8 @@ int main(int argc, char **argv) {
 C
 cc -std=c11 -Wall -Wextra -pedantic -O2 -I. -o "$dir/mouse-check" "$dir/mouse-check.c" grammar.c regex.c -lutil
 "$dir/mouse-check" "$compose"
+grep -q '^comments 1$' "$compose.edits"
+grep -q '^nXew$' "$compose.edits"
 
 printf 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\n' > "$review"
 ./edit --render-keys 20:30 'CeXCcok
@@ -2680,7 +2724,7 @@ grep -q '##.2..Comment' "$out"
 ./edit --render-keys-color 5:100 "$(printf 'f%.0s' $(seq 1 22))" "$comment_nearest" > "$out"
 grep -Fq "$(printf '%s[48;2;76;66;35m123456789' "$esc")" "$out"
 
-# The review is a normal read-only buffer; its search drives document selection.
+# Review search drives document selection; typing on comment text opens its editor.
 cp "$comment_nearest" "$tmp.expected"
 cp "$comment_nearest.edits" "$dir/review-expected.edits"
 python3 ./tui_view.py 12:100 '^xo^s222
@@ -2694,7 +2738,7 @@ python3 ./tui_view.py 12:100 '^xo^s222
 grep -q 'comment-nearest.txt.1:1.Suggested' "$out"
 python3 ./tui_view.py 12:100 '^xo^s222
 X' "$comment_nearest" > "$out"
-grep -q 'read.only' "$out"
+grep -q 'comment:' "$out"
 cmp -s "$tmp.expected" "$comment_nearest"
 cmp -s "$dir/review-expected.edits" "$comment_nearest.edits"
 python3 ./tui_view.py 12:100 '^xo^x0' "$comment_nearest" > "$out"

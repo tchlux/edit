@@ -363,11 +363,14 @@ struct edit_state {
   size_t goto_pos;
   bool comment_prompt;
   bool review_expand_pending;
+  bool mouse_down;
   char comment[COMMENT_SIZE];
   size_t comment_len;
   size_t comment_pos;
   size_t comment_start;
   size_t comment_end;
+  int comment_source;
+  int comment_edit;
   char status[STATUS_SIZE];
   long long status_ms;
   char footer[STATUS_SIZE];
@@ -2761,9 +2764,10 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
         sscanf(seq, "[<%d;%d;%d", &button, &x, &y) == 3) {
       snprintf(ev.kind, sizeof(ev.kind), "sgr-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && final == 'M' && (button == 0 || button == 2 || button == 32)) {
+      if (ev.key < 0 && ((final == 'M' && (button == 0 || button == 2 || button == 32)) ||
+          (final == 'm' && button == 0))) {
         ev.key = KEY_MOUSE;
-        ev.mouse_button = button;
+        ev.mouse_button = final == 'm' ? 3 : button;
         ev.mouse_col = x - 1;
         ev.mouse_row = y - 1;
       }
@@ -2771,7 +2775,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
       button = (unsigned char) seq[2] - 32;
       snprintf(ev.kind, sizeof(ev.kind), "x10-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && (button == 0 || button == 2 || button == 32)) {
+      if (ev.key < 0 && (button == 0 || button == 2 || button == 3 || button == 32)) {
         ev.key = KEY_MOUSE;
         ev.mouse_button = button;
         ev.mouse_col = (unsigned char) seq[3] - 33;
@@ -3083,9 +3087,31 @@ static int pane_at(edit_state * e, int row, int col, pane_rect rects[PANE_MAX]) 
 
 static void comment_prompt_position(edit_state * e, int cols, size_t * first,
                                     int * row, size_t * col);
+static bool begin_comment(edit_state * e, int source, int index, size_t pos);
+
+// Only the text below "### Comment" opens an existing comment.
+static int review_comment_at(buffer * b, size_t pos, size_t * text_pos) {
+  int comment = -1;
+  for (int i = 0; i < b->n_review; i++) {
+    review_row * r = &b->review[i];
+    if (r->style == REVIEW_COMMENT_HEAD) comment++;
+    if (i == 0 || comment < 0 || r->style != REVIEW_COMMENT ||
+        strcmp(b->review[i - 1].text, "### Comment")) continue;
+    size_t start = r->offset + 2;
+    size_t end = r->offset + strlen(r->text);
+    if (pos >= start && pos <= end) {
+      *text_pos = pos - start;
+      return comment;
+    }
+  }
+  return -1;
+}
 
 static int mouse_click(edit_state * e, key_event * ev) {
+  if (ev->mouse_button == 3) return e->mouse_down = false, 0;
   bool drag = ev->mouse_button == 32;
+  if (drag && !e->mouse_down) return 0;
+  if (ev->mouse_button == 0) e->mouse_down = true;
   // Map the visible two-row comment viewport back to its text cursor.
   if (e->comment_prompt && ev->mouse_row >= e->rows - 2 &&
       ev->mouse_row < e->rows && ev->mouse_col >= 0 && ev->mouse_col < e->cols) {
@@ -3141,6 +3167,12 @@ static int mouse_click(edit_state * e, key_event * ev) {
   p->preferred_col = SIZE_MAX;
   if (drag && !p->mark_active) p->mark = anchor, p->mark_active = true;
   else if (!drag) p->mark_active = false;
+  if (ev->mouse_button == 0 && b->kind == BUFFER_REVIEW &&
+      b->review_source >= 0 && b->review_source < e->n_buffers) {
+    size_t text_pos;
+    int comment = review_comment_at(b, p->cursor, &text_pos);
+    if (comment >= 0) begin_comment(e, b->review_source, comment, text_pos);
+  }
   refresh_buffer_list(e);
   return select ? cmd_insert(e, KEY_ENTER) : 0;
 }
@@ -5644,7 +5676,7 @@ static bool prompt_edit(edit_state * e, prompt_slot * s, int key) {
   } else if (key == KEY_PASTE_START) {
     if (! prompt_paste(s, e)) return false;
     clear_prompt_mark(e);
-  } else if (key >= 32 && key < 127) {
+  } else if (key >= 32 && key < 256) {
     if (! prompt_insert(e, s, &(char){(char) key}, 1)) return false;
     clear_prompt_mark(e);
   }
@@ -5996,40 +6028,87 @@ static int cmd_suggested(edit_state * e, int key) {
   return 0;
 }
 
+static bool begin_comment(edit_state * e, int source, int index, size_t pos) {
+  buffer * b = &e->buffers[source];
+  if (index >= 0) {
+    if (index >= b->n_comments) return false;
+    edit_comment * c = &b->comments[index];
+    size_t len = strlen(c->text);
+    if (len >= sizeof(e->comment)) return set_status(e, "comment too long to edit"), false;
+    memcpy(e->comment, c->text, len + 1);
+    e->comment_len = len;
+    e->comment_pos = pos < len ? pos : len;
+    if (active_buffer(e)->kind == BUFFER_REVIEW)
+      for (int i = 0; i < e->n_panes; i++) if (e->panes[i].buffer == source) {
+        e->active_pane = i;
+        e->panes[i].cursor = c->start;
+        break;
+      }
+  } else {
+    e->comment[0] = '\0';
+    e->comment_len = e->comment_pos = 0;
+  }
+  e->comment_source = source;
+  e->comment_edit = index;
+  e->comment_prompt = true;
+  e->prompt_overflow = NULL;
+  clear_prompt_mark(e);
+  set_status(e, index >= 0 ? "editing comment" : "comment: ");
+  return true;
+}
+
 static int cmd_comment(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   (void) key;
+  if (b->kind == BUFFER_REVIEW) {
+    size_t text_pos;
+    int index = review_comment_at(b, p->cursor, &text_pos);
+    if (index >= 0 && b->review_source >= 0 && b->review_source < e->n_buffers)
+      begin_comment(e, b->review_source, index, text_pos);
+    else set_status(e, "place cursor on comment text");
+    return 0;
+  }
   if (! b->suggested) cmd_suggested(e, 0);
   if (! b->suggested) return 0;
+  int source = (int) (b - e->buffers);
+  size_t start, end;
+  bool selection = region_range(p, &start, &end);
+  int index = nearest_comment(b, p->cursor);
+  if (index >= 0 && p->cursor >= b->comments[index].start &&
+      (p->cursor < b->comments[index].end ||
+       (b->comments[index].start == b->comments[index].end &&
+        p->cursor == b->comments[index].start)))
+    return begin_comment(e, source, index, strlen(b->comments[index].text)), 0;
   if (b->n_comments >= COMMENT_MAX) return set_status(e, "too many comments"), 0;
-  if (! region_range(p, &e->comment_start, &e->comment_end)) {
-    e->comment_start = line_start(b, p->cursor);
-    e->comment_end = line_end(b, p->cursor);
-  }
-  e->comment[0] = '\0';
-  e->comment_len = e->comment_pos = 0;
-  e->comment_prompt = true;
-  e->prompt_overflow = NULL;
-  clear_prompt_mark(e);
-  set_status(e, "comment: ");
+  e->comment_start = selection ? start : line_start(b, p->cursor);
+  e->comment_end = selection ? end : line_end(b, p->cursor);
+  begin_comment(e, source, -1, 0);
   return 0;
 }
 
 static int comment_submit(edit_state * e) {
-  buffer * b = active_buffer(e);
+  buffer * b = &e->buffers[e->comment_source];
   e->comment_prompt = false;
   if (e->comment_len == 0) return set_status(e, "empty comment"), 0;
-  edit_comment * c = &b->comments[b->n_comments++];
-  c->start = e->comment_start;
-  c->end = e->comment_end;
-  c->text = _dup(e->comment);
-  if (c->text == NULL) return b->n_comments--, set_status(e, "comment failed"), 0;
+  if (e->comment_edit >= 0 && !strcmp(b->comments[e->comment_edit].text, e->comment))
+    return set_status(e, "comment unchanged"), 0;
+  char * text = _dup(e->comment);
+  if (!text) return set_status(e, "comment failed"), 0;
+  if (e->comment_edit >= 0) {
+    free(b->comments[e->comment_edit].text);
+    b->comments[e->comment_edit].text = text;
+  } else {
+    edit_comment * c = &b->comments[b->n_comments++];
+    c->start = e->comment_start;
+    c->end = e->comment_end;
+    c->text = text;
+  }
   b->dirty = true;
   b->comments_visible = true;
   clear_mark(e);
   b->review_version++;
-  set_status(e, "comment added");
+  set_status(e, e->comment_edit >= 0 ? "comment edited" : "comment added");
   return 0;
 }
 
@@ -6921,7 +7000,7 @@ static const char HELP_TEXT[] =
   "  C-c C-r                           toggle read only\n"
   "  C-c C-w                           cycle overflow / character / word wrap\n"
   "  C-c e                             start suggested changes\n"
-  "  C-c c, C-c d                      create and delete comment\n"
+  "  C-c c, C-c d                      create/edit and delete comment\n"
   "  C-c ]                             show or hide comments\n"
   "  C-c a, C-c r                      accept or reject all changes\n"
   "\n"
@@ -7632,6 +7711,17 @@ static int dispatch(edit_state * e, int key) {
   if (e->replace_phase) return action_other(e), replace_dispatch(e, key);
   if (e->search_prompt) return action_other(e), search_dispatch(e, key);
 
+  if (e->prefix == 0 && active_buffer(e)->kind == BUFFER_REVIEW &&
+      ((key >= 32 && key < 256) || key == KEY_BACKSPACE || key == KEY_CTRL('d') ||
+       key == KEY_CTRL('y') || key == KEY_PASTE_START)) {
+    buffer * review = active_buffer(e);
+    size_t text_pos;
+    int index = review_comment_at(review, active_pane(e)->cursor, &text_pos);
+    if (index >= 0 && review->review_source >= 0 && review->review_source < e->n_buffers &&
+        begin_comment(e, review->review_source, index, text_pos))
+      return comment_dispatch(e, key);
+  }
+
   if (e->prefix) {
     keys[0] = e->prefix;
     keys[1] = key;
@@ -7775,6 +7865,15 @@ static int tui(const char * path) {
         spell_choice_key(&e, ev.spell_choice ? '0' + ev.spell_choice : 'i');
       key = -1;
     }
+    if ((!strcmp(ev.kind, "sgr-mouse") || !strcmp(ev.kind, "x10-mouse")) &&
+        (key == KEY_UP || key == KEY_DOWN || key == KEY_LEFT || key == KEY_RIGHT)) {
+      e.mouse_down = false;
+      clear_mark(&e);
+    }
+    if (key == KEY_MOUSE && ev.mouse_button == 3) {
+      mouse_click(&e, &ev);
+      key = -1;
+    }
     if (key == KEY_MOUSE || key == KEY_SPELL_MENU) {
       bool correction = key == KEY_SPELL_MENU || ev.mouse_button == 2;
       if (correction && (e.spell.choosing || e.spell.n_choices)) spell_cancel(&e);
@@ -7847,7 +7946,9 @@ static int tui(const char * path) {
       output ignored = read_paste(&e);
       free(ignored.data);
     } else if (key == KEY_PASTE_START && (e.find_prompt || e.search_prompt ||
-               e.replace_phase || e.command_prompt || e.run_prompt || e.goto_prompt)) {
+               e.replace_phase || e.command_prompt || e.run_prompt || e.goto_prompt ||
+               e.comment_prompt || (active_buffer(&e)->kind == BUFFER_REVIEW &&
+               review_comment_at(active_buffer(&e), active_pane(&e)->cursor, &(size_t){0}) >= 0))) {
       dispatch(&e, key);
       action = "prompt-paste";
     } else if (key == KEY_PASTE_START) {

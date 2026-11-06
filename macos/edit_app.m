@@ -761,7 +761,8 @@ static bool cell_same_text(cell *a, cell *b) {
 - (BOOL)sendMouseRow:(int)row col:(int)col button:(int)button {
   if (row < 0 || row >= _rows || col < 0 || col >= _cols) return NO;
   char seq[32];
-  int n = snprintf(seq, sizeof(seq), "\033[<%d;%d;%dM", button, col + 1, row + 1);
+  int n = snprintf(seq, sizeof(seq), "\033[<%d;%d;%d%c", button == 3 ? 0 : button,
+                   col + 1, row + 1, button == 3 ? 'm' : 'M');
   if (n <= 0 || n >= (int)sizeof(seq)) return NO;
   [self sendBytes:seq length:(NSUInteger)n];
   return YES;
@@ -782,6 +783,14 @@ static bool cell_same_text(cell *a, cell *b) {
   int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
   int row = (int)((self.bounds.size.height - p.y) / cell.height);
   [self sendMouseRow:row col:col button:32];
+}
+
+- (void)mouseUp:(NSEvent *)event {
+  NSSize cell = [self cellSize];
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
+  int row = (int)((self.bounds.size.height - p.y) / cell.height);
+  [self sendMouseRow:MAX(0, MIN(row, _rows - 1)) col:MAX(0, MIN(col, _cols - 1)) button:3];
 }
 
 - (NSMenuItem *)contextItem:(NSString *)title bytes:(const char *)bytes length:(NSUInteger)length {
@@ -806,7 +815,7 @@ static bool cell_same_text(cell *a, cell *b) {
   [menu addItem:[NSMenuItem separatorItem]];
   _spellingMenu = menu;
   _spellingItems = 1;
-  [menu addItem:[self contextItem:@"Create Comment" bytes:"\003c" length:2]];
+  [menu addItem:[self contextItem:@"Create/Edit Comment" bytes:"\003c" length:2]];
   [menu addItem:[self contextItem:@"Delete Comment" bytes:"\003d" length:2]];
   [menu addItem:[self contextItem:@"Show/Hide Comments" bytes:"\003]" length:2]];
   [menu addItem:[NSMenuItem separatorItem]];
@@ -872,7 +881,7 @@ static bool cell_same_text(cell *a, cell *b) {
     _scrollY += dy;
     CGFloat step = precise ? cell.height : 1;
     while (fabs(_scrollY) >= step && sent < SCROLL_MAX_KEYS) {
-      [self sendKey:_scrollY < 0 ? "\x1b[B" : "\x1b[A"];
+      [self sendKey:_scrollY < 0 ? "\x1b[<65;1;1M" : "\x1b[<64;1;1M"];
       _scrollY += (_scrollY < 0) ? step : -step;
       sent++;
     }
@@ -880,7 +889,7 @@ static bool cell_same_text(cell *a, cell *b) {
     _scrollX += dx;
     CGFloat step = precise ? cell.width : 1;
     while (fabs(_scrollX) >= step && sent < SCROLL_MAX_KEYS) {
-      [self sendKey:_scrollX < 0 ? "\x1b[C" : "\x1b[D"];
+      [self sendKey:_scrollX < 0 ? "\x1b[<67;1;1M" : "\x1b[<66;1;1M"];
       _scrollX += (_scrollX < 0) ? step : -step;
       sent++;
     }
@@ -1097,7 +1106,7 @@ static bool cell_same_text(cell *a, cell *b) {
 
   [self addCommand:@"Run Command    C-c x" bytes:"\003x" length:2 to:commands];
   [self addCommand:@"Start Suggested Changes    C-c e" bytes:"\003e" length:2 to:commands];
-  [self addCommand:@"Create Comment    C-c c" bytes:"\003c" length:2 to:commands];
+  [self addCommand:@"Create/Edit Comment    C-c c" bytes:"\003c" length:2 to:commands];
   [self addCommand:@"Delete Nearest Comment    C-c d" bytes:"\003d" length:2 to:commands];
   [self addCommand:@"Show/Hide Comments    C-c ]" bytes:"\003]" length:2 to:commands];
   [self addCommand:@"Accept All Changes    C-c a" bytes:"\003a" length:2 to:commands];
@@ -1302,17 +1311,18 @@ static int ansi_self_test(void) {
   int sent2 = [scrollView sendScrollDeltaX:0 y:-100000 precise:NO];
   close(p[1]);
   scrollView.fd = -1;
-  char buf[512];
+  char buf[2048];
   ssize_t got = read(p[0], buf, sizeof(buf));
   close(p[0]);
+  const char wheel[] = "\033[<65;1;1M";
   if (sent != SCROLL_MAX_KEYS || sent2 != SCROLL_MAX_KEYS ||
-      got != (sent + sent2) * 3) {
+      got != (sent + sent2) * (ssize_t)strlen(wheel)) {
     fprintf(stderr, "scroll cap failed: sent=%d sent2=%d got=%zd\n", sent, sent2, got);
     return 1;
   }
-  for (ssize_t i = 0; i < got; i += 3)
-    if (buf[i] != 0x1b || buf[i + 1] != '[' || buf[i + 2] != 'B') {
-      fprintf(stderr, "scroll emitted non-line-key bytes\n");
+  for (ssize_t i = 0; i < got; i += (ssize_t)strlen(wheel))
+    if (memcmp(buf + i, wheel, strlen(wheel))) {
+      fprintf(stderr, "scroll emitted wrong wheel bytes\n");
       return 1;
     }
 
@@ -1321,13 +1331,14 @@ static int ansi_self_test(void) {
   mouseView.fd = p[1];
   BOOL clicked = [mouseView sendMouseRow:1 col:1 button:0];
   BOOL dragged = [mouseView sendMouseRow:2 col:4 button:32];
+  BOOL released = [mouseView sendMouseRow:2 col:4 button:3];
   close(p[1]);
   mouseView.fd = -1;
   got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  const char mouse[] = "\033[<0;2;2M\033[<32;5;3M";
-  if (!clicked || !dragged || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
-    fprintf(stderr, "mouse click/drag bytes failed\n");
+  const char mouse[] = "\033[<0;2;2M\033[<32;5;3M\033[<0;5;3m";
+  if (!clicked || !dragged || !released || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
+    fprintf(stderr, "mouse click/drag/release bytes failed\n");
     return 1;
   }
 
@@ -1350,7 +1361,7 @@ static int ansi_self_test(void) {
       ![[context itemAtIndex:1].title isEqualToString:@"spilling"] ||
       ![[context itemAtIndex:2].title isEqualToString:@"Add word"] ||
       ![context itemAtIndex:2].isEnabled ||
-      ![[context itemAtIndex:4].title isEqualToString:@"Create Comment"]) return 1;
+      ![[context itemAtIndex:4].title isEqualToString:@"Create/Edit Comment"]) return 1;
   ansi_feed(menuView, "\033]777;spell;2;00;626164\a\033]777;spell;1;00;zz\a");
   if (![[context itemAtIndex:0].title isEqualToString:@"spelling"]) return 1;
   [menuView sendCommand:[context itemAtIndex:0]];
@@ -1436,8 +1447,8 @@ static int ansi_self_test(void) {
   preciseView.fd = -1;
   got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  if (half != 0 || rest != 1 || got != 3 ||
-      buf[0] != 0x1b || buf[1] != '[' || buf[2] != 'B') {
+  if (half != 0 || rest != 1 || got != (ssize_t)strlen(wheel) ||
+      memcmp(buf, wheel, strlen(wheel))) {
     fprintf(stderr, "precise scroll failed: half=%d rest=%d got=%zd\n", half, rest, got);
     return 1;
   }
