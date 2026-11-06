@@ -93,6 +93,7 @@ void match(const char * regex, const char * string, int * start, int * end);
 #define PANE_MAX 8
 #define LAYOUT_MAX (PANE_MAX * 2 - 1)
 #define COMMENT_MAX 64
+#define COMMENT_SIZE (64 * 1024)
 #define CHANGE_SGR "38;2;130;230;150;48;2;38;68;45"
 #define DELETE_SGR "9;38;2;235;145;145;48;2;62;38;38"
 #define COMMENT_SGR "48;2;54;50;34"
@@ -361,7 +362,8 @@ struct edit_state {
   size_t goto_len;
   size_t goto_pos;
   bool comment_prompt;
-  char comment[STATUS_SIZE];
+  bool review_expand_pending;
+  char comment[COMMENT_SIZE];
   size_t comment_len;
   size_t comment_pos;
   size_t comment_start;
@@ -2759,7 +2761,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
         sscanf(seq, "[<%d;%d;%d", &button, &x, &y) == 3) {
       snprintf(ev.kind, sizeof(ev.kind), "sgr-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && final == 'M' && (button == 0 || button == 2)) {
+      if (ev.key < 0 && final == 'M' && (button == 0 || button == 2 || button == 32)) {
         ev.key = KEY_MOUSE;
         ev.mouse_button = button;
         ev.mouse_col = x - 1;
@@ -2769,7 +2771,7 @@ static key_event read_key_event(edit_state * e, int timeout_ms) {
       button = (unsigned char) seq[2] - 32;
       snprintf(ev.kind, sizeof(ev.kind), "x10-mouse");
       ev.key = mouse_wheel_key(button);
-      if (ev.key < 0 && (button == 0 || button == 2)) {
+      if (ev.key < 0 && (button == 0 || button == 2 || button == 32)) {
         ev.key = KEY_MOUSE;
         ev.mouse_button = button;
         ev.mouse_col = (unsigned char) seq[3] - 33;
@@ -3079,7 +3081,37 @@ static int pane_at(edit_state * e, int row, int col, pane_rect rects[PANE_MAX]) 
   return -1;
 }
 
+static void comment_prompt_position(edit_state * e, int cols, size_t * first,
+                                    int * row, size_t * col);
+
 static int mouse_click(edit_state * e, key_event * ev) {
+  bool drag = ev->mouse_button == 32;
+  // Map the visible two-row comment viewport back to its text cursor.
+  if (e->comment_prompt && ev->mouse_row >= e->rows - 2 &&
+      ev->mouse_row < e->rows && ev->mouse_col >= 0 && ev->mouse_col < e->cols) {
+    size_t first, col;
+    int row;
+    comment_prompt_position(e, e->cols, &first, &row, &col);
+    size_t target = (first + (size_t) (ev->mouse_row - (e->rows - 2))) * (size_t) e->cols +
+      (size_t) ev->mouse_col;
+    size_t label = strlen("comment: ");
+    size_t pos = 0;
+    if (target > label) {
+      size_t count = target - label;
+      while (pos < e->comment_len && count > 0) {
+        pos++;
+        while (pos < e->comment_len && ((unsigned char) e->comment[pos] & 0xc0) == 0x80) pos++;
+        count--;
+      }
+    }
+    if (drag && (!e->prompt_mark_active || e->prompt_mark_text != e->comment)) {
+      e->prompt_mark_text = e->comment;
+      e->prompt_mark = e->comment_pos;
+      e->prompt_mark_active = true;
+    } else if (!drag) clear_prompt_mark(e);
+    e->comment_pos = pos;
+    return 0;
+  }
   if (prompt_footer_cursor(e) && ! e->find_prompt) return 0;
   pane_rect rects[PANE_MAX];
   pane_rects(e, rects);
@@ -3103,10 +3135,12 @@ static int mouse_click(edit_state * e, key_event * ev) {
   size_t col = (size_t) (ev->mouse_col - rects[i].col);
   if (p->wrap) col += visual_col(e, b, start, pos);
   else col += p->left_col;
+  size_t anchor = p->cursor;
   p->cursor = p->wrap == 2 ? visual_row_column_pos(e, p, pos, col - visual_col(e, b, start, pos)) :
     visual_column_pos(e, b, start, col);
   p->preferred_col = SIZE_MAX;
-  p->mark_active = false;
+  if (drag && !p->mark_active) p->mark = anchor, p->mark_active = true;
+  else if (!drag) p->mark_active = false;
   refresh_buffer_list(e);
   return select ? cmd_insert(e, KEY_ENTER) : 0;
 }
@@ -3852,6 +3886,7 @@ static void comment_prompt_position(edit_state * e, int cols, size_t * first,
 
 static void render_comment_prompt(edit_state * e, output * o, int cols, bool snapshot) {
   const char * label = "comment: ";
+  size_t label_len = strlen(label);
   size_t width = (size_t) cols;
   size_t first;
   int cursor_row;
@@ -3860,6 +3895,8 @@ static void render_comment_prompt(edit_state * e, output * o, int cols, bool sna
   output text = {0};
   out_s(&text, label);
   out_add(&text, e->comment, e->comment_len);
+  size_t selected_start = label_len + (e->prompt_mark < e->comment_pos ? e->prompt_mark : e->comment_pos);
+  size_t selected_end = label_len + (e->prompt_mark > e->comment_pos ? e->prompt_mark : e->comment_pos);
   size_t at = 0;
   for (size_t col = 0; col < first * width && at < text.len; col++) {
     at++;
@@ -3867,14 +3904,22 @@ static void render_comment_prompt(edit_state * e, output * o, int cols, bool sna
   }
   for (int row = 0; row < 2; row++) {
     size_t used = 0;
+    bool reversed = false;
     while (used < width && at < text.len) {
       if (snapshot && row == cursor_row && used == cursor_col) out_s(o, "|");
       size_t end = at + 1;
       while (end < text.len && ((unsigned char) text.data[end] & 0xc0) == 0x80) end++;
+      bool selected = !snapshot && e->prompt_mark_active && e->prompt_mark_text == e->comment &&
+        at >= selected_start && at < selected_end;
+      if (selected != reversed) {
+        out_s(o, selected ? "\x1b[7m" : "\x1b[27m");
+        reversed = selected;
+      }
       out_add(o, text.data + at, end - at);
       at = end;
       used++;
     }
+    if (reversed) out_s(o, "\x1b[27m");
     if (snapshot && row == cursor_row && used == cursor_col) out_s(o, "|");
     if (! snapshot) while (used++ < width) out_s(o, " ");
     if (row == 0) out_s(o, "\r\n");
@@ -4318,6 +4363,7 @@ static void render(edit_state * e) {
   int previous_rows = e->rows;
   int previous_cols = e->cols;
   get_window_size(e);
+  int previous_panes = e->n_panes;
   sync_review(e);
   output o = {0};
   pane_rect rects[PANE_MAX];
@@ -4326,6 +4372,10 @@ static void render(edit_state * e) {
   size_t cursor_col = 0;
 
   pane_rects(e, rects);
+  if (e->review_expand_pending && e->n_panes > previous_panes) {
+    out_s(&o, "\x1b]777;review-open\x07");
+    e->review_expand_pending = false;
+  }
   out_f(&o, "\x1b[?25l\x1b[H\x1b[%sm", BASE_SGR);
   // Clear the previous layout after resizing.
   if (e->rows != previous_rows || e->cols != previous_cols) out_s(&o, "\x1b[2J");
@@ -5528,12 +5578,9 @@ static bool prompt_insert(edit_state * e, prompt_slot * s, const char * data, si
     return set_footer(e, "input too long; edit or cancel"), false;
   }
   if (region) prompt_delete(e, s, start, end, false);
-  for (size_t i = 0; i < n; i++) {
-    if (data[i] == '\0') continue;
-    memmove(s->text + *s->pos + 1, s->text + *s->pos, *s->len - *s->pos + 1);
-    s->text[(*s->pos)++] = data[i];
-    (*s->len)++;
-  }
+  memmove(s->text + *s->pos + bytes, s->text + *s->pos, *s->len - *s->pos + 1);
+  for (size_t i = 0; i < n; i++) if (data[i] != '\0') s->text[(*s->pos)++] = data[i];
+  *s->len += bytes;
   if (bytes) e->prompt_overflow = NULL;
   return true;
 }
@@ -5941,6 +5988,7 @@ static int cmd_suggested(edit_state * e, int key) {
   b->base = buffer_text(b, &b->base_len);
   if (b->base == NULL) return set_status(e, "cannot start suggestions"), 0;
   b->suggested = true;
+  e->review_expand_pending = true;
   b->suggested_history_start = b->undo_at;
   b->comments_visible = true;
   track_rebuild(b);
@@ -5952,7 +6000,8 @@ static int cmd_comment(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   (void) key;
-  if (! b->suggested) return set_status(e, "start suggested changes first"), 0;
+  if (! b->suggested) cmd_suggested(e, 0);
+  if (! b->suggested) return 0;
   if (b->n_comments >= COMMENT_MAX) return set_status(e, "too many comments"), 0;
   if (! region_range(p, &e->comment_start, &e->comment_end)) {
     e->comment_start = line_start(b, p->cursor);
@@ -5986,6 +6035,23 @@ static int comment_submit(edit_state * e) {
 
 static int comment_dispatch(edit_state * e, int key) {
   if (key == KEY_ENTER) return clear_prompt_mark(e), comment_submit(e);
+  // Move one visible row so long comments can scroll through the footer.
+  if (key == KEY_UP || key == KEY_DOWN) {
+    size_t column = strlen("comment: ");
+    for (size_t i = 0; i < e->comment_pos; i++)
+      if (((unsigned char) e->comment[i] & 0xc0) != 0x80) column++;
+    column = key == KEY_UP ? (column > (size_t)e->cols ? column - (size_t)e->cols : 0) :
+      column + (size_t)e->cols;
+    size_t pos = 0, target = column > strlen("comment: ") ? column - strlen("comment: ") : 0;
+    while (pos < e->comment_len && target > 0) {
+      pos++;
+      while (pos < e->comment_len && ((unsigned char)e->comment[pos] & 0xc0) == 0x80) pos++;
+      target--;
+    }
+    e->comment_pos = pos;
+    clear_prompt_mark(e);
+    return 0;
+  }
   prompt_slot s = {"comment: ", e->comment, &e->comment_len,
                    &e->comment_pos, sizeof(e->comment)};
   prompt_edit(e, &s, key);
@@ -7664,7 +7730,7 @@ static int tui(const char * path) {
   resize_action.sa_handler = window_resized;
   sigemptyset(&resize_action.sa_mask);
   sigaction(SIGWINCH, &resize_action, NULL);
-  const char * start = "\x1b[?1049h\x1b[?1007h\x1b[?1000h\x1b[?1006h"
+  const char * start = "\x1b[?1049h\x1b[?1007h\x1b[?1002h\x1b[?1006h"
     "\x1b[?2004h\x1b[38;2;224;224;224m"
     "\x1b[48;2;32;32;32m\x1b[2 q\x1b[?12l";
   terminal_write(start, strlen(start));
@@ -7717,7 +7783,8 @@ static int tui(const char * path) {
       int pane_i = pane_at(&e, ev.mouse_row, ev.mouse_col, rects);
       bool body = pane_i >= 0 && ev.mouse_row - rects[pane_i].row < pane_body_rows(&e, pane_i);
       if (correction && prompt_footer_cursor(&e) && !e.find_prompt) body = false;
-      if (body) {
+      if (body || (key == KEY_MOUSE && e.comment_prompt &&
+                   ev.mouse_row >= e.rows - 2 && ev.mouse_row < e.rows)) {
         e.prefix = 0;
         e.quit_confirm = false;
         mouse_click(&e, &ev);
@@ -7809,7 +7876,7 @@ static int tui(const char * path) {
   int snapshot = !e.quit && session_enabled() ? session_save(&e) : 0;
   raw_off(&e);
   if (snapshot) fprintf(stderr, "edit: session snapshot failed\n");
-  const char * clear = "\x1b[?1006l\x1b[?1000l\x1b[?1007l\x1b[?2004l"
+  const char * clear = "\x1b[?1006l\x1b[?1002l\x1b[?1007l\x1b[?2004l"
     "\x1b[?25h\x1b[0 q\x1b[0m\x1b[?1049l";
   terminal_write(clear, strlen(clear));
   free(e.input.data);

@@ -93,7 +93,7 @@ typedef struct {
 - (NSString *)lineText:(int)width;
 - (NSUInteger)csiLength;
 - (void)readBytes:(NSData *)data;
-- (BOOL)sendMouseClickRow:(int)row col:(int)col;
+- (BOOL)sendMouseRow:(int)row col:(int)col button:(int)button;
 - (int)sendScrollDeltaX:(CGFloat)dx y:(CGFloat)dy precise:(BOOL)precise;
 - (void)panicCancel;
 - (void)sendBytes:(const char *)bytes length:(NSUInteger)length;
@@ -129,6 +129,15 @@ static cell blank_cell(attr a) {
   memcpy(c.underline_rgb, a.underline_rgb, sizeof(c.underline_rgb));
   c.reverse = a.reverse;
   return c;
+}
+
+static NSRect review_frame(NSRect frame, NSRect visible) {
+  CGFloat width = MIN(frame.size.width * 2, visible.size.width);
+  if (width <= frame.size.width) return frame;
+  CGFloat center = NSMidX(frame);
+  frame.size.width = width;
+  frame.origin.x = MAX(NSMinX(visible), MIN(center - width / 2, NSMaxX(visible) - width));
+  return frame;
 }
 
 static bool cell_equal(cell a, cell b) {
@@ -568,7 +577,10 @@ static bool cell_same_text(cell *a, cell *b) {
     unsigned char b = bytes[i];
     if (_ansiState == AnsiOsc || _ansiState == AnsiOscEsc) {
       if (b == 7 || (_ansiState == AnsiOscEsc && b == '\\')) {
-        [self spellingResponse:_csi];
+        if ([_csi isEqualToString:@"777;review-open"]) {
+          NSWindow *window = self.window;
+          if (window.screen) [window setFrame:review_frame(window.frame, window.screen.visibleFrame) display:YES];
+        } else [self spellingResponse:_csi];
         [_csi setString:@""];
         _ansiState = AnsiNormal;
       } else if (b == 27) _ansiState = AnsiOscEsc;
@@ -746,10 +758,10 @@ static bool cell_same_text(cell *a, cell *b) {
   [self sendBytes:data.bytes length:data.length];
 }
 
-- (BOOL)sendMouseClickRow:(int)row col:(int)col {
+- (BOOL)sendMouseRow:(int)row col:(int)col button:(int)button {
   if (row < 0 || row >= _rows || col < 0 || col >= _cols) return NO;
   char seq[32];
-  int n = snprintf(seq, sizeof(seq), "\033[<0;%d;%dM", col + 1, row + 1);
+  int n = snprintf(seq, sizeof(seq), "\033[<%d;%d;%dM", button, col + 1, row + 1);
   if (n <= 0 || n >= (int)sizeof(seq)) return NO;
   [self sendBytes:seq length:(NSUInteger)n];
   return YES;
@@ -761,7 +773,15 @@ static bool cell_same_text(cell *a, cell *b) {
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
   int row = (int)((self.bounds.size.height - p.y) / cell.height);
-  [self sendMouseClickRow:row col:col];
+  [self sendMouseRow:row col:col button:0];
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+  NSSize cell = [self cellSize];
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  int col = (int)floor((p.x - [self rowRect:0].origin.x) / cell.width);
+  int row = (int)((self.bounds.size.height - p.y) / cell.height);
+  [self sendMouseRow:row col:col button:32];
 }
 
 - (NSMenuItem *)contextItem:(NSString *)title bytes:(const char *)bytes length:(NSUInteger)length {
@@ -1299,14 +1319,15 @@ static int ansi_self_test(void) {
   if (pipe(p) != 0) return 1;
   EditTerminalView *mouseView = [[EditTerminalView alloc] initForAnsiSelfTest];
   mouseView.fd = p[1];
-  BOOL clicked = [mouseView sendMouseClickRow:1 col:1];
+  BOOL clicked = [mouseView sendMouseRow:1 col:1 button:0];
+  BOOL dragged = [mouseView sendMouseRow:2 col:4 button:32];
   close(p[1]);
   mouseView.fd = -1;
   got = read(p[0], buf, sizeof(buf));
   close(p[0]);
-  const char mouse[] = "\033[<0;2;2M";
-  if (!clicked || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
-    fprintf(stderr, "mouse click bytes failed\n");
+  const char mouse[] = "\033[<0;2;2M\033[<32;5;3M";
+  if (!clicked || !dragged || got != (ssize_t)strlen(mouse) || memcmp(buf, mouse, strlen(mouse)) != 0) {
+    fprintf(stderr, "mouse click/drag bytes failed\n");
     return 1;
   }
 

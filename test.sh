@@ -231,6 +231,10 @@ int main(int argc, char ** argv) {
     await_window(view, nil);
     [view setFontSize:17];
     [window setFrame:NSMakeRect(120, 140, 720, 480) display:YES];
+    NSRect sample = review_frame(NSMakeRect(400, 200, 600, 480), NSMakeRect(0, 0, 1600, 900));
+    assert(sample.size.width == 1200 && sample.origin.x == 100);
+    sample = review_frame(NSMakeRect(400, 200, 600, 480), NSMakeRect(0, 0, 900, 900));
+    assert(sample.size.width == 900 && sample.origin.x == 0);
     [view sendKey:"WINDOW-ONE"];
     await_window(view, @"WINDOW-ONE");
     NSRect frame = window.frame;
@@ -244,6 +248,11 @@ int main(int argc, char ** argv) {
     window = [delegate openPath:nil session:saved];
     view = (EditTerminalView *)window.contentView;
     await_window(view, @"WINDOW-ONE");
+    if (window.screen && window.screen.visibleFrame.size.width > window.frame.size.width) {
+      CGFloat oldWidth = window.frame.size.width;
+      [view readBytes:[@"\033]777;review-open\007" dataUsingEncoding:NSUTF8StringEncoding]];
+      assert(window.frame.size.width > oldWidth);
+    }
     // AppKit may constrain geometry when the test host has no attached screen.
     assert([saved[@"frame"] isEqual:NSStringFromRect(frame)] && view.font.pointSize == 17);
     NSWindow *secondWindow = [delegate openPath:nil session:@{@"id": @"two"}];
@@ -2028,7 +2037,7 @@ grep -q 'Xabc' "$out"
 
 python3 ./tui_view.py 4:40 '<raw>' "$tmp" > "$out"
 grep -F -q "$(printf '\033[?1007h')" "$out"
-grep -F -q "$(printf '\033[?1000h')" "$out"
+grep -F -q "$(printf '\033[?1002h')" "$out"
 grep -F -q "$(printf '\033[?1006h')" "$out"
 grep -F -q "$(printf '\033[38;2;224;224;224;48;2;32;32;32m')" "$out"
 grep -F -q "$(printf '\033[2 q')" "$out"
@@ -2036,7 +2045,7 @@ grep -F -q "$(printf '\033[?12l')" "$out"
 
 python3 ./tui_view.py 4:40 '<raw><c-x>^c' "$tmp" > "$out"
 grep -F -q "$(printf '\033[?1006l')" "$out"
-grep -F -q "$(printf '\033[?1000l')" "$out"
+grep -F -q "$(printf '\033[?1002l')" "$out"
 grep -F -q "$(printf '\033[?1007l')" "$out"
 
 printf 'one\ntwo\nthree\n' > "$tmp"
@@ -2566,6 +2575,64 @@ printf 'alpha\n' > "$compose"
 ./edit --render-keys 7:23 'CeCcijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyzijkmotuwyz' "$compose" > "$out"
 grep -q '^otuwyzijkmotuwyzijkmotu' "$out"
 grep -q '^wyzijkmotuwyz|$' "$out"
+
+# Starting a comment enables suggestions; a long comment survives the prompt viewport and save.
+long_comment=$(printf 'ijkmotuwyz%.0s' $(seq 1 400))
+./edit --render-keys 8:30 "Cc${long_comment}" "$compose" > "$out"
+grep -q 'Suggested' "$out"
+grep -q '^jkmotuwyzijkmotuwyz|$' "$out"
+./edit --render-keys 8:30 "Cc${long_comment}
+xs" "$compose" > "$out"
+grep -q '^comment 0 5 4000$' "$compose.edits"
+grep -q "$long_comment" "$compose.edits"
+
+cat > "$dir/mouse-check.c" <<'C'
+#define main edit_program_main
+#include "edit.c"
+#undef main
+#include <assert.h>
+
+int main(int argc, char **argv) {
+  assert(argc == 2);
+  edit_state e;
+  init_state(&e);
+  e.rows = 8; e.cols = 30;
+  e.n_buffers = e.n_panes = 1;
+  e.panes[0].buffer = 0;
+  assert(!buffer_load(&e.buffers[0], argv[1]));
+  key_event click = {.mouse_row = 0, .mouse_col = 1, .mouse_button = 0};
+  key_event drag = {.mouse_row = 0, .mouse_col = 4, .mouse_button = 32};
+  mouse_click(&e, &click);
+  mouse_click(&e, &drag);
+  assert(e.panes[0].mark_active && e.panes[0].mark == 1 && e.panes[0].cursor == 4);
+  cmd_comment(&e, 0);
+  assert(e.comment_prompt && e.buffers[0].suggested);
+  strcpy(e.comment, "abcdef");
+  e.comment_len = e.comment_pos = 6;
+  click.mouse_row = 6; click.mouse_col = 11;
+  drag.mouse_row = 6; drag.mouse_col = 14;
+  mouse_click(&e, &click);
+  mouse_click(&e, &drag);
+  assert(e.prompt_mark_active && e.prompt_mark == 2 && e.comment_pos == 5);
+  comment_dispatch(&e, KEY_CTRL('w'));
+  assert(!strcmp(e.comment, "abf"));
+  memset(e.comment, 'k', 4000);
+  e.comment[4000] = 0;
+  e.comment_len = e.comment_pos = 4000;
+  comment_dispatch(&e, KEY_UP);
+  assert(e.comment_pos == 3970);
+  comment_dispatch(&e, KEY_DOWN);
+  assert(e.comment_pos == 4000);
+  click.mouse_row = 6; click.mouse_col = 0;
+  mouse_click(&e, &click);
+  assert(e.comment_pos > 3900 && e.comment_pos < 4000);
+  buffers_free(&e);
+  kill_ring_free(&e);
+  return 0;
+}
+C
+cc -std=c11 -Wall -Wextra -pedantic -O2 -I. -o "$dir/mouse-check" "$dir/mouse-check.c" grammar.c regex.c -lutil
+"$dir/mouse-check" "$compose"
 
 printf 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\n' > "$review"
 ./edit --render-keys 20:30 'CeXCcok
