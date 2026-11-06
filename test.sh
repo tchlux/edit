@@ -2587,6 +2587,22 @@ xs" "$compose" > "$out"
 grep -q '^comment 0 5 4000$' "$compose.edits"
 grep -q "$long_comment" "$compose.edits"
 
+# Rapid comment typing must stay in the prompt, including when suggestions open on that keystroke.
+fast_comment="$dir/fast-comment.txt"
+printf 'alpha beta gamma\n' > "$fast_comment"
+python3 ./tui_view.py 12:60 '<c-c>cabcdef
+^x^s' "$fast_comment" > "$out"
+grep -q '^changes 0$' "$fast_comment.edits"
+grep -q '^comments 1$' "$fast_comment.edits"
+grep -q '^abcdef$' "$fast_comment.edits"
+
+# Wheel movement inside the comment prompt must leave its source selection visible.
+wheel_comment="$dir/wheel-comment.txt"
+printf 'abcdef\n' > "$wheel_comment"
+wheel_keys=$(printf '<raw>\033[<0;2;1M\033[<32;5;1M\033[<0;5;1m\003c\033[<65;1;1M')
+python3 ./tui_view.py 8:60 "$wheel_keys" "$wheel_comment" > "$out"
+grep -Fq ';7mbcd' "$out"
+
 cat > "$dir/mouse-check.c" <<'C'
 #define main edit_program_main
 #include "edit.c"
@@ -2603,17 +2619,39 @@ int main(int argc, char **argv) {
   assert(!buffer_load(&e.buffers[0], argv[1]));
   key_event click = {.mouse_row = 0, .mouse_col = 1, .mouse_button = 0};
   key_event drag = {.mouse_row = 0, .mouse_col = 4, .mouse_button = 32};
+  key_event release = {.mouse_row = 0, .mouse_col = 1, .mouse_button = 3};
+  mouse_click(&e, &click);
+  drag.mouse_col = 1;
+  mouse_click(&e, &drag);
+  mouse_click(&e, &release);
+  dispatch(&e, KEY_RIGHT);
+  assert(!e.panes[0].mark_active && e.panes[0].cursor == 2);
+  mouse_click(&e, &click);
+  mouse_click(&e, &release);
+  dispatch(&e, KEY_CTRL(' '));
+  dispatch(&e, KEY_RIGHT);
+  assert(e.panes[0].mark_active && e.panes[0].mark == 1 && e.panes[0].cursor == 2);
+
+  drag.mouse_col = 4;
   mouse_click(&e, &click);
   mouse_click(&e, &drag);
   assert(e.panes[0].mark_active && e.panes[0].mark == 1 && e.panes[0].cursor == 4);
-  key_event release = {.mouse_row = 0, .mouse_col = 4, .mouse_button = 3};
+  release.mouse_col = 4;
   mouse_click(&e, &release);
   assert(!e.mouse_down);
+  dispatch(&e, KEY_RIGHT);
+  assert(!e.panes[0].mark_active && e.panes[0].cursor == 5);
+
+  mouse_click(&e, &click);
+  mouse_click(&e, &drag);
+  mouse_click(&e, &release);
   drag.mouse_col = 5;
   mouse_click(&e, &drag);
   assert(e.panes[0].cursor == 4);
   cmd_comment(&e, 0);
   assert(e.comment_prompt && e.buffers[0].suggested);
+  mouse_click(&e, &click);
+  assert(e.panes[0].cursor == 4 && e.comment_start == 1 && e.comment_end == 4);
   strcpy(e.comment, "abcdef");
   e.comment_len = e.comment_pos = 6;
   click.mouse_row = 6; click.mouse_col = 11;
@@ -2667,7 +2705,51 @@ int main(int argc, char **argv) {
   comment_submit(&e);
   assert(e.buffers[0].n_comments == 1 && !strcmp(e.buffers[0].comments[0].text, "nXew"));
   e.active_pane = 0;
+  sync_review(&e);
+  pane_rects(&e, rects);
+  click.mouse_row = rects[0].row;
+  click.mouse_col = rects[0].col + 1;
+  drag.mouse_row = rects[1].row;
+  drag.mouse_col = rects[1].col + 1;
+  mouse_click(&e, &click);
+  mouse_click(&e, &drag);
+  assert(e.active_pane == 0 && !e.panes[1].mark_active);
+  mouse_click(&e, &release);
   cmd_save(&e, 0);
+  buffers_free(&e);
+  kill_ring_free(&e);
+
+  // Traversing the document's last page must not scroll a still-selected review comment.
+  init_state(&e);
+  e.rows = 12; e.cols = 80; e.n_buffers = e.n_panes = 1;
+  e.panes[0].buffer = 0;
+  output text = {0};
+  for (int i = 0; i < 30; i++) out_f(&text, "line %02d\n", i);
+  assert(!buffer_set_text(&e.buffers[0], "notes.txt", BUFFER_FILE, text.data));
+  free(text.data);
+  cmd_suggested(&e, 0);
+  buffer *b = &e.buffers[0];
+  b->n_comments = 10;
+  for (int i = 0; i < b->n_comments; i++) {
+    b->comments[i].start = (size_t)(i == 0 ? 0 : i == 1 ? 12 : 24) * 8;
+    b->comments[i].end = b->comments[i].start + 4;
+    b->comments[i].text = _dup("note");
+  }
+  b->review_version++;
+  e.panes[0].top = e.panes[0].cursor = 20 * 8;
+  sync_review(&e);
+  assert(e.n_panes == 2);
+  size_t review_top = e.panes[1].top;
+  int selected = e.buffers[1].review_selected;
+  for (int i = 21; i < 30; i++) {
+    dispatch(&e, KEY_DOWN);
+    sync_review(&e);
+    assert(e.panes[0].cursor == (size_t)i * 8);
+    assert(e.buffers[1].review_selected == selected && e.panes[1].top == review_top);
+  }
+  for (int i = 0; i < e.buffers[1].n_review; i++)
+    for (const unsigned char *p = (const unsigned char *)e.buffers[1].review[i].text; *p; p++)
+      assert(*p < 128);
   buffers_free(&e);
   kill_ring_free(&e);
   return 0;
@@ -2705,7 +2787,7 @@ printf 'one\ntwo\nthree\n' > "$comment_align"
 nn@ffCcsecond
 xs' "$comment_align" > "$out"
 python3 ./tui_view.py 12:60 '^n^n' "$comment_align" > "$out"
-sed -n '3p' "$out" | grep -q '##.2..Comment'
+grep -q '##.2..Comment' "$out"
 python3 ./tui_view.py 12:60 '' "$comment_align" > "$out"
 sed -n '1p' "$out" | grep -q '##.1..Comment'
 

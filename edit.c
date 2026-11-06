@@ -218,6 +218,7 @@ typedef struct {
   int recenter;
   int help_return_buffer;
   bool mark_active;
+  bool mouse_mark;
   int wrap; // 0: overflow, 1: characters, 2: words
 } pane;
 
@@ -364,6 +365,7 @@ struct edit_state {
   bool comment_prompt;
   bool review_expand_pending;
   bool mouse_down;
+  int mouse_pane;
   char comment[COMMENT_SIZE];
   size_t comment_len;
   size_t comment_pos;
@@ -1399,6 +1401,7 @@ static buffer * pane_buffer(edit_state * e, pane * p) {
 
 static void clear_mark(edit_state * e) {
   active_pane(e)->mark_active = false;
+  active_pane(e)->mouse_mark = false;
 }
 
 static void clear_prompt_mark(edit_state * e) {
@@ -3108,13 +3111,19 @@ static int review_comment_at(buffer * b, size_t pos, size_t * text_pos) {
 }
 
 static int mouse_click(edit_state * e, key_event * ev) {
-  if (ev->mouse_button == 3) return e->mouse_down = false, 0;
+  if (ev->mouse_button == 3) {
+    e->mouse_down = false;
+    if (active_pane(e)->mouse_mark && active_pane(e)->mark == active_pane(e)->cursor)
+      clear_mark(e);
+    return 0;
+  }
   bool drag = ev->mouse_button == 32;
   if (drag && !e->mouse_down) return 0;
-  if (ev->mouse_button == 0) e->mouse_down = true;
   // Map the visible two-row comment viewport back to its text cursor.
   if (e->comment_prompt && ev->mouse_row >= e->rows - 2 &&
       ev->mouse_row < e->rows && ev->mouse_col >= 0 && ev->mouse_col < e->cols) {
+    if (drag && e->mouse_pane != -1) return 0;
+    if (ev->mouse_button == 0) e->mouse_down = true, e->mouse_pane = -1;
     size_t first, col;
     int row;
     comment_prompt_position(e, e->cols, &first, &row, &col);
@@ -3138,6 +3147,7 @@ static int mouse_click(edit_state * e, key_event * ev) {
     e->comment_pos = pos;
     return 0;
   }
+  if (e->comment_prompt) return 0;
   if (prompt_footer_cursor(e) && ! e->find_prompt) return 0;
   pane_rect rects[PANE_MAX];
   pane_rects(e, rects);
@@ -3146,6 +3156,8 @@ static int mouse_click(edit_state * e, key_event * ev) {
   int body_rows = pane_body_rows(e, i);
   int local_row = ev->mouse_row - rects[i].row;
   if (local_row < 0 || local_row >= body_rows) return 0;
+  if (drag && e->mouse_pane != i) return 0;
+  if (ev->mouse_button == 0) e->mouse_down = true, e->mouse_pane = i;
 
   bool select = e->active_pane == i && pane_buffer(e, &e->panes[i])->kind == BUFFER_FIND;
   save_pane_state(e);
@@ -3165,8 +3177,9 @@ static int mouse_click(edit_state * e, key_event * ev) {
   p->cursor = p->wrap == 2 ? visual_row_column_pos(e, p, pos, col - visual_col(e, b, start, pos)) :
     visual_column_pos(e, b, start, col);
   p->preferred_col = SIZE_MAX;
-  if (drag && !p->mark_active) p->mark = anchor, p->mark_active = true;
-  else if (!drag) p->mark_active = false;
+  if (drag && !p->mark_active && p->cursor != anchor)
+    p->mark = anchor, p->mark_active = p->mouse_mark = true;
+  else if (!drag) p->mark_active = p->mouse_mark = false;
   if (ev->mouse_button == 0 && b->kind == BUFFER_REVIEW &&
       b->review_source >= 0 && b->review_source < e->n_buffers) {
     size_t text_pos;
@@ -4182,7 +4195,7 @@ static int build_review(buffer * b, review_row ** rows) {
   int section = 0;
   size_t original = 0;
   size_t proposed = 0;
-  review_add_row(rows, &n, REVIEW_HEAD, 0, "# Suggested Changes — %s", file_name(b->path));
+  review_add_row(rows, &n, REVIEW_HEAD, 0, "# Suggested Changes - %s", file_name(b->path));
   review_add_row(rows, &n, REVIEW_PLAIN, 0, "");
   for (int i = 0; i < b->n_atoms;) {
     track_atom * a = &b->atoms[i];
@@ -4213,9 +4226,9 @@ static int build_review(buffer * b, review_row ** rows) {
     const char * kind = deleted.len && added.len ? "Replace" : deleted.len ? "Delete" : "Add";
     review_add_row(rows, &n, REVIEW_HEAD, proposed_start, "## %d. %s", ++section, kind);
     review_add_row(rows, &n, REVIEW_META, proposed_start,
-                   "- Original: %zu:%zu–%zu:%zu", ol1, oc1, ol2, oc2);
+                   "- Original: %zu:%zu-%zu:%zu", ol1, oc1, ol2, oc2);
     review_add_row(rows, &n, REVIEW_META, proposed_start,
-                   "- Proposed: %zu:%zu–%zu:%zu", pl1, pc1, pl2, pc2);
+                   "- Proposed: %zu:%zu-%zu:%zu", pl1, pc1, pl2, pc2);
     if (deleted.len) {
       review_add_row(rows, &n, REVIEW_DELETE, proposed_start, "### Deleted");
       review_text_rows(rows, &n, REVIEW_DELETE, proposed_start, "- ", &deleted);
@@ -4251,9 +4264,9 @@ static int build_review(buffer * b, review_row ** rows) {
     int first = n;
     review_add_row(rows, &n, REVIEW_COMMENT_HEAD, c->start, "## %d. Comment", ++section);
     review_add_row(rows, &n, REVIEW_META, c->start,
-                   "- Original: %zu:%zu–%zu:%zu", ol1, oc1, ol2, oc2);
+                   "- Original: %zu:%zu-%zu:%zu", ol1, oc1, ol2, oc2);
     review_add_row(rows, &n, REVIEW_META, c->start,
-                   "- Proposed: %zu:%zu–%zu:%zu", pl1, pc1, pl2, pc2);
+                   "- Proposed: %zu:%zu-%zu:%zu", pl1, pc1, pl2, pc2);
     review_add_row(rows, &n, REVIEW_COMMENT, c->start, "### Selected");
     review_text_rows(rows, &n, REVIEW_COMMENT, c->start, "> ", &selected);
     review_add_row(rows, &n, REVIEW_COMMENT, c->start, "### Comment");
@@ -4322,7 +4335,8 @@ static void sync_review(edit_state * e) {
     review_pane = doc_pane + 1;
     e->panes[review_pane] = (pane){.buffer = review, .wrap = 1, .preferred_col = SIZE_MAX};
   }
-  if (changed_source || !b->n_review || b->review_version != doc->review_version) {
+  bool rebuilt = changed_source || !b->n_review || b->review_version != doc->review_version;
+  if (rebuilt) {
     review_row * rows = NULL;
     int count = build_review(doc, &rows);
     output text = {0};
@@ -4374,21 +4388,24 @@ static void sync_review(edit_state * e) {
     doc->cursor = row->anchor;
     if (dp) dp->cursor = row->anchor, dp->preferred_col = SIZE_MAX;
   }
+  bool selected_changed = rebuilt || selected != b->review_selected;
   b->review_selected = selected;
   if (!dp || !rp) return;
-  pane * leader = focused ? rp : dp;
-  pane * follower = focused ? dp : rp;
-  int leader_i = focused ? review_pane : doc_pane;
-  int follower_i = focused ? doc_pane : review_pane;
-  if (!focused) rp->cursor = row->offset, rp->preferred_col = SIZE_MAX;
-  ensure_pane_visible(e, leader, pane_body_rows(e, leader_i));
-  size_t match = focused ? row->offset : dp->cursor;
-  int screen_row = pane_position_row(e, leader, match, pane_body_rows(e, leader_i));
-  follower->top = focused ? line_start(doc, dp->cursor) : row->offset;
-  for (int i = 0; i < screen_row && follower->top > 0; i++)
-    follower->top = follower->wrap ? visual_row_prev(e, follower, follower->top, pane_wrap_width(e, follower)) :
-      prev_line(pane_buffer(e, follower), follower->top);
-  ensure_pane_visible(e, follower, pane_body_rows(e, follower_i));
+  if (!focused) {
+    rp->cursor = row->offset;
+    rp->preferred_col = SIZE_MAX;
+    if (selected_changed) rp->top = row->offset;
+    ensure_pane_visible(e, dp, pane_body_rows(e, doc_pane));
+    ensure_pane_visible(e, rp, pane_body_rows(e, review_pane));
+    return;
+  }
+  ensure_pane_visible(e, rp, pane_body_rows(e, review_pane));
+  int screen_row = pane_position_row(e, rp, row->offset, pane_body_rows(e, review_pane));
+  dp->top = line_start(doc, dp->cursor);
+  for (int i = 0; i < screen_row && dp->top > 0; i++)
+    dp->top = dp->wrap ? visual_row_prev(e, dp, dp->top, pane_wrap_width(e, dp)) :
+      prev_line(doc, dp->top);
+  ensure_pane_visible(e, dp, pane_body_rows(e, doc_pane));
 }
 
 static void render(edit_state * e) {
@@ -5260,6 +5277,7 @@ static int cmd_mark(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->mark = p->cursor;
   p->mark_active = true;
+  p->mouse_mark = false;
   set_status(e, "mark");
   (void) key;
   return 0;
@@ -5269,6 +5287,7 @@ static int cmd_select_all(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->mark = buffer_len(active_buffer(e));
   p->mark_active = true;
+  p->mouse_mark = false;
   p->cursor = p->top = p->left_col = 0;
   p->preferred_col = SIZE_MAX;
   set_status(e, "selected all");
@@ -5692,7 +5711,8 @@ static bool fallback_text_byte(char c) {
 static bool fallback_context(edit_state * e, int key) {
   return key >= 32 && key < 127 && e->prefix == 0 && ! e->find_prompt &&
     (!e->spell.choosing || e->spell.native) &&
-    ! e->command_prompt && ! e->run_prompt && ! e->goto_prompt && ! e->search_prompt && ! e->replace_phase &&
+    ! e->command_prompt && ! e->comment_prompt && ! e->run_prompt && ! e->goto_prompt &&
+    ! e->search_prompt && ! e->replace_phase &&
     ! e->debug_recording && ! e->debug_note_prompt &&
     active_buffer(e)->kind != BUFFER_LIST && ! read_only_buffer(active_buffer(e));
 }
@@ -7739,6 +7759,12 @@ static int dispatch(edit_state * e, int key) {
     if (bindings[i].n_keys == n_keys && bindings[i].keys[0] == keys[0] &&
         bindings[i].keys[1] == keys[1]) {
       command_fn fn = bindings[i].fn;
+      if (active_pane(e)->mouse_mark &&
+          (fn == cmd_left || fn == cmd_right || fn == cmd_up || fn == cmd_down ||
+           fn == cmd_word_back || fn == cmd_word_forward || fn == cmd_line_start ||
+           fn == cmd_line_end || fn == cmd_file_start || fn == cmd_file_end ||
+           fn == cmd_page_up || fn == cmd_page_down || fn == cmd_up_10 || fn == cmd_down_10 ||
+           fn == cmd_goto_line)) clear_mark(e);
       if (fn != cmd_quit) e->quit_confirm = false;
       if (fn != cmd_recenter) active_pane(e)->recenter = 0;
       int rc = fn(e, key);
@@ -7868,7 +7894,7 @@ static int tui(const char * path) {
     if ((!strcmp(ev.kind, "sgr-mouse") || !strcmp(ev.kind, "x10-mouse")) &&
         (key == KEY_UP || key == KEY_DOWN || key == KEY_LEFT || key == KEY_RIGHT)) {
       e.mouse_down = false;
-      clear_mark(&e);
+      if (!e.comment_prompt) clear_mark(&e);
     }
     if (key == KEY_MOUSE && ev.mouse_button == 3) {
       mouse_click(&e, &ev);
