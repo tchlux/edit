@@ -4,3 +4,4 @@ Edit.app
 keydump
 *.o
 logs/debug-*.log
+*.editchat

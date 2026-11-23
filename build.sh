@@ -2,7 +2,7 @@
 set -eu
 regex_src=../regex/regex/regex.c
 [ ! -f "$regex_src" ] || cmp -s "$regex_src" regex.c || cp "$regex_src" regex.c
-cc -std=c11 -Wall -Wextra -pedantic -O2 -o edit edit.c grammar.c regex.c
+cc -std=c11 -DEDIT_COMPLETION -fobjc-arc -Wall -Wextra -pedantic -O2 -o edit edit.c grammar.c regex.c completion.m chat.m -framework Foundation -lcurl
 
 app=Edit.app
 bin="$app/Contents/MacOS"

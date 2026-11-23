@@ -19,10 +19,15 @@
 //    edit --render-color rows:cols file
 //
 // COMPILATION
+//    sh build.sh  (includes Light completions)
 //    cc -std=c11 -Wall -Wextra -pedantic -O2 -o edit edit.c grammar.c regex.c
 // ___________________________________________________________________
 
 #include "grammar.h"
+#include "completion.h"
+#ifdef EDIT_COMPLETION
+#include "chat.h"
+#endif
 
 #include <ctype.h>
 #include <dirent.h>
@@ -145,7 +150,9 @@ typedef struct { size_t pos, col; } column_point;
 typedef struct { size_t pos; char quote, fence, block, interpolation; } syntax_point;
 typedef struct { size_t start, next; bool full, newline; } wrap_point;
 
-typedef struct {
+struct buffer {
+  void *chat;
+  size_t chat_start;
   char * data;
   char * path;
   size_t cap;
@@ -205,7 +212,7 @@ typedef struct {
   int wrapped_mode, wrapped_tab;
   size_t counted_pos, counted_line, counted_col;
   size_t known_line_start, known_line_through;
-} buffer;
+};
 
 typedef struct {
   int buffer;
@@ -233,7 +240,6 @@ static void out_add(output * o, const char * s, size_t n);
 static void out_s(output * o, const char * s);
 static void out_f(output * o, const char * fmt, ...);
 
-typedef struct edit_state edit_state;
 typedef int (*command_fn)(edit_state * e, int key);
 static void track_rebuild(buffer * b);
 
@@ -338,7 +344,7 @@ struct edit_state {
   size_t replace_pos;
   size_t replace_start;
   size_t replace_end;
-  bool find_prompt;
+  bool find_prompt, chat_save_as;
   bool find_home;
   char find_path[PATH_SIZE];
   size_t find_len;
@@ -460,7 +466,7 @@ static size_t buffer_len(buffer * b) {
   return b->cap - (b->gap_b - b->gap_a);
 }
 
-static char buffer_at(buffer * b, size_t i) {
+char buffer_at(buffer * b, size_t i) {
   return (i < b->gap_a) ? b->data[i] : b->data[i + (b->gap_b - b->gap_a)];
 }
 
@@ -496,7 +502,11 @@ static int buffer_scratch(buffer * b) {
   return buffer_blank_kind(b, "*scratch*", BUFFER_SCRATCH);
 }
 
-static int buffer_load(buffer * b, const char * path) {
+#ifdef EDIT_COMPLETION
+static int chat_decode(buffer *b);
+#endif
+
+static int buffer_load_raw(buffer * b, const char * path) {
   FILE * f = fopen(path, "rb");
   if (f == NULL) {
     if (errno == ENOENT) return buffer_blank(b, path);
@@ -549,6 +559,14 @@ static int buffer_load(buffer * b, const char * path) {
   return 0;
 }
 
+static int buffer_load(buffer *b, const char *path) {
+  if (buffer_load_raw(b,path)) return -1;
+#ifdef EDIT_COMPLETION
+  if (chat_decode(b)) { buffer_free(b); return -1; }
+#endif
+  return 0;
+}
+
 static void history_free_buffer(buffer * b) {
   for (int i = 0; i < b->n_history; i++) free(b->history[i].text);
   free(b->history);
@@ -580,6 +598,9 @@ static void buffer_invalidate_render(buffer * b) {
 }
 
 static void buffer_free(buffer * b) {
+#ifdef EDIT_COMPLETION
+  if (b->chat) chat_close(b->chat);
+#endif
   buffer_invalidate_render(b);
   free(b->columns);
   free(b->syntax);
@@ -632,24 +653,25 @@ static int buffer_save_source(buffer * b) {
     free(tmp);
     return -1;
   }
-  if (fwrite(b->data, 1, b->gap_a, f) != b->gap_a) {
-    fclose(f);
-    unlink(tmp);
-    free(tmp);
-    return -1;
+  bool ok;
+#ifdef EDIT_COMPLETION
+  if (b->chat) {
+    size_t len = 0;
+    char *archive = chat_archive(b, &len);
+    ok = archive && fwrite(archive, 1, len, f) == len;
+    free(archive);
+  } else
+#endif
+  {
+    size_t tail = b->cap - b->gap_b;
+    ok = fwrite(b->data, 1, b->gap_a, f) == b->gap_a &&
+         fwrite(b->data + b->gap_b, 1, tail, f) == tail;
   }
-  size_t tail = b->cap - b->gap_b;
-  if (fwrite(b->data + b->gap_b, 1, tail, f) != tail) {
-    fclose(f);
-    unlink(tmp);
-    free(tmp);
-    return -1;
-  }
-  if (fclose(f) != 0 || rename(tmp, b->path) != 0) {
-    unlink(tmp);
-    free(tmp);
-    return -1;
-  }
+  if (fclose(f)) ok = false;
+  // Two windows may independently choose the same new chat filename.
+  if (ok && b->chat && !b->disk_mtime) { ok = link(tmp,b->path) == 0; unlink(tmp); }
+  else if (ok) ok = rename(tmp,b->path) == 0;
+  if (!ok) { unlink(tmp); free(tmp); return -1; }
   free(tmp);
   struct stat st;
   if (stat(b->path, &st) == 0) {
@@ -812,6 +834,7 @@ static int parse_size_line(char ** p, char * end, const char * label, size_t * v
 }
 
 static int buffer_resume_edits(buffer * b) {
+  if (b->chat) return 0;
   char path[PATH_SIZE + 8];
   if (edits_path(b, path, sizeof(path)) != 0) return -1;
   FILE * f = fopen(path, "rb");
@@ -1088,7 +1111,7 @@ static size_t utf8_next_pos(buffer * b, size_t pos) {
   return pos + utf8_len_at(b, pos, len);
 }
 
-static size_t utf8_prev_pos(buffer * b, size_t pos) {
+size_t utf8_prev_pos(buffer * b, size_t pos) {
   size_t len = buffer_len(b);
   if (pos == 0) return 0;
   if (pos > len) pos = len;
@@ -1301,7 +1324,7 @@ static void format_message(char * text, size_t size, const char * fmt, va_list a
   memcpy(text + end, "...", 4);
 }
 
-static void set_status(edit_state * e, const char * fmt, ...) {
+void set_status(edit_state * e, const char * fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   format_message(e->status, sizeof(e->status), fmt, ap);
@@ -1450,7 +1473,7 @@ static bool kill_push_text(edit_state * e, const char * data, size_t len) {
   return true;
 }
 
-static bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
+bool kill_push(edit_state * e, buffer * b, size_t start, size_t end) {
   if (end <= start) return false;
   output o = {0};
   for (size_t i = start; i < end; i++) out_add(&o, &(char){buffer_at(b, i)}, 1);
@@ -1632,6 +1655,11 @@ static int edit_insert(edit_state * e, size_t pos, const char * text,
                        size_t len, unsigned group, bool reset_undo) {
   if (len == 0) return 0;
   buffer * b = active_buffer(e);
+#ifdef EDIT_COMPLETION
+  if (b->chat && (pos < b->chat_start || chat_busy(b->chat))) {
+    set_status(e, "transcript is read only"); return -1;
+  }
+#endif
   if (reset_undo) history_truncate(b);
   if (edit_insert_raw(e, pos, text, len) != 0) return -1;
   if (history_add(b, HIST_INSERT, pos, text, len, group) != 0) return -1;
@@ -1679,6 +1707,11 @@ static int edit_delete(edit_state * e, size_t start, size_t end,
   if (end > len) end = len;
   if (end <= start) return 0;
 
+#ifdef EDIT_COMPLETION
+  if (b->chat && (start < b->chat_start || chat_busy(b->chat))) {
+    set_status(e, "transcript is read only"); return -1;
+  }
+#endif
   if (reset_undo) history_truncate(b);
   size_t n = end - start;
   char * text = malloc(n);
@@ -1856,6 +1889,7 @@ static int switch_to_buffer(edit_state * e, int i) {
     active_pane(e)->help_return_buffer = active_pane(e)->buffer;
   active_pane(e)->buffer = i;
   active_pane(e)->cursor = e->buffers[i].cursor;
+  if (e->buffers[i].chat) active_pane(e)->wrap = 2;
   active_pane(e)->top = e->buffers[i].top;
   active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
@@ -1878,8 +1912,8 @@ static int switch_to_path(edit_state * e, const char * path) {
   i = e->n_buffers++;
   int resumed = buffer_resume_edits(&e->buffers[i]);
   active_pane(e)->buffer = i;
-  active_pane(e)->wrap = default_wrap(path);
-  active_pane(e)->cursor = 0;
+  active_pane(e)->wrap = e->buffers[i].chat ? 2 : default_wrap(path);
+  active_pane(e)->cursor = e->buffers[i].cursor;
   active_pane(e)->top = 0;
   active_pane(e)->left_col = 0;
   active_pane(e)->preferred_col = SIZE_MAX;
@@ -1993,11 +2027,17 @@ static int session_buffer(FILE * f, bool writing, buffer * b) {
   n = writing ? buffer_len(b) : 0;
   char * text = writing ? buffer_text(b, &n) : NULL;
   if (writing && !text) return -1;
+#ifdef EDIT_COMPLETION
+  if (writing && b->chat) { free(text); text = chat_archive(b, &n); if (!text) return -1; }
+#endif
   int rc = session_blob(f, writing, &text, &n);
   if (!writing && !rc) {
     b->cap = n; b->gap_a = n; b->gap_b = n; b->data = text;
   } else free(text);
   if (rc) return -1;
+#ifdef EDIT_COMPLETION
+  if (!writing && chat_decode(b)) return -1;
+#endif
   SESSION_FIELD(b->cursor); SESSION_FIELD(b->top);
   SESSION_FIELD(b->disk_size); SESSION_FIELD(b->disk_mtime);
   SESSION_FIELD(b->dirty); SESSION_FIELD(b->read_only); SESSION_FIELD(b->kind);
@@ -3685,6 +3725,9 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
     }
   }
   char * line = b->render_text;
+#ifdef EDIT_COMPLETION
+  const char *chat_color = b->chat ? chat_style(b->chat, start) : NULL;
+#endif
   const char ** search_sgrs = search_highlight_active(e) ? calloc(n ? n : 1, sizeof(*search_sgrs)) : NULL;
   if (!line || (search_highlight_active(e) && !search_sgrs)) {
     free(search_sgrs);
@@ -3706,7 +3749,7 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
       for (int r = 0; r < b->n_review && b->review[r].offset <= start; r++) review_line = &b->review[r];
   }
 
-  if (!b->render_highlighted && e->has_grammar && b->kind != BUFFER_FIND && b->kind != BUFFER_REVIEW) {
+  if (!b->chat && !b->render_highlighted && e->has_grammar && b->kind != BUFFER_FIND && b->kind != BUFFER_REVIEW) {
     if (e->grammar.is_default) {
       syntax_point state = syntax_before(b, start);
       e->grammar.triple_quote = state.quote;
@@ -3771,6 +3814,9 @@ static size_t render_buffer_line(edit_state * e, output * o, buffer * b, pane * 
     int new_attr = 0;
     if (region_byte(p, start + i)) sgr = REGION_SGR;
     else if (search_sgrs && search_sgrs[i] != NULL) sgr = search_sgrs[i];
+#ifdef EDIT_COMPLETION
+    else if (chat_color) sgr = chat_color;
+#endif
     else if (review_line) {
       int style = review_line->style;
       sgr = (style == REVIEW_HEAD || style == REVIEW_COMMENT_HEAD) ?
@@ -4005,7 +4051,7 @@ static bool active_prompt_slot(edit_state * e, prompt_slot * s) {
     return true;
   }
   if (e->find_prompt && active_buffer(e)->kind != BUFFER_FIND) {
-    *s = (prompt_slot){"find file: ", e->find_path, &e->find_len,
+    *s = (prompt_slot){e->chat_save_as ? "save chat as: " : "find file: ", e->find_path, &e->find_len,
                        &e->find_pos, sizeof(e->find_path)};
     return true;
   }
@@ -4040,7 +4086,7 @@ static bool active_prompt_slot(edit_state * e, prompt_slot * s) {
 static bool prompt_footer_cursor(edit_state * e) {
   prompt_slot s;
   return e->footer[0] == '\0' && active_prompt_slot(e, &s) &&
-    (e->command_prompt || strncmp(e->status, s.label, strlen(s.label)) == 0);
+    (e->command_prompt || e->chat_save_as || strncmp(e->status, s.label, strlen(s.label)) == 0);
 }
 
 // Scroll prompt text enough to keep its cursor before the help hint.
@@ -4419,7 +4465,7 @@ static void sync_review(edit_state * e) {
   ensure_pane_visible(e, dp, pane_body_rows(e, doc_pane));
 }
 
-static void render(edit_state * e) {
+void render(edit_state * e) {
   int previous_rows = e->rows;
   int previous_cols = e->cols;
   get_window_size(e);
@@ -6052,7 +6098,7 @@ static void review_clear(buffer * b) {
 static int cmd_suggested(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   (void) key;
-  if (b->kind != BUFFER_FILE) return set_status(e, "suggestions need a file"), 0;
+  if (b->chat || b->kind != BUFFER_FILE) return set_status(e, "suggestions need a file"), 0;
   if (b->suggested) return set_status(e, "suggested changes already on"), 0;
   if (b->dirty) return set_status(e, "save before starting suggestions"), 0;
   b->base = buffer_text(b, &b->base_len);
@@ -6494,6 +6540,7 @@ static int open_find_path(edit_state * e) {
 }
 
 static int cmd_find_file(edit_state * e, int key) {
+  e->chat_save_as = false;
   char current[PATH_SIZE];
   (void) key;
   e->find_path[0] = '\0';
@@ -6812,6 +6859,7 @@ static int goto_submit(edit_state * e) {
 }
 
 static int cmd_cancel(edit_state * e, int key) {
+  e->chat_save_as = false;
   e->prompt_overflow = NULL;
   input_clear(e);
   if (e->command_prompt) {
@@ -7034,6 +7082,9 @@ static const char HELP_TEXT[] =
   "  C-q                               insert next key literally\n"
   "  C-/, C-_, C-x u                   undo\n"
   "  C-x r                             redo\n"
+#ifdef EDIT_COMPLETION
+  "  C-c C-c                           stream code completion (any key cancels)\n"
+#endif
   "  C-c x                             run shell command\n"
   "  C-c C-r                           toggle read only\n"
   "  C-c C-w                           cycle overflow / character / word wrap\n"
@@ -7070,6 +7121,12 @@ static const char HELP_TEXT[] =
   "Named commands\n"
   "  M-x (or Esc x)                    run a command by name\n"
   "  Tab / Tab Tab                     complete / list matching commands\n"
+#ifdef EDIT_COMPLETION
+  "  chat / chat-new                   open a right-hand chat / start another\n"
+  "  chat-clear / chat-save-as         clear context / save at a chosen path\n"
+  "  C-c C-c / C-g                     send draft / stop chat generation\n"
+  "  C-c p / C-c n                     previous / next chat section\n"
+#endif
   "  toggle-syntax-highlighting        toggle colors in the current buffer\n"
   "  toggle-spell-checking             toggle spelling in the current buffer\n"
   "  spell-correct-word (M-$)          choose correction; i adds word\n"
@@ -7443,6 +7500,38 @@ static int cmd_execute_extended_command(edit_state * e, int key) {
   return 0;
 }
 
+// Stream one undoable edit while leaving the next input event for normal dispatch.
+bool edit_stream_open(edit_state *e, edit_stream *s) {
+  buffer *b = active_buffer(e);
+  if (read_only_buffer(b) || (b->kind != BUFFER_FILE && b->kind != BUFFER_SCRATCH)) {
+    set_status(e, "read only");
+    return false;
+  }
+  pane *p = active_pane(e);
+  *s = (edit_stream){e, b, file_name(b->path), buffer_len(b), p->cursor,
+                     p->mark_active ? p->mark : p->cursor, p->cursor, ++b->history_group};
+  return true;
+}
+
+bool edit_stream_write(edit_stream *s, const char *text, size_t len) {
+  edit_state *e = s->editor;
+  if (session_closing || window_changed || input_wait(e, 0) ||
+      active_buffer(e) != s->document || buffer_changed(s->document)) return false;
+  if (len) {
+    pane *p = active_pane(e);
+    size_t mark = p->mark;
+    if (edit_insert(e, s->insert_at, text, len, s->group, true) != 0) return false;
+    p->mark = mark;
+    s->insert_at += len;
+    render(e);
+  }
+  return true;
+}
+
+#ifdef EDIT_COMPLETION
+#include "chat_editor.inc"
+#endif
+
 static binding bindings[] = {
   {{KEY_LEFT, 0}, 1, cmd_left, "backward-char"},
   {{KEY_RIGHT, 0}, 1, cmd_right, "forward-char"},
@@ -7488,6 +7577,16 @@ static binding bindings[] = {
   {{KEY_CTRL('r'), 0}, 1, cmd_reverse_search, "reverse-search"},
   {{KEY_CTRL('s'), 0}, 1, cmd_search, "search"},
   {{KEY_CTRL('_'), 0}, 1, cmd_undo, "undo"},
+#ifdef EDIT_COMPLETION
+  {{KEY_CTRL('c'), KEY_CTRL('c')}, 2, cmd_complete_or_chat, "insert-completion"},
+  {{CHAT_OPEN,0}, 0, chat_command, "chat"},
+  {{CHAT_NEW,0}, 0, chat_command, "chat-new"},
+  {{CHAT_CLEAR,0}, 0, chat_command, "chat-clear"},
+  {{0,0}, 0, chat_save_as_cmd, "chat-save-as"},
+  {{CHAT_SEND,0}, 0, chat_command, "chat-send"},
+  {{KEY_CTRL('c'),'p'}, 2, chat_command, "chat-previous"},
+  {{KEY_CTRL('c'),'n'}, 2, chat_command, "chat-next"},
+#endif
   {{KEY_CTRL('c'), 'e'}, 2, cmd_suggested, "suggested"},
   {{KEY_CTRL('c'), 'c'}, 2, cmd_comment, "comment"},
   {{KEY_CTRL('c'), 'd'}, 2, cmd_delete_comment, "delete-comment"},
@@ -7591,9 +7690,17 @@ static int command_dispatch(edit_state * e, int key) {
 
 static int find_dispatch(edit_state * e, int key) {
   e->footer[0] = '\0';
+#ifdef EDIT_COMPLETION
+  if (e->chat_save_as) {
+    if (key == KEY_ENTER) return chat_save_path(e);
+    prompt_slot slot;
+    if (active_prompt_slot(e,&slot)) prompt_edit(e,&slot,key);
+    return 0;
+  }
+#endif
   if (key == KEY_ENTER) return clear_prompt_mark(e), open_find_path(e);
   if (key == KEY_CTRL('i')) return find_complete(e, true);
-  prompt_slot s = {"find file: ", e->find_path, &e->find_len,
+  prompt_slot s = {e->chat_save_as ? "save chat as: " : "find file: ", e->find_path, &e->find_len,
                    &e->find_pos, sizeof(e->find_path)};
   if (prompt_edit(e, &s, key) && e->find_pane >= 0) find_complete(e, false);
   set_status(e, "find file: %s", e->find_path);
@@ -7728,6 +7835,10 @@ static int dispatch_key(edit_state * e, int key) {
       e->prompt_overflow == s.text)
     return set_footer(e, "input too long; edit or cancel"), 0;
 
+#ifdef EDIT_COMPLETION
+  if (key == KEY_CTRL('g') && !active_prompt_slot(e,&s) && active_buffer(e)->chat && chat_stop(e,active_buffer(e)))
+    return set_status(e,"chat canceled"),0;
+#endif
   if (key == KEY_CTRL('g') || (key == KEY_ESC && active_buffer(e)->kind == BUFFER_HELP))
     return action_other(e), cmd_cancel(e, key);
   if (e->command_prompt) return command_dispatch(e, key);
@@ -7852,7 +7963,8 @@ static int tui(const char * path) {
     fprintf(stderr, "edit: cannot open %s\n", path);
     return 1;
   } else {
-    e.panes[0].wrap = default_wrap(open_path);
+    e.panes[0].wrap = e.buffers[0].chat ? 2 : default_wrap(open_path);
+    if (e.buffers[0].chat) e.panes[0].cursor = buffer_len(&e.buffers[0]);
     int resumed = buffer_resume_edits(&e.buffers[0]);
     if (resumed == 1) set_status(&e, "edits conflict: source changed");
     else if (resumed == 2) set_status(&e, "resumed suggested changes");
@@ -7883,6 +7995,11 @@ static int tui(const char * path) {
   while (! e.quit && !session_closing) {
     window_changed = 0;
     auto_reload(&e);
+#ifdef EDIT_COMPLETION
+    bool chatting = false;
+    for (int i = 0; i < e.n_buffers; i++)
+      if (e.buffers[i].chat && chat_tick(&e, &e.buffers[i])) chatting = true;
+#endif
     buffer * edited = active_buffer(&e);
     if (active_pane(&e)->cursor < edited->spelling_start || active_pane(&e)->cursor > edited->spelling_end)
       edited->spelling_editing = false;
@@ -7893,6 +8010,9 @@ static int tui(const char * path) {
     spell_service(&e, true);
     if (e.spell.redraw) continue;
     int timeout = status_timeout(&e);
+#ifdef EDIT_COMPLETION
+    if (chatting && (timeout < 0 || timeout > 40)) timeout = 40;
+#endif
     for (int i = 0; i < e.n_panes; i++) {
       buffer * b = pane_buffer(&e, &e.panes[i]);
       long long delay = 250 - (now_ms() - b->edited_ms);
@@ -8046,7 +8166,7 @@ static int tui(const char * path) {
 
 static int cli_print(const char * range, const char * path) {
   buffer b = {0};
-  if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
+  if (buffer_load_raw(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
   size_t start;
   size_t end;
   if (parse_range(range, &start, &end, &b) != 0) {
@@ -8063,7 +8183,7 @@ static int cli_print(const char * range, const char * path) {
 
 static int cli_search(const char * point, const char * regex, const char * path) {
   buffer b = {0};
-  if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
+  if (buffer_load_raw(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
   size_t from;
   size_t start = 0;
   size_t end = 0;
@@ -8093,7 +8213,7 @@ static int cli_search(const char * point, const char * regex, const char * path)
 static int cli_change(const char * op, const char * point_or_range,
                       const char * text, const char * path) {
   buffer b = {0};
-  if (buffer_load(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
+  if (buffer_load_raw(&b, path) != 0) return fprintf(stderr, "edit: open failed\n"), 1;
 
   size_t n = 0;
   char * input = NULL;

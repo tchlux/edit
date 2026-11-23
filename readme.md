@@ -140,6 +140,67 @@ focus there. Typing returns to the prompt.
 in `$HOME/.edit/recent`. Set `EDIT_RECENT` to override that path. Clean file
 buffers auto-reload when the file changes on disk.
 
+### Code completion
+
+Press `C-c C-c` (or `M-x insert-completion`) to stream code at the cursor.
+With a selection, the proposed rewrite appears immediately after the original.
+The cursor and selection stay in place. Any key stops generation and still
+performs its usual action. One undo removes the generated text, including a
+partial completion. As in Emacs, the command copies the selection or the
+preceding 2,000 characters to the kill ring.
+
+Edit sends the filename, first ten lines, and up to twenty lines on each side
+of the cursor to the configured server. A rewrite also includes the complete selection.
+Inline completion and chat both use the server’s default model initially.
+
+Set `EDIT_COMPLETION_URL` to the full HTTP(S) chat completions endpoint. For a
+persistent default shared by terminal launches and Finder launches of Edit.app,
+put the URL alone on one line in `~/.edit/completion-url`. For example, a server
+on this Mac might use `http://127.0.0.1:8081/v1/chat/completions`. An explicit
+environment setting takes precedence. A fresh installation has no endpoint.
+Saved `*.editchat` files are ignored by Git. If you choose another extension
+when saving a conversation, keep that file outside published source trees.
+
+The command lives in `completion.m`. The normal build enables it for both
+the terminal and the app using the macOS SDK's Foundation and libcurl.
+Run `python3 test-completion.py` for the local fixture or add `--live` to
+complete, compile, and run a small C function against Light.
+
+### Agent chat
+
+`M-x chat` opens a word-wrapped chat on the right and focuses it. Type after
+**You**. Enter adds a newline and `C-c C-c` sends the whole draft. The agent
+uses the same Light endpoint as inline completion. Each new chat captures
+`~/.agents.md` as its system message. If the file is missing, Edit uses
+a short built-in prompt.
+
+The pane shows the system prompt, messages, streamed thinking, tool names,
+arguments, and results in distinct colors. The agent can inspect open buffers,
+their live text, pane cursors and marks, replace a unique piece of text,
+create a named buffer, and read Edit's built-in help. Its edits use the
+target buffer's undo history. You can keep editing or reading other panes
+while a response streams.
+
+| In the chat | Action |
+| --- | --- |
+| `C-c C-c` / `M-x chat-send` | Send the draft, or continue an interrupted turn with an empty draft |
+| `C-g` | Stop this session's active generation |
+| `C-c p` / `C-c n` | Jump to the previous or next transcript section |
+| `C-s` / `C-r`, `Esc <` / `Esc >` | Search the transcript, or jump to its beginning or end |
+| `M-x chat-new` | Start a separate session in a new buffer |
+| `M-x chat-clear` | Clear the current conversation and draft, retaining its original system prompt |
+| `C-x C-s` / `M-x chat-save-as` | Save to the buffer's numbered chat file, or choose a new path |
+
+Open a saved chat with `C-x C-f` or `./edit path`. Its single file contains
+the system prompt, model, reasoning effort, tool definitions, messages,
+thinking, tool-call IDs and arguments, results, and unsent draft. It can be
+moved or renamed. Interrupted output stays visible. Opening the file never
+re-executes a recorded tool call. On the next turn the tools see the buffers
+currently open in Edit.
+
+Run `python3 test-chat.py` for the loopback terminal test, or add `--live`
+to exercise Light against temporary source files.
+
 ### Undo and Toggles
 
 - `C-/`, `C-_`, or `C-x u` undo.
