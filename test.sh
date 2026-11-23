@@ -1985,6 +1985,18 @@ done
 python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<opt-gt>^e' "$word_wrap" > "$out"
 grep -q 'cursor:4:1' "$out"
 
+# C-l uses visible wrapped rows and keeps its position at EOF after cursor movement.
+word_recenter="$dir/recenter.txt"
+printf 'first paragraph words wrap over multiple rows here\nsecond paragraph words wrap over multiple rows here\nthird paragraph words wrap over multiple rows here\nfourth paragraph words wrap over multiple rows here\nfifth paragraph words wrap over multiple rows here\n' > "$word_recenter"
+./edit --render-keys 12:20 '>l' "$word_recenter" > "$out"
+[ "$(sed -n '6p' "$out")" = '|' ]
+./edit --render-keys 12:20 '>lb' "$word_recenter" > "$out"
+[ "$(sed -n '5p' "$out")" = 'multiple.rows.here|' ]
+./edit --render-keys 12:20 '>ll' "$word_recenter" > "$out"
+[ "$(sed -n '1p' "$out")" = '|' ]
+./edit --render-keys 12:20 '>lll' "$word_recenter" > "$out"
+[ "$(sed -n '10p' "$out")" = '|' ]
+
 # Font bindings emit the app command without modifying the document.
 EDIT_APP=1 ./edit --render-keys 8:40 'x+x-x)' "$command_file" > "$out"
 head -c 24 "$out" > "$tmp.head"

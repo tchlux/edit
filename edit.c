@@ -223,7 +223,7 @@ typedef struct {
   size_t preferred_col;
   size_t wrap_end; // C-e can place point on the earlier side of a wrap boundary.
   size_t mark;
-  int recenter;
+  int recenter; // 0: normal, 1-3: C-l cycle, -1: keep the recentered viewport
   int help_return_buffer;
   bool mark_active;
   bool mouse_mark;
@@ -3099,7 +3099,8 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
       if (row < body_rows) break;
       p->top = visual_row_next(e, p, p->top, width);
     }
-    while (p->top > 0 && visual_rows_from(e, p, p->top, width, body_rows) < body_rows)
+    while (!p->recenter && p->top > 0 &&
+           visual_rows_from(e, p, p->top, width, body_rows) < body_rows)
       p->top = visual_row_prev(e, p, p->top, width);
     p->left_col = 0;
     return;
@@ -3116,7 +3117,7 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
     if (row < body_rows) break;
     p->top = next_line(b, p->top);
   }
-  while (p->top > 0 && file_rows_from(b, p->top, body_rows) < body_rows)
+  while (!p->recenter && p->top > 0 && file_rows_from(b, p->top, body_rows) < body_rows)
     p->top = prev_line(b, p->top);
 
   int cols = pane_cols(e, (int) (p - e->panes));
@@ -5130,6 +5131,7 @@ static int cmd_file_start(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->cursor = 0;
   p->top = 0;
+  p->recenter = 0;
   p->left_col = 0;
   p->preferred_col = SIZE_MAX;
   (void) key;
@@ -5141,6 +5143,7 @@ static int cmd_file_end(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->cursor = buffer_len(b);
   p->top = line_start(b, p->cursor);
+  p->recenter = 0;
   p->preferred_col = SIZE_MAX;
   (void) key;
   return 0;
@@ -5208,11 +5211,14 @@ static int cmd_recenter(edit_state * e, int key) {
   pane * p = active_pane(e);
   buffer * b = active_buffer(e);
   int body_rows = pane_body_rows(e, e->active_pane);
-  int mode = p->recenter++ % 3;
+  int mode = p->recenter < 0 ? 0 : p->recenter % 3;
+  p->recenter = mode + 1;
   int above = (mode == 0) ? body_rows / 2 : (mode == 1) ? 0 : body_rows - 1;
 
-  p->top = line_start(b, p->cursor);
-  for (int i = 0; i < above && p->top > 0; i++) p->top = prev_line(b, p->top);
+  size_t width = pane_wrap_width(e, p);
+  p->top = p->wrap ? visual_row_at_cursor(e, p, width) : line_start(b, p->cursor);
+  for (int i = 0; i < above && p->top > 0; i++)
+    p->top = p->wrap ? visual_row_prev(e, p, p->top, width) : prev_line(b, p->top);
   (void) key;
   return 0;
 }
@@ -6062,6 +6068,7 @@ static int cmd_toggle_wrap(edit_state * e, int key) {
   pane * p = active_pane(e);
   p->wrap = (p->wrap + 1) % 3;
   p->top = line_start(active_buffer(e), p->top);
+  p->recenter = 0;
   p->preferred_col = SIZE_MAX;
   if (p->wrap) p->left_col = 0;
   set_status(e, "wrap %s", p->wrap == 2 ? "words" : p->wrap ? "characters" : "off");
@@ -7636,7 +7643,8 @@ static int command_dispatch(edit_state * e, int key) {
       e->command_prompt = false;
       clear_prompt_mark(e);
       if (b->fn != cmd_quit) e->quit_confirm = false;
-      if (b->fn != cmd_recenter) active_pane(e)->recenter = 0;
+      if (b->fn != cmd_recenter && active_pane(e)->recenter)
+        active_pane(e)->recenter = -1;
       return b->fn(e, b->keys[b->n_keys == 2 ? 1 : 0]);
     }
     return set_footer(e, "no such command: %s", e->command), 0;
@@ -7895,7 +7903,8 @@ static int dispatch_key(edit_state * e, int key) {
            fn == cmd_page_up || fn == cmd_page_down || fn == cmd_up_10 || fn == cmd_down_10 ||
            fn == cmd_goto_line)) clear_mark(e);
       if (fn != cmd_quit) e->quit_confirm = false;
-      if (fn != cmd_recenter) active_pane(e)->recenter = 0;
+      if (fn != cmd_recenter && active_pane(e)->recenter)
+        active_pane(e)->recenter = -1;
       int rc = fn(e, key);
       if (fn != cmd_kill_line && fn != cmd_cut_region &&
           fn != cmd_yank && fn != cmd_yank_pop)
@@ -7905,7 +7914,7 @@ static int dispatch_key(edit_state * e, int key) {
 
   if ((n_keys == 1) && (key >= 32) && (key < 127)) {
     e->quit_confirm = false;
-    active_pane(e)->recenter = 0;
+    if (active_pane(e)->recenter) active_pane(e)->recenter = -1;
     action_other(e);
     return cmd_insert(e, key);
   }
