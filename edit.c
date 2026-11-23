@@ -214,6 +214,7 @@ typedef struct {
   size_t top;
   size_t left_col;
   size_t preferred_col;
+  size_t wrap_end; // C-e can place point on the earlier side of a wrap boundary.
   size_t mark;
   int recenter;
   int help_return_buffer;
@@ -1618,6 +1619,7 @@ static int edit_insert_raw(edit_state * e, size_t pos, const char * text, size_t
   }
   for (int i = 0; i < e->n_panes; i++) {
     if (e->panes[i].buffer != bnum) continue;
+    e->panes[i].wrap_end = 0;
     if (e->panes[i].mark_active && e->panes[i].mark >= pos) e->panes[i].mark += len;
     if (i == e->active_pane) continue;
     if (e->panes[i].cursor >= pos) e->panes[i].cursor += len;
@@ -1659,6 +1661,7 @@ static int edit_delete_raw(edit_state * e, size_t start, size_t end) {
   for (int i = 0; i < e->n_panes; i++) {
     pane * p = &e->panes[i];
     if (p->buffer != bnum) continue;
+    p->wrap_end = 0;
     if (p->mark_active && p->mark > start)
       p->mark = (p->mark >= end) ? p->mark - n : start;
     if (i == e->active_pane) continue;
@@ -1896,6 +1899,7 @@ static void clamp_panes(edit_state * e, int bnum) {
     if (e->panes[i].cursor > len) e->panes[i].cursor = len;
     if (e->panes[i].top > len) e->panes[i].top = len;
     if (e->panes[i].mark > len) e->panes[i].mark = len;
+    e->panes[i].wrap_end = 0;
     e->panes[i].preferred_col = SIZE_MAX;
   }
 }
@@ -2961,8 +2965,13 @@ static size_t visual_row_prev(edit_state * e, pane * p, size_t pos, size_t width
   return prev;
 }
 
-static size_t visual_row_at_cursor(edit_state * e, pane * p, size_t cursor, size_t width) {
+static size_t wrapped_cursor(pane * p) {
+  return p->cursor - (p->wrap_end && p->wrap_end == p->cursor);
+}
+
+static size_t visual_row_at_cursor(edit_state * e, pane * p, size_t width) {
   buffer * b = pane_buffer(e, p);
+  size_t cursor = wrapped_cursor(p);
   size_t row = line_start(b, cursor);
   // Prime the cache key before looking up a nearby wrapped row.
   visual_row_next(e, p, row, width);
@@ -3034,6 +3043,7 @@ static void ensure_pane_visible(edit_state * e, pane * p, int body_rows) {
   size_t width = pane_wrap_width(e, p);
 
   if (p->wrap) {
+    cursor = wrapped_cursor(p);
     if (cursor < p->top) p->top = line_start(b, cursor);
     for (;;) {
       size_t pos = p->top;
@@ -3176,6 +3186,7 @@ static int mouse_click(edit_state * e, key_event * ev) {
   size_t anchor = p->cursor;
   p->cursor = p->wrap == 2 ? visual_row_column_pos(e, p, pos, col - visual_col(e, b, start, pos)) :
     visual_column_pos(e, b, start, col);
+  p->wrap_end = 0;
   p->preferred_col = SIZE_MAX;
   if (drag && !p->mark_active && p->cursor != anchor)
     p->mark = anchor, p->mark_active = p->mouse_mark = true;
@@ -3882,7 +3893,7 @@ static int pane_position_row(edit_state * e, pane * p, size_t target, int body_r
 }
 
 static int pane_cursor_row(edit_state * e, pane * p, int body_rows) {
-  return pane_position_row(e, p, p->cursor, body_rows);
+  return pane_position_row(e, p, p->wrap ? wrapped_cursor(p) : p->cursor, body_rows);
 }
 
 static size_t pane_cursor_col(edit_state * e, pane * p) {
@@ -3892,7 +3903,7 @@ static size_t pane_cursor_col(edit_state * e, pane * p) {
   size_t limit = cols > 0 ? (size_t) cols - 1 : 0;
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, width);
     cx = visual_row_column(e, b, row, p->cursor);
     return (cx > limit) ? limit : cx;
   }
@@ -5004,9 +5015,10 @@ static int cmd_up(edit_state * e, int key) {
   pane * p = active_pane(e);
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, width);
     if (p->preferred_col == SIZE_MAX)
       p->preferred_col = visual_row_column(e, b, row, p->cursor);
+    p->wrap_end = 0;
     p->cursor = visual_row_column_pos(e, p, visual_row_prev(e, p, row, width),
                                       p->preferred_col);
     scroll_line_move(e, -1);
@@ -5027,9 +5039,10 @@ static int cmd_down(edit_state * e, int key) {
   pane * p = active_pane(e);
   if (p->wrap) {
     size_t width = pane_wrap_width(e, p);
-    size_t row = visual_row_at_cursor(e, p, p->cursor, width);
+    size_t row = visual_row_at_cursor(e, p, width);
     if (p->preferred_col == SIZE_MAX)
       p->preferred_col = visual_row_column(e, b, row, p->cursor);
+    p->wrap_end = 0;
     size_t next = visual_row_next(e, p, row, width);
     if (next > row) p->cursor = visual_row_column_pos(e, p, next, p->preferred_col);
     scroll_line_move(e, 1);
@@ -5161,7 +5174,7 @@ static int cmd_recenter(edit_state * e, int key) {
 static int cmd_line_start(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
-  p->cursor = p->wrap ? visual_row_at_cursor(e, p, p->cursor, pane_wrap_width(e, p)) :
+  p->cursor = p->wrap ? visual_row_at_cursor(e, p, pane_wrap_width(e, p)) :
     line_start(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
@@ -5172,10 +5185,15 @@ static int cmd_line_end(edit_state * e, int key) {
   buffer * b = active_buffer(e);
   pane * p = active_pane(e);
   if (p->wrap) {
-    size_t row = visual_row_at_cursor(e, p, p->cursor, pane_wrap_width(e, p));
+    size_t width = pane_wrap_width(e, p);
+    size_t row = visual_row_at_cursor(e, p, width);
     bool full, newline;
-    size_t end = visual_row_end(e, p, row, pane_wrap_width(e, p), &full, &newline);
-    p->cursor = end > row && (full || newline) ? utf8_prev_pos(b, end) : end;
+    size_t end = visual_row_end(e, p, row, width, &full, &newline) - newline;
+    p->cursor = end;
+    // Stop before the separator at a word-wrap break.
+    if (p->wrap == 2 && full && end < buffer_len(b) && buffer_at(b, end) != '\n' &&
+        isspace((unsigned char) buffer_at(b, end - 1))) p->cursor--;
+    p->wrap_end = full && p->cursor == end ? end : 0;
   } else p->cursor = line_end(b, p->cursor);
   p->preferred_col = SIZE_MAX;
   (void) key;
@@ -7700,7 +7718,7 @@ static int replace_dispatch(edit_state * e, int key) {
   return 0;
 }
 
-static int dispatch(edit_state * e, int key) {
+static int dispatch_key(edit_state * e, int key) {
   if (e->spell.choosing && !e->spell.native) return spell_choice_key(e, key);
   sync_review(e);
   int keys[2] = {key, 0};
@@ -7781,6 +7799,16 @@ static int dispatch(edit_state * e, int key) {
     return cmd_insert(e, key);
   }
   return 0;
+}
+
+static int dispatch(edit_state * e, int key) {
+  pane * p = active_pane(e);
+  int buffer = p->buffer;
+  int wrap = p->wrap;
+  int rc = dispatch_key(e, key);
+  if (p->cursor != p->wrap_end || p->buffer != buffer || p->wrap != wrap)
+    p->wrap_end = 0;
+  return rc;
 }
 
 static int tui(const char * path) {

@@ -1975,6 +1975,11 @@ for wrap_keys in '<c-c>^w' '<c-c>^w<c-c>^w'; do
   grep -q "cursor:2:$edge_col" "$out"
   python3 ./tui_view.py 8:12 "${wrap_keys}^n^e^a" "$word_wrap" > "$out"
   grep -q 'cursor:2:1' "$out"
+  printf 'abcdefghijkl\nnext\n' > "$wrap_cursor"
+  python3 ./tui_view.py 6:12 "${wrap_keys}^e^e" "$wrap_cursor" > "$out"
+  grep -q 'cursor:1:12' "$out"
+  python3 ./tui_view.py 6:12 "${wrap_keys}^eZ<c-x>^s" "$wrap_cursor" > "$out"
+  printf 'abcdefghijklZ\nnext\n' | cmp -s - "$wrap_cursor"
 done
 python3 ./tui_view.py 8:12 '<c-c>^w<c-c>^w<opt-gt>^e' "$word_wrap" > "$out"
 grep -q 'cursor:4:1' "$out"
