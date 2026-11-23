@@ -17,8 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-void matcha(const char * regex, const char * string,
-            int * n, int ** starts, int ** ends);
+void matchan(const char * regex, const char * string, size_t len,
+             int * n, int ** starts, int ** ends);
 
 static char * _space(char * s) {
   while ((*s != '\0') && (! isspace((unsigned char) *s))) s++;
@@ -927,17 +927,13 @@ void grammar_advance(grammar * g, const char * path, const char * line,
 int grammar_highlight(grammar * g, const char * path, const char * line,
                       size_t len, grammar_span * spans, int max_spans) {
   if (len == 0 || max_spans <= 0) return 0;
-  char * text = malloc(len + 1);
   const char ** sgrs = calloc(len, sizeof(*sgrs));
   int * attrs = calloc(len, sizeof(*attrs));
-  if (text == NULL || sgrs == NULL || attrs == NULL) {
-    free(text);
+  if (sgrs == NULL || attrs == NULL) {
     free(sgrs);
     free(attrs);
     return -1;
   }
-  memcpy(text, line, len);
-  text[len] = '\0';
 
   if (g->is_default && _markdown_path(path))
     _document_highlight(g, path, line, len, sgrs, attrs);
@@ -954,7 +950,7 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
       int n = len < INT_MAX ? (int) len + 1 : INT_MAX;
       int * starts = NULL;
       int * ends = NULL;
-      matcha(g->rules[i].regex, text, &n, &starts, &ends);
+      matchan(g->rules[i].regex, line, len, &n, &starts, &ends);
       for (int j = 0; j < n; j++)
         if (starts[j] >= 0 && ends[j] > starts[j]) {
           _paint(sgrs, len, (size_t) starts[j], (size_t) ends[j], sgr);
@@ -978,7 +974,6 @@ int grammar_highlight(grammar * g, const char * path, const char * line,
     n_spans++;
   }
 
-  free(text);
   free(sgrs);
   free(attrs);
   return n_spans;

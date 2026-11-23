@@ -2926,4 +2926,5 @@ python3 ./tui_view.py 12:100 '^xo^s987654321
 grep -q 'many-reviews.txt.1:1.Suggested' "$out"
 grep -q '##.1..Add' "$out"
 
+sh ./test-grammar.sh
 printf 'ok\n'

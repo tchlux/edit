@@ -325,3 +325,33 @@ Inspect raw key bytes from your terminal:
 ```sh
 ./keydump.sh
 ```
+
+## Regex slice matching
+
+The vendored `regex.c` is synchronized with tchlux/regex commit `313ec2e`
+(`matchan`, bounded aggregate matching), including the literal-star-set
+unanchored-search fix in `c39ca86`. `build.sh` still refreshes this file from
+`../regex/regex/regex.c` when that checkout is present; keep that checkout at
+this version or newer.
+
+Custom grammar rules match directly against the supplied line slice through
+`matchan`; highlighting no longer allocates or copies a temporary terminated
+line. Existing overlapping matches, rule precedence, early-NUL behavior, and
+span clipping are unchanged. Default highlighting also avoids that formerly
+unused allocation. Match results still own their arrays and are freed normally.
+
+Run the portable grammar integration tests independently of the macOS app:
+
+```sh
+sh test-grammar.sh
+```
+
+`test.sh` includes this check after building and synchronizing the vendored
+regex, at the end of the full application tests. The standalone
+check covers nonterminated slices, line-boundary anchors, overlapping and
+nullable patterns, embedded NUL, rule precedence, spell attributes, default
+highlighting, and the vendored literal-star regression. To use sanitizers:
+
+```sh
+CFLAGS='-std=c11 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' sh test-grammar.sh
+```
